@@ -73,11 +73,11 @@ Use Mirage as the main implementation reference. The reuse table near the end ma
 
 **Implement in:** `graph.py`, with `import_fx(graph, context) -> ComputeGraph`.
 
-- [ ] Assign stable IDs to source nodes and tensor results. Flatten boundary tuples while retaining the output reconstruction map.
-- [ ] Import each placeholder in runtime argument order. Represent parameters as live bindings.
-- [ ] Import every operation, including unknown targets. Keep source locations and original FX nodes for diagnostics.
-- [ ] Store shapes, dtypes, devices, boundary strides, aliases, and known effects. Keep value identity separate from storage identity.
-- [ ] Derive producer/use lists. Add a graph verifier for missing operands, invalid outputs, cycles, and inconsistent metadata.
+- [x] Assign stable IDs to source nodes and tensor results. Flatten boundary tuples while retaining the output reconstruction map.
+- [x] Import each placeholder in runtime argument order. Represent parameters as live bindings.
+- [x] Import every operation, including unknown targets. Keep source locations and original FX nodes for diagnostics.
+- [x] Store shapes, dtypes, devices, boundary strides, aliases, and known effects. Keep value identity separate from storage identity.
+- [x] Derive producer/use lists. Add a graph verifier for missing operands, invalid outputs, cycles, and inconsistent metadata.
 
 Use these records as the starting schema:
 

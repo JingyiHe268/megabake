@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import re
+from pathlib import Path
 from typing import Any, Sequence
 
 import torch
@@ -10,6 +12,7 @@ import torch
 from .frontend import make_backend
 from .fx_handler.export import capture_exported_program
 from .fx_handler.transformers import capture_transformer
+from .graph import dump_compute_graph, import_fx
 
 
 def _backend(args: argparse.Namespace) -> Any:
@@ -64,12 +67,25 @@ def _run_transformers(args: argparse.Namespace) -> int:
         backend=backend,
     )
     output = capture.run(input_ids)
+    compute_graph_path = None
+    if getattr(args, "dump_compute_graph", False):
+        compute_graph = import_fx(capture.graph, capture.context)
+        model_name = args.model_name
+        safe_model_name = re.sub(r"[^A-Za-z0-9_.-]+", "__", model_name).strip("._")
+        output_directory = Path(args.dump_dir or "fx_traces") / (
+            safe_model_name or "model"
+        )
+        compute_graph_path = dump_compute_graph(
+            compute_graph, output_directory / "compute_graph.txt"
+        )
     print(f"transformers: PASS {_summary(output)}")
     print(
         f"capture: phase={capture.context.phase} "
         f"cache_state={capture.context.cache_state} "
         f"inputs={len(capture.context.input_order)}"
     )
+    if compute_graph_path is not None:
+        print(f"compute graph: {compute_graph_path}")
     return 0
 
 
@@ -134,6 +150,9 @@ def build_parser() -> argparse.ArgumentParser:
     transformers_parser.add_argument(
         "--input-ids", type=lambda value: [int(item) for item in value.split(",")],
         default="1,2,3,4",
+    )
+    transformers_parser.add_argument(
+        "--dump-compute-graph", action="store_true", default=False
     )
     transformers_parser.set_defaults(handler=_run_transformers)
 

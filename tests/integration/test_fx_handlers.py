@@ -5,6 +5,7 @@ from transformers.models.llama.configuration_llama import LlamaConfig
 from megabake import make_backend
 from megabake.fx_handler.export import capture_exported_program
 from megabake.fx_handler.transformers import capture_transformer
+from megabake.graph import dump_compute_graph, import_fx
 
 
 class Model(torch.nn.Module):
@@ -76,3 +77,30 @@ def test_capture_transformer_extracts_fx_graph_without_torch_compile():
             return_dict=False,
         )
         torch.testing.assert_close(capture.run(input_ids), expected)
+
+
+def test_capture_transformer_imports_and_dumps_compute_graph(tmp_path):
+    config = LlamaConfig(
+        vocab_size=32,
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        max_position_embeddings=16,
+    )
+    model = AutoModelForCausalLM.from_config(config).eval()
+    input_ids = torch.tensor([[1, 2, 3]])
+    backend = make_backend(cache=False)
+    capture = capture_transformer(
+        model, input_ids, device="cpu", backend=backend
+    )
+    graph = import_fx(capture.graph, capture.context)
+    path = dump_compute_graph(graph, tmp_path / "compute_graph.txt")
+
+    text = path.read_text(encoding="utf-8")
+    assert "## Values" in text
+    assert "## Operations" in text
+    assert "## Output Reconstruction" in text
+    assert f"values={len(graph.values)}" in text
+    assert f"operations={len(graph.ops)}" in text
