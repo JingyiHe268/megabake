@@ -81,3 +81,12 @@ nvcc --version  # should report release 13.0
 ```
 
 Activate the environment again in new shells with `source .venv/bin/activate`.
+
+```bash
+.venv/bin/python -m megabake.main transformers \  
+  --model-name HuggingFaceTB/SmolLM-135M \
+  --device cuda \
+  --dump-dir fx_traces/smollm \
+  --dump-compute-graph \
+  --dump-lowering-graph
+```
