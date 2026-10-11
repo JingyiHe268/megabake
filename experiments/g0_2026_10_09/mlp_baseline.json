@@ -1,0 +1,622 @@
+{
+  "inductor_gemm_autotune_eligible": false,
+  "torch": "2.14.0+cu130",
+  "gpu": "_CudaDeviceProperties(name='NVIDIA H200 MIG 3g.71gb', major=9, minor=0, total_memory=71424MB, multi_processor_count=60, uuid=9dea0b6d-ef2b-c5f3-8f4d-f2e6b5a59394, pci_bus_id=173, pci_device_id=0, pci_domain_id=0, L2_cache_size=29MB)",
+  "mode": "max-autotune-no-cudagraphs, then externally captured for GPU timing",
+  "seed": 456,
+  "cache": "repeated buffers",
+  "records": [
+    {
+      "m": 1,
+      "n": 1536,
+      "k": 576,
+      "input_and_reference_setup_seconds": 0.08635965920984745,
+      "eager_graph": {
+        "median_us": 13.70800007134676,
+        "batch_mean_us": [
+          13.861999846994877,
+          13.748000375926495,
+          13.724000193178654,
+          13.705000281333923,
+          13.729000464081764,
+          13.70100025087595,
+          13.69599997997284,
+          13.700000010430813,
+          13.700000010430813,
+          13.70800007134676,
+          13.710999861359596
+        ],
+        "first_call_host_us": 330.3010016679764,
+        "first_post_compile_host_us": 9290.49588739872,
+        "complete_host_call": {
+          "median_us": 53.6944717168808,
+          "samples_us": [
+            158.2913100719452,
+            59.88776683807373,
+            54.95920777320862,
+            53.6944717168808,
+            53.28468978404999,
+            53.46722900867462,
+            52.92519927024841,
+            53.102150559425354,
+            52.966177463531494,
+            72.47738540172577,
+            54.75245416164398
+          ]
+        },
+        "relative_l2_error": 0.0,
+        "kernel_names": [
+          "nvjet_sm90_tst_32x64_64x16_4x1_v_bz_TNN",
+          "void at::native::vectorized_elementwise_kernel<8, at::native::(anonymous namespace)::silu_kernel(at::TensorIteratorBase&)::{lambda()#1}::operator()() const::{lambda()#6}::operator()() const::{lambda(c10::BFloat16)#1}, std::array<char*, 2ul>, false>(int, at::native::(anonymous namespace)::silu_kernel(at::TensorIteratorBase&)::{lambda()#1}::operator()() const::{lambda()#6}::operator()() const::{lambda(c10::BFloat16)#1}, std::array<char*, 2ul>)",
+          "nvjet_sm90_tst_32x64_64x16_4x1_v_bz_TNN",
+          "void at::native::vectorized_elementwise_kernel<8, at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10::BFloat16, at::native::binary_internal::MulFunctor<float> >, std::array<char*, 3ul>, false>(int, at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10::BFloat16, at::native::binary_internal::MulFunctor<float> >, std::array<char*, 3ul>)",
+          "nvjet_sm90_tst_16x64_64x16_4x1_v_bz_TNN"
+        ],
+        "launch_count": 5,
+        "first_call_event_span_us": 177.15199291706085,
+        "first_post_compile_event_span_us": 180.95999956130981
+      },
+      "inductor_graph": {
+        "median_us": 7.829999551177025,
+        "batch_mean_us": [
+          7.938999682664871,
+          7.829999551177025,
+          7.926000282168388,
+          7.786999922245741,
+          7.799000013619661,
+          7.853000424802303,
+          7.710000034421682,
+          7.842999882996082,
+          7.714000064879656,
+          7.74300005286932,
+          7.87500012665987
+        ],
+        "first_call_host_us": 1544846.5030640364,
+        "first_post_compile_host_us": 7566.899061203003,
+        "complete_host_call": {
+          "median_us": 78.4657895565033,
+          "samples_us": [
+            181.7885786294937,
+            85.31659841537476,
+            78.4657895565033,
+            75.73887705802917,
+            72.87785410881042,
+            95.82377970218658,
+            81.03437721729279,
+            73.85201752185822,
+            73.02314043045044,
+            72.40474224090576,
+            83.37944746017456
+          ]
+        },
+        "relative_l2_error": 0.0035757655277848244,
+        "compile_and_first_call_host_us": 1544846.5030640364,
+        "kernel_names": [
+          "triton_per_fused_mm_permute_0",
+          "triton_red_fused_mm_mul_permute_silu_1"
+        ],
+        "launch_count": 2,
+        "first_call_event_span_us": 1544741.0888671875,
+        "first_post_compile_event_span_us": 259.7759962081909
+      },
+      "library_gemm_sum_us": 12.3240000102669,
+      "inductor_kernel_names": [
+        "triton_per_fused_mm_permute_0",
+        "triton_red_fused_mm_mul_permute_silu_1"
+      ]
+    },
+    {
+      "m": 256,
+      "n": 1536,
+      "k": 576,
+      "input_and_reference_setup_seconds": 0.005098346620798111,
+      "eager_graph": {
+        "median_us": 16.610000282526016,
+        "batch_mean_us": [
+          17.057999968528748,
+          16.755999997258186,
+          16.610000282526016,
+          16.666999086737633,
+          16.64300076663494,
+          16.561999917030334,
+          16.486000269651413,
+          16.383999958634377,
+          16.56300015747547,
+          17.064999788999557,
+          16.598999500274658
+        ],
+        "first_call_host_us": 255.32208383083344,
+        "first_post_compile_host_us": 11143.380776047707,
+        "complete_host_call": {
+          "median_us": 83.93824100494385,
+          "samples_us": [
+            417.73729026317596,
+            96.13856673240662,
+            84.99249815940857,
+            97.67897427082062,
+            93.44331920146942,
+            83.93824100494385,
+            81.4199447631836,
+            80.84625005722046,
+            80.97290992736816,
+            79.1102647781372,
+            80.27628064155579
+          ]
+        },
+        "relative_l2_error": 0.0,
+        "kernel_names": [
+          "nvjet_sm90_tst_112x64_64x9_2x4_h_bz_TNN",
+          "void at::native::vectorized_elementwise_kernel<8, at::native::(anonymous namespace)::silu_kernel(at::TensorIteratorBase&)::{lambda()#1}::operator()() const::{lambda()#6}::operator()() const::{lambda(c10::BFloat16)#1}, std::array<char*, 2ul>, false>(int, at::native::(anonymous namespace)::silu_kernel(at::TensorIteratorBase&)::{lambda()#1}::operator()() const::{lambda()#6}::operator()() const::{lambda(c10::BFloat16)#1}, std::array<char*, 2ul>)",
+          "nvjet_sm90_tst_112x64_64x9_2x4_h_bz_TNN",
+          "void at::native::vectorized_elementwise_kernel<8, at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10::BFloat16, at::native::binary_internal::MulFunctor<float> >, std::array<char*, 3ul>, false>(int, at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10::BFloat16, at::native::binary_internal::MulFunctor<float> >, std::array<char*, 3ul>)",
+          "nvjet_sm90_tst_40x64_64x16_1x2_h_bz_TNN"
+        ],
+        "launch_count": 5,
+        "first_call_event_span_us": 186.0480010509491,
+        "first_post_compile_event_span_us": 166.49599373340607
+      },
+      "inductor_graph": {
+        "median_us": 14.638000167906284,
+        "batch_mean_us": [
+          15.049999579787254,
+          14.712000265717506,
+          14.535999856889248,
+          14.580000191926956,
+          14.669000171124935,
+          14.561000280082226,
+          14.642000198364258,
+          14.708999544382095,
+          14.535999856889248,
+          14.638000167906284,
+          14.547999948263168
+        ],
+        "first_call_host_us": 96081.17677271366,
+        "first_post_compile_host_us": 12205.349281430244,
+        "complete_host_call": {
+          "median_us": 125.28710067272186,
+          "samples_us": [
+            569.0418183803558,
+            181.9133758544922,
+            164.75841403007507,
+            125.28710067272186,
+            118.2854175567627,
+            125.5720853805542,
+            115.96269905567169,
+            113.31960558891296,
+            109.78803038597107,
+            114.98294770717621,
+            149.4884490966797
+          ]
+        },
+        "relative_l2_error": 0.0035770598333328962,
+        "compile_and_first_call_host_us": 96081.17677271366,
+        "kernel_names": [
+          "nvjet_sm90_tst_112x64_64x9_2x4_h_bz_TNN",
+          "nvjet_sm90_tst_112x64_64x9_2x4_h_bz_TNN",
+          "triton_poi_fused_mul_silu_0",
+          "nvjet_sm90_tst_40x64_64x16_1x2_h_bz_TNN"
+        ],
+        "launch_count": 4,
+        "first_call_event_span_us": 95984.29107666016,
+        "first_post_compile_event_span_us": 296.60800099372864
+      },
+      "library_gemm_sum_us": 12.69300002604723,
+      "inductor_kernel_names": [
+        "nvjet_sm90_tst_112x64_64x9_2x4_h_bz_TNN",
+        "nvjet_sm90_tst_112x64_64x9_2x4_h_bz_TNN",
+        "triton_poi_fused_mul_silu_0",
+        "nvjet_sm90_tst_40x64_64x16_1x2_h_bz_TNN"
+      ]
+    },
+    {
+      "m": 1024,
+      "n": 1536,
+      "k": 576,
+      "input_and_reference_setup_seconds": 0.005169125273823738,
+      "eager_graph": {
+        "median_us": 30.75299970805645,
+        "batch_mean_us": [
+          31.39200061559677,
+          30.80100007355213,
+          30.73599934577942,
+          30.765000730752945,
+          30.748000368475914,
+          30.74299916625023,
+          30.578000470995903,
+          30.60000017285347,
+          30.75299970805645,
+          30.79799935221672,
+          30.771000310778618
+        ],
+        "first_call_host_us": 261.3496035337448,
+        "first_post_compile_host_us": 16360.409557819366,
+        "complete_host_call": {
+          "median_us": 86.52172982692719,
+          "samples_us": [
+            446.24507427215576,
+            113.09422552585602,
+            86.52172982692719,
+            83.44650268554688,
+            81.85766637325287,
+            81.88746869564056,
+            87.38599717617035,
+            99.11321103572845,
+            86.75828576087952,
+            85.35198867321014,
+            80.68419992923737
+          ]
+        },
+        "relative_l2_error": 0.0,
+        "kernel_names": [
+          "nvjet_sm90_tst_112x128_64x7_2x4_h_bz_TNN",
+          "void at::native::vectorized_elementwise_kernel<8, at::native::(anonymous namespace)::silu_kernel(at::TensorIteratorBase&)::{lambda()#1}::operator()() const::{lambda()#6}::operator()() const::{lambda(c10::BFloat16)#1}, std::array<char*, 2ul>, false>(int, at::native::(anonymous namespace)::silu_kernel(at::TensorIteratorBase&)::{lambda()#1}::operator()() const::{lambda()#6}::operator()() const::{lambda(c10::BFloat16)#1}, std::array<char*, 2ul>)",
+          "nvjet_sm90_tst_112x128_64x7_2x4_h_bz_TNN",
+          "void at::native::vectorized_elementwise_kernel<8, at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10::BFloat16, at::native::binary_internal::MulFunctor<float> >, std::array<char*, 3ul>, false>(int, at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10::BFloat16, at::native::binary_internal::MulFunctor<float> >, std::array<char*, 3ul>)",
+          "nvjet_sm90_tst_88x128_64x7_1x4_h_bz_TNN"
+        ],
+        "launch_count": 5,
+        "first_call_event_span_us": 195.19999623298645,
+        "first_post_compile_event_span_us": 150.56000649929047
+      },
+      "inductor_graph": {
+        "median_us": 27.44700014591217,
+        "batch_mean_us": [
+          27.61399932205677,
+          27.489999309182167,
+          27.43699960410595,
+          27.44700014591217,
+          27.45099924504757,
+          27.33200043439865,
+          27.4679996073246,
+          27.48899906873703,
+          27.389999479055405,
+          27.333000674843788,
+          27.338000014424324
+        ],
+        "first_call_host_us": 421.97294533252716,
+        "first_post_compile_host_us": 16582.703217864037,
+        "complete_host_call": {
+          "median_us": 118.0209219455719,
+          "samples_us": [
+            551.9408732652664,
+            175.22647976875305,
+            128.82985174655914,
+            118.0209219455719,
+            114.11868035793304,
+            132.76003301143646,
+            127.33228504657745,
+            117.07283556461334,
+            117.80299246311188,
+            116.52521789073944,
+            114.91961777210236
+          ]
+        },
+        "relative_l2_error": 0.0035989657044410706,
+        "compile_and_first_call_host_us": 421.97294533252716,
+        "kernel_names": [
+          "nvjet_sm90_tst_112x128_64x7_2x4_h_bz_TNN",
+          "nvjet_sm90_tst_112x128_64x7_2x4_h_bz_TNN",
+          "triton_poi_fused_mul_silu_0",
+          "nvjet_sm90_tst_88x128_64x7_1x4_h_bz_TNN"
+        ],
+        "launch_count": 4,
+        "first_call_event_span_us": 353.7920117378235,
+        "first_post_compile_event_span_us": 304.60798740386963
+      },
+      "library_gemm_sum_us": 23.28199939802289,
+      "inductor_kernel_names": [
+        "nvjet_sm90_tst_112x128_64x7_2x4_h_bz_TNN",
+        "nvjet_sm90_tst_112x128_64x7_2x4_h_bz_TNN",
+        "triton_poi_fused_mul_silu_0",
+        "nvjet_sm90_tst_88x128_64x7_1x4_h_bz_TNN"
+      ]
+    },
+    {
+      "m": 1,
+      "n": 11008,
+      "k": 4096,
+      "input_and_reference_setup_seconds": 0.014102721586823463,
+      "eager_graph": {
+        "median_us": 138.04499804973602,
+        "batch_mean_us": [
+          138.31600546836853,
+          138.04499804973602,
+          138.01799714565277,
+          138.0770057439804,
+          138.15000653266907,
+          138.14100623130798,
+          138.1250023841858,
+          138.04200291633606,
+          138.00500333309174,
+          137.98899948596954,
+          138.03499937057495
+        ],
+        "first_call_host_us": 282.4142575263977,
+        "first_post_compile_host_us": 58337.93617784977,
+        "complete_host_call": {
+          "median_us": 162.9795879125595,
+          "samples_us": [
+            289.39731419086456,
+            166.4143055677414,
+            167.32700169086456,
+            162.9795879125595,
+            161.95513308048248,
+            160.05709767341614,
+            167.35494136810303,
+            161.85827553272247,
+            168.06088387966156,
+            160.75000166893005,
+            159.60447490215302
+          ]
+        },
+        "relative_l2_error": 0.0,
+        "kernel_names": [
+          "nvjet_sm90_tst_192x8_64x8_2x1_v_bz_TNT",
+          "void at::native::vectorized_elementwise_kernel<8, at::native::(anonymous namespace)::silu_kernel(at::TensorIteratorBase&)::{lambda()#1}::operator()() const::{lambda()#6}::operator()() const::{lambda(c10::BFloat16)#1}, std::array<char*, 2ul>, false>(int, at::native::(anonymous namespace)::silu_kernel(at::TensorIteratorBase&)::{lambda()#1}::operator()() const::{lambda()#6}::operator()() const::{lambda(c10::BFloat16)#1}, std::array<char*, 2ul>)",
+          "nvjet_sm90_tst_192x8_64x8_2x1_v_bz_TNT",
+          "void at::native::vectorized_elementwise_kernel<8, at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10::BFloat16, at::native::binary_internal::MulFunctor<float> >, std::array<char*, 3ul>, false>(int, at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10::BFloat16, at::native::binary_internal::MulFunctor<float> >, std::array<char*, 3ul>)",
+          "nvjet_sm90_tst_64x8_64x16_2x1_v_bz_splitK_TNT",
+          "void cublasLt::splitKreduce_kernel<32, 16, int, float, __nv_bfloat16, float, __nv_bfloat16, false, float, __nv_bfloat16, __nv_bfloat16, true, false, false, false>(cublasLt::cublasSplitKParams<float>, float const*, __nv_bfloat16 const*, float*, __nv_bfloat16*, float const*, float const*, __nv_bfloat16 const*, float const*, __nv_bfloat16*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)"
+        ],
+        "launch_count": 6,
+        "first_call_event_span_us": 217.82399713993073,
+        "first_post_compile_event_span_us": 200.00000298023224
+      },
+      "inductor_graph": {
+        "median_us": 174.49000477790833,
+        "batch_mean_us": [
+          174.7329980134964,
+          174.5380014181137,
+          174.54800009727478,
+          174.45699870586395,
+          174.59000647068024,
+          174.49000477790833,
+          174.34799671173096,
+          174.33799803256989,
+          174.44700002670288,
+          174.37799274921417,
+          174.53500628471375
+        ],
+        "first_call_host_us": 147447.41469621658,
+        "first_post_compile_host_us": 71598.50932657719,
+        "complete_host_call": {
+          "median_us": 232.623890042305,
+          "samples_us": [
+            362.7501428127289,
+            241.46214127540588,
+            232.623890042305,
+            243.10313165187836,
+            234.90190505981445,
+            227.94492542743683,
+            227.52955555915833,
+            231.72050714492798,
+            238.172709941864,
+            230.6271344423294,
+            228.9116382598877
+          ]
+        },
+        "relative_l2_error": 0.003923856187611818,
+        "compile_and_first_call_host_us": 147447.41469621658,
+        "kernel_names": [
+          "triton_red_fused_mm_permute_0",
+          "triton_red_fused_mm_mul_permute_silu_1"
+        ],
+        "launch_count": 2,
+        "first_call_event_span_us": 147340.8660888672,
+        "first_post_compile_event_span_us": 323.96799325942993
+      },
+      "library_gemm_sum_us": 134.16900113224983,
+      "inductor_kernel_names": [
+        "triton_red_fused_mm_permute_0",
+        "triton_red_fused_mm_mul_permute_silu_1"
+      ]
+    },
+    {
+      "m": 256,
+      "n": 11008,
+      "k": 4096,
+      "input_and_reference_setup_seconds": 0.005464199930429459,
+      "eager_graph": {
+        "median_us": 200.5690038204193,
+        "batch_mean_us": [
+          200.7479965686798,
+          200.3210037946701,
+          200.45100152492523,
+          200.5860060453415,
+          200.22399723529816,
+          200.00199973583221,
+          200.85099339485168,
+          200.5690038204193,
+          200.6939947605133,
+          200.6019949913025,
+          200.3529965877533
+        ],
+        "first_call_host_us": 339.75765109062195,
+        "first_post_compile_host_us": 81799.27431046963,
+        "complete_host_call": {
+          "median_us": 227.01546549797058,
+          "samples_us": [
+            326.65207982063293,
+            231.62178695201874,
+            234.68583822250366,
+            226.25364363193512,
+            227.01546549797058,
+            233.2199364900589,
+            232.83995687961578,
+            224.81009364128113,
+            224.5437353849411,
+            225.60730576515198,
+            226.5535295009613
+          ]
+        },
+        "relative_l2_error": 0.0,
+        "kernel_names": [
+          "nvjet_sm90_tst_192x128_64x5_1x2_h_bz_coopB_TNT",
+          "void at::native::vectorized_elementwise_kernel<8, at::native::(anonymous namespace)::silu_kernel(at::TensorIteratorBase&)::{lambda()#1}::operator()() const::{lambda()#6}::operator()() const::{lambda(c10::BFloat16)#1}, std::array<char*, 2ul>, false>(int, at::native::(anonymous namespace)::silu_kernel(at::TensorIteratorBase&)::{lambda()#1}::operator()() const::{lambda()#6}::operator()() const::{lambda(c10::BFloat16)#1}, std::array<char*, 2ul>)",
+          "nvjet_sm90_tst_192x128_64x5_1x2_h_bz_coopB_TNT",
+          "void at::native::vectorized_elementwise_kernel<8, at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10::BFloat16, at::native::binary_internal::MulFunctor<float> >, std::array<char*, 3ul>, false>(int, at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10::BFloat16, at::native::binary_internal::MulFunctor<float> >, std::array<char*, 3ul>)",
+          "nvjet_sm90_tst_144x128_64x6_1x2_h_bz_TNN"
+        ],
+        "launch_count": 5,
+        "first_call_event_span_us": 268.0639922618866,
+        "first_post_compile_event_span_us": 272.19200134277344
+      },
+      "inductor_graph": {
+        "median_us": 196.3459998369217,
+        "batch_mean_us": [
+          196.8739926815033,
+          196.58499956130981,
+          196.16499543190002,
+          196.09899818897247,
+          196.1739957332611,
+          196.3459998369217,
+          196.1749941110611,
+          196.27000391483307,
+          196.80200517177582,
+          196.76099717617035,
+          196.59100472927094
+        ],
+        "first_call_host_us": 84852.8053611517,
+        "first_post_compile_host_us": 82105.2435785532,
+        "complete_host_call": {
+          "median_us": 275.60628950595856,
+          "samples_us": [
+            524.8356610536575,
+            306.30268156528473,
+            273.91500771045685,
+            275.6211906671524,
+            278.47103774547577,
+            267.15174317359924,
+            267.8483724594116,
+            266.8052911758423,
+            275.60628950595856,
+            281.77350759506226,
+            274.07705783843994
+          ]
+        },
+        "relative_l2_error": 0.0035795983858406544,
+        "compile_and_first_call_host_us": 84852.8053611517,
+        "kernel_names": [
+          "nvjet_sm90_tst_192x128_64x5_1x2_h_bz_coopB_TNT",
+          "nvjet_sm90_tst_192x128_64x5_1x2_h_bz_coopB_TNT",
+          "triton_poi_fused_mul_silu_0",
+          "nvjet_sm90_tst_144x128_64x6_1x2_h_bz_TNN"
+        ],
+        "launch_count": 4,
+        "first_call_event_span_us": 84761.43646240234,
+        "first_post_compile_event_span_us": 409.280002117157
+      },
+      "library_gemm_sum_us": 185.71699410676956,
+      "inductor_kernel_names": [
+        "nvjet_sm90_tst_192x128_64x5_1x2_h_bz_coopB_TNT",
+        "nvjet_sm90_tst_192x128_64x5_1x2_h_bz_coopB_TNT",
+        "triton_poi_fused_mul_silu_0",
+        "nvjet_sm90_tst_144x128_64x6_1x2_h_bz_TNN"
+      ]
+    },
+    {
+      "m": 1024,
+      "n": 11008,
+      "k": 4096,
+      "input_and_reference_setup_seconds": 0.0036656316369771957,
+      "eager_graph": {
+        "median_us": 753.07697057724,
+        "batch_mean_us": [
+          753.5070180892944,
+          753.2140016555786,
+          753.4980177879333,
+          753.3289790153503,
+          753.5840272903442,
+          753.07697057724,
+          752.5960206985474,
+          751.6279816627502,
+          752.0400285720825,
+          751.6549825668335,
+          749.2079734802246
+        ],
+        "first_call_host_us": 1002.8500109910965,
+        "first_post_compile_host_us": 300680.84970116615,
+        "complete_host_call": {
+          "median_us": 781.0164242982864,
+          "samples_us": [
+            1049.5837777853012,
+            792.4549281597137,
+            788.3105427026749,
+            782.8827947378159,
+            778.1423628330231,
+            779.5989513397217,
+            778.3453911542892,
+            781.4988493919373,
+            780.9232920408249,
+            773.8135755062103,
+            781.0164242982864
+          ]
+        },
+        "relative_l2_error": 0.0,
+        "kernel_names": [
+          "nvjet_sm90_tst_128x256_64x4_2x1_v_bz_coopA_TNN",
+          "void at::native::vectorized_elementwise_kernel<8, at::native::(anonymous namespace)::silu_kernel(at::TensorIteratorBase&)::{lambda()#1}::operator()() const::{lambda()#6}::operator()() const::{lambda(c10::BFloat16)#1}, std::array<char*, 2ul>, false>(int, at::native::(anonymous namespace)::silu_kernel(at::TensorIteratorBase&)::{lambda()#1}::operator()() const::{lambda()#6}::operator()() const::{lambda(c10::BFloat16)#1}, std::array<char*, 2ul>)",
+          "nvjet_sm90_tst_128x256_64x4_2x1_v_bz_coopA_TNN",
+          "void at::native::vectorized_elementwise_kernel<8, at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10::BFloat16, at::native::binary_internal::MulFunctor<float> >, std::array<char*, 3ul>, false>(int, at::native::BinaryFunctor<c10::BFloat16, c10::BFloat16, c10::BFloat16, at::native::binary_internal::MulFunctor<float> >, std::array<char*, 3ul>)",
+          "nvjet_sm90_tst_192x128_64x5_1x2_h_bz_coopB_TNT"
+        ],
+        "launch_count": 5,
+        "first_call_event_span_us": 756.6720247268677,
+        "first_post_compile_event_span_us": 822.1439719200134
+      },
+      "inductor_graph": {
+        "median_us": 737.5879883766174,
+        "batch_mean_us": [
+          739.2590045928955,
+          740.5790090560913,
+          740.7060265541077,
+          740.9359812736511,
+          740.3039932250977,
+          737.4569773674011,
+          737.4740242958069,
+          737.5230193138123,
+          737.5879883766174,
+          737.4740242958069,
+          737.3769879341125
+        ],
+        "first_call_host_us": 1212.017610669136,
+        "first_post_compile_host_us": 293332.9064399004,
+        "complete_host_call": {
+          "median_us": 826.4388889074326,
+          "samples_us": [
+            1282.8707695007324,
+            902.7812629938126,
+            825.5373686552048,
+            824.8630911111832,
+            829.208642244339,
+            826.4388889074326,
+            830.1734924316406,
+            823.7045258283615,
+            812.796875834465,
+            826.273113489151,
+            829.5327425003052
+          ]
+        },
+        "relative_l2_error": 0.003579431679099798,
+        "compile_and_first_call_host_us": 1212.017610669136,
+        "kernel_names": [
+          "nvjet_sm90_tst_128x256_64x4_2x1_v_bz_coopA_TNN",
+          "nvjet_sm90_tst_128x256_64x4_2x1_v_bz_coopA_TNN",
+          "triton_poi_fused_mul_silu_0",
+          "nvjet_sm90_tst_192x128_64x5_1x2_h_bz_coopB_TNT"
+        ],
+        "launch_count": 4,
+        "first_call_event_span_us": 1123.1679916381836,
+        "first_post_compile_event_span_us": 964.7039771080017
+      },
+      "library_gemm_sum_us": 696.2300091981888,
+      "inductor_kernel_names": [
+        "nvjet_sm90_tst_128x256_64x4_2x1_v_bz_coopA_TNN",
+        "nvjet_sm90_tst_128x256_64x4_2x1_v_bz_coopA_TNN",
+        "triton_poi_fused_mul_silu_0",
+        "nvjet_sm90_tst_192x128_64x5_1x2_h_bz_coopB_TNT"
+      ]
+    }
+  ],
+  "compile_wrapper_setup_seconds": 0.2558318544179201
+}

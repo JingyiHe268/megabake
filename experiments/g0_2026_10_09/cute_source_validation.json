@@ -1,0 +1,184 @@
+{
+  "torch": "2.14.0+cu130",
+  "torch_git": "08187d9e0fba026dc8217405802ab5381dc88d90",
+  "cuda_runtime": "13.0",
+  "cute": "4.8.0",
+  "gpu": "_CudaDeviceProperties(name='NVIDIA H200 MIG 3g.71gb', major=9, minor=0, total_memory=71424MB, multi_processor_count=60, uuid=9dea0b6d-ef2b-c5f3-8f4d-f2e6b5a59394, pci_bus_id=173, pci_device_id=0, pci_domain_id=0, L2_cache_size=29MB)",
+  "cutlass_revision": "0b55a2f691d69981583568fd9eb69687b1f0de8a",
+  "source_sha256": {
+    "dense_gemm.py": "bb7b76d893219757e2f3701abf1a7c8c819b9966e38aaed30a768596a55aca9f",
+    "dense_gemm_persistent.py": "65088a1fd7655ed46ad54fecd08e1461a334fb38f1b2d1da7cf252e465afc130"
+  },
+  "seed": 123,
+  "validation_only": true,
+  "precision": "BF16 inputs/output, FP32 accumulation; reduced precision reduction disabled",
+  "timing": "CUDA event batch averages, CUDA Graph replay; no Python gaps; no host latency claim",
+  "cache": "repeated same buffers",
+  "records": [
+    {
+      "m": 4,
+      "n": 11008,
+      "k": 4096,
+      "provider": "torch_mm",
+      "tile": null,
+      "weight_buffers": 1,
+      "setup_seconds": 1.9166618585586548e-06,
+      "max_abs_error": 1.0,
+      "relative_l2_error": 0.00019949064881075174,
+      "status": "passed_diagnostic"
+    },
+    {
+      "m": 4,
+      "n": 11008,
+      "k": 4096,
+      "provider": "dense",
+      "tile": [
+        64,
+        64
+      ],
+      "weight_buffers": 1,
+      "threads": 128,
+      "stages": 14,
+      "setup_seconds": 0.27738563530147076,
+      "max_abs_error": 1.0,
+      "relative_l2_error": 0.00019949064881075174,
+      "status": "passed_diagnostic"
+    },
+    {
+      "m": 4,
+      "n": 11008,
+      "k": 4096,
+      "provider": "persistent",
+      "tile": [
+        64,
+        64
+      ],
+      "weight_buffers": 1,
+      "threads": 256,
+      "stages": 13,
+      "setup_seconds": 0.41411336325109005,
+      "max_abs_error": 1.0,
+      "relative_l2_error": 0.00019949064881075174,
+      "status": "passed_diagnostic"
+    },
+    {
+      "m": 4,
+      "n": 11008,
+      "k": 4096,
+      "provider": "restart",
+      "tile": [
+        64,
+        64
+      ],
+      "weight_buffers": 1,
+      "threads": 128,
+      "stages": 14,
+      "setup_seconds": 0.27246589586138725,
+      "max_abs_error": 1.0,
+      "relative_l2_error": 0.00019949064881075174,
+      "status": "passed_diagnostic"
+    },
+    {
+      "m": 4,
+      "n": 11008,
+      "k": 4096,
+      "provider": "dense",
+      "tile": [
+        64,
+        128
+      ],
+      "weight_buffers": 1,
+      "threads": 128,
+      "stages": 9,
+      "setup_seconds": 0.29117591120302677,
+      "max_abs_error": 1.0,
+      "relative_l2_error": 0.00019949064881075174,
+      "status": "passed_diagnostic"
+    },
+    {
+      "m": 4,
+      "n": 11008,
+      "k": 4096,
+      "provider": "persistent",
+      "tile": [
+        64,
+        128
+      ],
+      "weight_buffers": 1,
+      "threads": 256,
+      "stages": 8,
+      "setup_seconds": 0.42754594422876835,
+      "max_abs_error": 1.0,
+      "relative_l2_error": 0.00019949064881075174,
+      "status": "passed_diagnostic"
+    },
+    {
+      "m": 4,
+      "n": 11008,
+      "k": 4096,
+      "provider": "restart",
+      "tile": [
+        64,
+        128
+      ],
+      "weight_buffers": 1,
+      "threads": 128,
+      "stages": 9,
+      "setup_seconds": 0.29438153840601444,
+      "max_abs_error": 1.0,
+      "relative_l2_error": 0.00019949064881075174,
+      "status": "passed_diagnostic"
+    },
+    {
+      "m": 4,
+      "n": 11008,
+      "k": 4096,
+      "provider": "dense",
+      "tile": [
+        128,
+        128
+      ],
+      "weight_buffers": 1,
+      "threads": 128,
+      "stages": 7,
+      "setup_seconds": 0.39568188786506653,
+      "max_abs_error": 1.0,
+      "relative_l2_error": 0.00019949064881075174,
+      "status": "passed_diagnostic"
+    },
+    {
+      "m": 4,
+      "n": 11008,
+      "k": 4096,
+      "provider": "persistent",
+      "tile": [
+        128,
+        128
+      ],
+      "weight_buffers": 1,
+      "threads": 256,
+      "stages": 6,
+      "setup_seconds": 1.0579247493296862,
+      "max_abs_error": 1.0,
+      "relative_l2_error": 0.00019949064881075174,
+      "status": "passed_diagnostic"
+    },
+    {
+      "m": 4,
+      "n": 11008,
+      "k": 4096,
+      "provider": "restart",
+      "tile": [
+        128,
+        128
+      ],
+      "weight_buffers": 1,
+      "threads": 128,
+      "stages": 7,
+      "setup_seconds": 0.43884463980793953,
+      "max_abs_error": 1.0,
+      "relative_l2_error": 0.00019949064881075174,
+      "status": "passed_diagnostic"
+    }
+  ]
+}

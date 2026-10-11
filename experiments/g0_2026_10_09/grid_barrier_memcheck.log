@@ -1,0 +1,982 @@
+========= COMPUTE-SANITIZER
+========= Program hit CUDA_ERROR_INVALID_VALUE (error 1) due to "invalid argument" on CUDA API call to cuGetProcAddress_v2.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame:  [0x10ce1] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x24134] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x150d9] in cydriver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x4128e2] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame: PyObject_Vectorcall [0x140136] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1509ae] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_CallOneArg [0x18591e] in libpython3.13.so.1.0
+=========         Host Frame: _PyObject_GenericGetAttrWithDict [0x1708d4] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_GetAttr [0x1401dc] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x15111d] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adea9] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x22820c] in libpython3.13.so.1.0
+=========         Host Frame:  [0x278fc1] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2377e5] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame: PyEval_EvalCode [0x22a1ba] in libpython3.13.so.1.0
+=========         Host Frame:  [0x267a72] in libpython3.13.so.1.0
+=========         Host Frame:  [0x264e44] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2624d5] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261ace] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261820] in libpython3.13.so.1.0
+=========         Host Frame: Py_RunMain [0x25f81f] in libpython3.13.so.1.0
+=========         Host Frame: Py_BytesMain [0x217b6b] in libpython3.13.so.1.0
+=========         Host Frame: __libc_start_call_main [0x3447] in libc.so.6
+=========         Host Frame: __libc_start_main [0x350a] in libc.so.6
+=========         Host Frame: _start [0x1094] in python
+=========         Host Frame: get_compute_capability_major_minor in cuda.py:163
+=========         Host Frame: detect_gpu_arch in env_manager.py:422
+=========         Host Frame: arch in env_manager.py:999
+=========         Host Frame: apply_envar_settings in compiler.py:1202
+=========         Host Frame: _prepare_compilation in dsl.py:2722
+=========         Host Frame: _func_impl in dsl.py:2811
+=========         Host Frame: _func in dsl.py:2764
+=========         Host Frame: _compile in compiler.py:1739
+=========         Host Frame: __call__ in compiler.py:1569
+=========         Host Frame: main in grid_barrier_probe.py:140
+========= 
+========= Program hit CUDA_ERROR_INVALID_VALUE (error 1) due to "invalid argument" on CUDA API call to cuGetProcAddress_v2.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame:  [0x10d08] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x24134] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x150d9] in cydriver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x4128e2] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame: PyObject_Vectorcall [0x140136] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1509ae] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_CallOneArg [0x18591e] in libpython3.13.so.1.0
+=========         Host Frame: _PyObject_GenericGetAttrWithDict [0x1708d4] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_GetAttr [0x1401dc] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x15111d] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adea9] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x22820c] in libpython3.13.so.1.0
+=========         Host Frame:  [0x278fc1] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2377e5] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame: PyEval_EvalCode [0x22a1ba] in libpython3.13.so.1.0
+=========         Host Frame:  [0x267a72] in libpython3.13.so.1.0
+=========         Host Frame:  [0x264e44] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2624d5] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261ace] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261820] in libpython3.13.so.1.0
+=========         Host Frame: Py_RunMain [0x25f81f] in libpython3.13.so.1.0
+=========         Host Frame: Py_BytesMain [0x217b6b] in libpython3.13.so.1.0
+=========         Host Frame: __libc_start_call_main [0x3447] in libc.so.6
+=========         Host Frame: __libc_start_main [0x350a] in libc.so.6
+=========         Host Frame: _start [0x1094] in python
+=========         Host Frame: get_compute_capability_major_minor in cuda.py:163
+=========         Host Frame: detect_gpu_arch in env_manager.py:422
+=========         Host Frame: arch in env_manager.py:999
+=========         Host Frame: apply_envar_settings in compiler.py:1202
+=========         Host Frame: _prepare_compilation in dsl.py:2722
+=========         Host Frame: _func_impl in dsl.py:2811
+=========         Host Frame: _func in dsl.py:2764
+=========         Host Frame: _compile in compiler.py:1739
+=========         Host Frame: __call__ in compiler.py:1569
+=========         Host Frame: main in grid_barrier_probe.py:140
+========= 
+========= Program hit CUDA_ERROR_INVALID_VALUE (error 1) due to "invalid argument" on CUDA API call to cuGetProcAddress_v2.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame:  [0x10d2f] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x24134] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x150d9] in cydriver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x4128e2] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame: PyObject_Vectorcall [0x140136] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1509ae] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_CallOneArg [0x18591e] in libpython3.13.so.1.0
+=========         Host Frame: _PyObject_GenericGetAttrWithDict [0x1708d4] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_GetAttr [0x1401dc] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x15111d] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adea9] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x22820c] in libpython3.13.so.1.0
+=========         Host Frame:  [0x278fc1] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2377e5] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame: PyEval_EvalCode [0x22a1ba] in libpython3.13.so.1.0
+=========         Host Frame:  [0x267a72] in libpython3.13.so.1.0
+=========         Host Frame:  [0x264e44] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2624d5] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261ace] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261820] in libpython3.13.so.1.0
+=========         Host Frame: Py_RunMain [0x25f81f] in libpython3.13.so.1.0
+=========         Host Frame: Py_BytesMain [0x217b6b] in libpython3.13.so.1.0
+=========         Host Frame: __libc_start_call_main [0x3447] in libc.so.6
+=========         Host Frame: __libc_start_main [0x350a] in libc.so.6
+=========         Host Frame: _start [0x1094] in python
+=========         Host Frame: get_compute_capability_major_minor in cuda.py:163
+=========         Host Frame: detect_gpu_arch in env_manager.py:422
+=========         Host Frame: arch in env_manager.py:999
+=========         Host Frame: apply_envar_settings in compiler.py:1202
+=========         Host Frame: _prepare_compilation in dsl.py:2722
+=========         Host Frame: _func_impl in dsl.py:2811
+=========         Host Frame: _func in dsl.py:2764
+=========         Host Frame: _compile in compiler.py:1739
+=========         Host Frame: __call__ in compiler.py:1569
+=========         Host Frame: main in grid_barrier_probe.py:140
+========= 
+========= Program hit CUDA_ERROR_INVALID_VALUE (error 1) due to "invalid argument" on CUDA API call to cuGetProcAddress_v2.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame:  [0x10d56] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x24134] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x150d9] in cydriver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x4128e2] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame: PyObject_Vectorcall [0x140136] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1509ae] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_CallOneArg [0x18591e] in libpython3.13.so.1.0
+=========         Host Frame: _PyObject_GenericGetAttrWithDict [0x1708d4] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_GetAttr [0x1401dc] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x15111d] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adea9] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x22820c] in libpython3.13.so.1.0
+=========         Host Frame:  [0x278fc1] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2377e5] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame: PyEval_EvalCode [0x22a1ba] in libpython3.13.so.1.0
+=========         Host Frame:  [0x267a72] in libpython3.13.so.1.0
+=========         Host Frame:  [0x264e44] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2624d5] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261ace] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261820] in libpython3.13.so.1.0
+=========         Host Frame: Py_RunMain [0x25f81f] in libpython3.13.so.1.0
+=========         Host Frame: Py_BytesMain [0x217b6b] in libpython3.13.so.1.0
+=========         Host Frame: __libc_start_call_main [0x3447] in libc.so.6
+=========         Host Frame: __libc_start_main [0x350a] in libc.so.6
+=========         Host Frame: _start [0x1094] in python
+=========         Host Frame: get_compute_capability_major_minor in cuda.py:163
+=========         Host Frame: detect_gpu_arch in env_manager.py:422
+=========         Host Frame: arch in env_manager.py:999
+=========         Host Frame: apply_envar_settings in compiler.py:1202
+=========         Host Frame: _prepare_compilation in dsl.py:2722
+=========         Host Frame: _func_impl in dsl.py:2811
+=========         Host Frame: _func in dsl.py:2764
+=========         Host Frame: _compile in compiler.py:1739
+=========         Host Frame: __call__ in compiler.py:1569
+=========         Host Frame: main in grid_barrier_probe.py:140
+========= 
+========= Program hit CUDA_ERROR_INVALID_VALUE (error 1) due to "invalid argument" on CUDA API call to cuGetProcAddress_v2.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame:  [0x10d7d] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x24134] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x150d9] in cydriver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x4128e2] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame: PyObject_Vectorcall [0x140136] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1509ae] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_CallOneArg [0x18591e] in libpython3.13.so.1.0
+=========         Host Frame: _PyObject_GenericGetAttrWithDict [0x1708d4] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_GetAttr [0x1401dc] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x15111d] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adea9] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x22820c] in libpython3.13.so.1.0
+=========         Host Frame:  [0x278fc1] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2377e5] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame: PyEval_EvalCode [0x22a1ba] in libpython3.13.so.1.0
+=========         Host Frame:  [0x267a72] in libpython3.13.so.1.0
+=========         Host Frame:  [0x264e44] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2624d5] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261ace] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261820] in libpython3.13.so.1.0
+=========         Host Frame: Py_RunMain [0x25f81f] in libpython3.13.so.1.0
+=========         Host Frame: Py_BytesMain [0x217b6b] in libpython3.13.so.1.0
+=========         Host Frame: __libc_start_call_main [0x3447] in libc.so.6
+=========         Host Frame: __libc_start_main [0x350a] in libc.so.6
+=========         Host Frame: _start [0x1094] in python
+=========         Host Frame: get_compute_capability_major_minor in cuda.py:163
+=========         Host Frame: detect_gpu_arch in env_manager.py:422
+=========         Host Frame: arch in env_manager.py:999
+=========         Host Frame: apply_envar_settings in compiler.py:1202
+=========         Host Frame: _prepare_compilation in dsl.py:2722
+=========         Host Frame: _func_impl in dsl.py:2811
+=========         Host Frame: _func in dsl.py:2764
+=========         Host Frame: _compile in compiler.py:1739
+=========         Host Frame: __call__ in compiler.py:1569
+=========         Host Frame: main in grid_barrier_probe.py:140
+========= 
+========= Program hit CUDA_ERROR_INVALID_VALUE (error 1) due to "invalid argument" on CUDA API call to cuGetProcAddress_v2.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame:  [0x10da4] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x24134] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x150d9] in cydriver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x4128e2] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame: PyObject_Vectorcall [0x140136] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1509ae] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_CallOneArg [0x18591e] in libpython3.13.so.1.0
+=========         Host Frame: _PyObject_GenericGetAttrWithDict [0x1708d4] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_GetAttr [0x1401dc] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x15111d] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adea9] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x22820c] in libpython3.13.so.1.0
+=========         Host Frame:  [0x278fc1] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2377e5] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame: PyEval_EvalCode [0x22a1ba] in libpython3.13.so.1.0
+=========         Host Frame:  [0x267a72] in libpython3.13.so.1.0
+=========         Host Frame:  [0x264e44] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2624d5] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261ace] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261820] in libpython3.13.so.1.0
+=========         Host Frame: Py_RunMain [0x25f81f] in libpython3.13.so.1.0
+=========         Host Frame: Py_BytesMain [0x217b6b] in libpython3.13.so.1.0
+=========         Host Frame: __libc_start_call_main [0x3447] in libc.so.6
+=========         Host Frame: __libc_start_main [0x350a] in libc.so.6
+=========         Host Frame: _start [0x1094] in python
+=========         Host Frame: get_compute_capability_major_minor in cuda.py:163
+=========         Host Frame: detect_gpu_arch in env_manager.py:422
+=========         Host Frame: arch in env_manager.py:999
+=========         Host Frame: apply_envar_settings in compiler.py:1202
+=========         Host Frame: _prepare_compilation in dsl.py:2722
+=========         Host Frame: _func_impl in dsl.py:2811
+=========         Host Frame: _func in dsl.py:2764
+=========         Host Frame: _compile in compiler.py:1739
+=========         Host Frame: __call__ in compiler.py:1569
+=========         Host Frame: main in grid_barrier_probe.py:140
+========= 
+========= Program hit CUDA_ERROR_INVALID_VALUE (error 1) due to "invalid argument" on CUDA API call to cuGetProcAddress_v2.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame:  [0x10dcb] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x24134] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x150d9] in cydriver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x4128e2] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame: PyObject_Vectorcall [0x140136] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1509ae] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_CallOneArg [0x18591e] in libpython3.13.so.1.0
+=========         Host Frame: _PyObject_GenericGetAttrWithDict [0x1708d4] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_GetAttr [0x1401dc] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x15111d] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adea9] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x22820c] in libpython3.13.so.1.0
+=========         Host Frame:  [0x278fc1] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2377e5] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame: PyEval_EvalCode [0x22a1ba] in libpython3.13.so.1.0
+=========         Host Frame:  [0x267a72] in libpython3.13.so.1.0
+=========         Host Frame:  [0x264e44] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2624d5] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261ace] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261820] in libpython3.13.so.1.0
+=========         Host Frame: Py_RunMain [0x25f81f] in libpython3.13.so.1.0
+=========         Host Frame: Py_BytesMain [0x217b6b] in libpython3.13.so.1.0
+=========         Host Frame: __libc_start_call_main [0x3447] in libc.so.6
+=========         Host Frame: __libc_start_main [0x350a] in libc.so.6
+=========         Host Frame: _start [0x1094] in python
+=========         Host Frame: get_compute_capability_major_minor in cuda.py:163
+=========         Host Frame: detect_gpu_arch in env_manager.py:422
+=========         Host Frame: arch in env_manager.py:999
+=========         Host Frame: apply_envar_settings in compiler.py:1202
+=========         Host Frame: _prepare_compilation in dsl.py:2722
+=========         Host Frame: _func_impl in dsl.py:2811
+=========         Host Frame: _func in dsl.py:2764
+=========         Host Frame: _compile in compiler.py:1739
+=========         Host Frame: __call__ in compiler.py:1569
+=========         Host Frame: main in grid_barrier_probe.py:140
+========= 
+========= Program hit CUDA_ERROR_INVALID_VALUE (error 1) due to "invalid argument" on CUDA API call to cuGetProcAddress_v2.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame:  [0x10df2] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x24134] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x150d9] in cydriver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x4128e2] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame: PyObject_Vectorcall [0x140136] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1509ae] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_CallOneArg [0x18591e] in libpython3.13.so.1.0
+=========         Host Frame: _PyObject_GenericGetAttrWithDict [0x1708d4] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_GetAttr [0x1401dc] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x15111d] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adea9] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x22820c] in libpython3.13.so.1.0
+=========         Host Frame:  [0x278fc1] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2377e5] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame: PyEval_EvalCode [0x22a1ba] in libpython3.13.so.1.0
+=========         Host Frame:  [0x267a72] in libpython3.13.so.1.0
+=========         Host Frame:  [0x264e44] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2624d5] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261ace] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261820] in libpython3.13.so.1.0
+=========         Host Frame: Py_RunMain [0x25f81f] in libpython3.13.so.1.0
+=========         Host Frame: Py_BytesMain [0x217b6b] in libpython3.13.so.1.0
+=========         Host Frame: __libc_start_call_main [0x3447] in libc.so.6
+=========         Host Frame: __libc_start_main [0x350a] in libc.so.6
+=========         Host Frame: _start [0x1094] in python
+=========         Host Frame: get_compute_capability_major_minor in cuda.py:163
+=========         Host Frame: detect_gpu_arch in env_manager.py:422
+=========         Host Frame: arch in env_manager.py:999
+=========         Host Frame: apply_envar_settings in compiler.py:1202
+=========         Host Frame: _prepare_compilation in dsl.py:2722
+=========         Host Frame: _func_impl in dsl.py:2811
+=========         Host Frame: _func in dsl.py:2764
+=========         Host Frame: _compile in compiler.py:1739
+=========         Host Frame: __call__ in compiler.py:1569
+=========         Host Frame: main in grid_barrier_probe.py:140
+========= 
+========= Program hit CUDA_ERROR_INVALID_VALUE (error 1) due to "invalid argument" on CUDA API call to cuGetProcAddress_v2.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame:  [0x10e19] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x24134] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x150d9] in cydriver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x4128e2] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame: PyObject_Vectorcall [0x140136] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1509ae] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_CallOneArg [0x18591e] in libpython3.13.so.1.0
+=========         Host Frame: _PyObject_GenericGetAttrWithDict [0x1708d4] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_GetAttr [0x1401dc] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x15111d] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adea9] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x22820c] in libpython3.13.so.1.0
+=========         Host Frame:  [0x278fc1] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2377e5] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame: PyEval_EvalCode [0x22a1ba] in libpython3.13.so.1.0
+=========         Host Frame:  [0x267a72] in libpython3.13.so.1.0
+=========         Host Frame:  [0x264e44] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2624d5] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261ace] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261820] in libpython3.13.so.1.0
+=========         Host Frame: Py_RunMain [0x25f81f] in libpython3.13.so.1.0
+=========         Host Frame: Py_BytesMain [0x217b6b] in libpython3.13.so.1.0
+=========         Host Frame: __libc_start_call_main [0x3447] in libc.so.6
+=========         Host Frame: __libc_start_main [0x350a] in libc.so.6
+=========         Host Frame: _start [0x1094] in python
+=========         Host Frame: get_compute_capability_major_minor in cuda.py:163
+=========         Host Frame: detect_gpu_arch in env_manager.py:422
+=========         Host Frame: arch in env_manager.py:999
+=========         Host Frame: apply_envar_settings in compiler.py:1202
+=========         Host Frame: _prepare_compilation in dsl.py:2722
+=========         Host Frame: _func_impl in dsl.py:2811
+=========         Host Frame: _func in dsl.py:2764
+=========         Host Frame: _compile in compiler.py:1739
+=========         Host Frame: __call__ in compiler.py:1569
+=========         Host Frame: main in grid_barrier_probe.py:140
+========= 
+========= Program hit CUDA_ERROR_INVALID_VALUE (error 1) due to "invalid argument" on CUDA API call to cuGetProcAddress_v2.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame:  [0x10e40] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x24134] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x150d9] in cydriver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x4128e2] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame: PyObject_Vectorcall [0x140136] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1509ae] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_CallOneArg [0x18591e] in libpython3.13.so.1.0
+=========         Host Frame: _PyObject_GenericGetAttrWithDict [0x1708d4] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_GetAttr [0x1401dc] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x15111d] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adea9] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x22820c] in libpython3.13.so.1.0
+=========         Host Frame:  [0x278fc1] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2377e5] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame: PyEval_EvalCode [0x22a1ba] in libpython3.13.so.1.0
+=========         Host Frame:  [0x267a72] in libpython3.13.so.1.0
+=========         Host Frame:  [0x264e44] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2624d5] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261ace] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261820] in libpython3.13.so.1.0
+=========         Host Frame: Py_RunMain [0x25f81f] in libpython3.13.so.1.0
+=========         Host Frame: Py_BytesMain [0x217b6b] in libpython3.13.so.1.0
+=========         Host Frame: __libc_start_call_main [0x3447] in libc.so.6
+=========         Host Frame: __libc_start_main [0x350a] in libc.so.6
+=========         Host Frame: _start [0x1094] in python
+=========         Host Frame: get_compute_capability_major_minor in cuda.py:163
+=========         Host Frame: detect_gpu_arch in env_manager.py:422
+=========         Host Frame: arch in env_manager.py:999
+=========         Host Frame: apply_envar_settings in compiler.py:1202
+=========         Host Frame: _prepare_compilation in dsl.py:2722
+=========         Host Frame: _func_impl in dsl.py:2811
+=========         Host Frame: _func in dsl.py:2764
+=========         Host Frame: _compile in compiler.py:1739
+=========         Host Frame: __call__ in compiler.py:1569
+=========         Host Frame: main in grid_barrier_probe.py:140
+========= 
+========= Program hit CUDA_ERROR_INVALID_VALUE (error 1) due to "invalid argument" on CUDA API call to cuGetProcAddress_v2.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame:  [0x10e67] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x24134] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x150d9] in cydriver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x4128e2] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame: PyObject_Vectorcall [0x140136] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1509ae] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_CallOneArg [0x18591e] in libpython3.13.so.1.0
+=========         Host Frame: _PyObject_GenericGetAttrWithDict [0x1708d4] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_GetAttr [0x1401dc] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x15111d] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adea9] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x22820c] in libpython3.13.so.1.0
+=========         Host Frame:  [0x278fc1] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2377e5] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame: PyEval_EvalCode [0x22a1ba] in libpython3.13.so.1.0
+=========         Host Frame:  [0x267a72] in libpython3.13.so.1.0
+=========         Host Frame:  [0x264e44] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2624d5] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261ace] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261820] in libpython3.13.so.1.0
+=========         Host Frame: Py_RunMain [0x25f81f] in libpython3.13.so.1.0
+=========         Host Frame: Py_BytesMain [0x217b6b] in libpython3.13.so.1.0
+=========         Host Frame: __libc_start_call_main [0x3447] in libc.so.6
+=========         Host Frame: __libc_start_main [0x350a] in libc.so.6
+=========         Host Frame: _start [0x1094] in python
+=========         Host Frame: get_compute_capability_major_minor in cuda.py:163
+=========         Host Frame: detect_gpu_arch in env_manager.py:422
+=========         Host Frame: arch in env_manager.py:999
+=========         Host Frame: apply_envar_settings in compiler.py:1202
+=========         Host Frame: _prepare_compilation in dsl.py:2722
+=========         Host Frame: _func_impl in dsl.py:2811
+=========         Host Frame: _func in dsl.py:2764
+=========         Host Frame: _compile in compiler.py:1739
+=========         Host Frame: __call__ in compiler.py:1569
+=========         Host Frame: main in grid_barrier_probe.py:140
+========= 
+========= Program hit CUDA_ERROR_INVALID_VALUE (error 1) due to "invalid argument" on CUDA API call to cuGetProcAddress_v2.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame:  [0x10e8e] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x24134] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x150d9] in cydriver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x4128e2] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame: PyObject_Vectorcall [0x140136] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1509ae] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_CallOneArg [0x18591e] in libpython3.13.so.1.0
+=========         Host Frame: _PyObject_GenericGetAttrWithDict [0x1708d4] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_GetAttr [0x1401dc] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x15111d] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adea9] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x22820c] in libpython3.13.so.1.0
+=========         Host Frame:  [0x278fc1] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2377e5] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame: PyEval_EvalCode [0x22a1ba] in libpython3.13.so.1.0
+=========         Host Frame:  [0x267a72] in libpython3.13.so.1.0
+=========         Host Frame:  [0x264e44] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2624d5] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261ace] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261820] in libpython3.13.so.1.0
+=========         Host Frame: Py_RunMain [0x25f81f] in libpython3.13.so.1.0
+=========         Host Frame: Py_BytesMain [0x217b6b] in libpython3.13.so.1.0
+=========         Host Frame: __libc_start_call_main [0x3447] in libc.so.6
+=========         Host Frame: __libc_start_main [0x350a] in libc.so.6
+=========         Host Frame: _start [0x1094] in python
+=========         Host Frame: get_compute_capability_major_minor in cuda.py:163
+=========         Host Frame: detect_gpu_arch in env_manager.py:422
+=========         Host Frame: arch in env_manager.py:999
+=========         Host Frame: apply_envar_settings in compiler.py:1202
+=========         Host Frame: _prepare_compilation in dsl.py:2722
+=========         Host Frame: _func_impl in dsl.py:2811
+=========         Host Frame: _func in dsl.py:2764
+=========         Host Frame: _compile in compiler.py:1739
+=========         Host Frame: __call__ in compiler.py:1569
+=========         Host Frame: main in grid_barrier_probe.py:140
+========= 
+========= Program hit CUDA_ERROR_INVALID_VALUE (error 1) due to "invalid argument" on CUDA API call to cuGetProcAddress_v2.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame:  [0x10eb5] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x24134] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x150d9] in cydriver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x4128e2] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame: PyObject_Vectorcall [0x140136] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1509ae] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_CallOneArg [0x18591e] in libpython3.13.so.1.0
+=========         Host Frame: _PyObject_GenericGetAttrWithDict [0x1708d4] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_GetAttr [0x1401dc] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x15111d] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adea9] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x22820c] in libpython3.13.so.1.0
+=========         Host Frame:  [0x278fc1] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2377e5] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame: PyEval_EvalCode [0x22a1ba] in libpython3.13.so.1.0
+=========         Host Frame:  [0x267a72] in libpython3.13.so.1.0
+=========         Host Frame:  [0x264e44] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2624d5] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261ace] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261820] in libpython3.13.so.1.0
+=========         Host Frame: Py_RunMain [0x25f81f] in libpython3.13.so.1.0
+=========         Host Frame: Py_BytesMain [0x217b6b] in libpython3.13.so.1.0
+=========         Host Frame: __libc_start_call_main [0x3447] in libc.so.6
+=========         Host Frame: __libc_start_main [0x350a] in libc.so.6
+=========         Host Frame: _start [0x1094] in python
+=========         Host Frame: get_compute_capability_major_minor in cuda.py:163
+=========         Host Frame: detect_gpu_arch in env_manager.py:422
+=========         Host Frame: arch in env_manager.py:999
+=========         Host Frame: apply_envar_settings in compiler.py:1202
+=========         Host Frame: _prepare_compilation in dsl.py:2722
+=========         Host Frame: _func_impl in dsl.py:2811
+=========         Host Frame: _func in dsl.py:2764
+=========         Host Frame: _compile in compiler.py:1739
+=========         Host Frame: __call__ in compiler.py:1569
+=========         Host Frame: main in grid_barrier_probe.py:140
+========= 
+========= Program hit CUDA_ERROR_INVALID_VALUE (error 1) due to "invalid argument" on CUDA API call to cuGetProcAddress_v2.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame:  [0x10edc] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x24134] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x150d9] in cydriver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x4128e2] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame: PyObject_Vectorcall [0x140136] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1509ae] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_CallOneArg [0x18591e] in libpython3.13.so.1.0
+=========         Host Frame: _PyObject_GenericGetAttrWithDict [0x1708d4] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_GetAttr [0x1401dc] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x15111d] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adea9] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x22820c] in libpython3.13.so.1.0
+=========         Host Frame:  [0x278fc1] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2377e5] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame: PyEval_EvalCode [0x22a1ba] in libpython3.13.so.1.0
+=========         Host Frame:  [0x267a72] in libpython3.13.so.1.0
+=========         Host Frame:  [0x264e44] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2624d5] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261ace] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261820] in libpython3.13.so.1.0
+=========         Host Frame: Py_RunMain [0x25f81f] in libpython3.13.so.1.0
+=========         Host Frame: Py_BytesMain [0x217b6b] in libpython3.13.so.1.0
+=========         Host Frame: __libc_start_call_main [0x3447] in libc.so.6
+=========         Host Frame: __libc_start_main [0x350a] in libc.so.6
+=========         Host Frame: _start [0x1094] in python
+=========         Host Frame: get_compute_capability_major_minor in cuda.py:163
+=========         Host Frame: detect_gpu_arch in env_manager.py:422
+=========         Host Frame: arch in env_manager.py:999
+=========         Host Frame: apply_envar_settings in compiler.py:1202
+=========         Host Frame: _prepare_compilation in dsl.py:2722
+=========         Host Frame: _func_impl in dsl.py:2811
+=========         Host Frame: _func in dsl.py:2764
+=========         Host Frame: _compile in compiler.py:1739
+=========         Host Frame: __call__ in compiler.py:1569
+=========         Host Frame: main in grid_barrier_probe.py:140
+========= 
+========= Program hit CUDA_ERROR_INVALID_VALUE (error 1) due to "invalid argument" on CUDA API call to cuGetProcAddress_v2.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame:  [0x10f03] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x24134] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x150d9] in cydriver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x4128e2] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame: PyObject_Vectorcall [0x140136] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1509ae] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_CallOneArg [0x18591e] in libpython3.13.so.1.0
+=========         Host Frame: _PyObject_GenericGetAttrWithDict [0x1708d4] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_GetAttr [0x1401dc] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x15111d] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adea9] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x22820c] in libpython3.13.so.1.0
+=========         Host Frame:  [0x278fc1] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2377e5] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame: PyEval_EvalCode [0x22a1ba] in libpython3.13.so.1.0
+=========         Host Frame:  [0x267a72] in libpython3.13.so.1.0
+=========         Host Frame:  [0x264e44] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2624d5] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261ace] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261820] in libpython3.13.so.1.0
+=========         Host Frame: Py_RunMain [0x25f81f] in libpython3.13.so.1.0
+=========         Host Frame: Py_BytesMain [0x217b6b] in libpython3.13.so.1.0
+=========         Host Frame: __libc_start_call_main [0x3447] in libc.so.6
+=========         Host Frame: __libc_start_main [0x350a] in libc.so.6
+=========         Host Frame: _start [0x1094] in python
+=========         Host Frame: get_compute_capability_major_minor in cuda.py:163
+=========         Host Frame: detect_gpu_arch in env_manager.py:422
+=========         Host Frame: arch in env_manager.py:999
+=========         Host Frame: apply_envar_settings in compiler.py:1202
+=========         Host Frame: _prepare_compilation in dsl.py:2722
+=========         Host Frame: _func_impl in dsl.py:2811
+=========         Host Frame: _func in dsl.py:2764
+=========         Host Frame: _compile in compiler.py:1739
+=========         Host Frame: __call__ in compiler.py:1569
+=========         Host Frame: main in grid_barrier_probe.py:140
+========= 
+========= Program hit CUDA_ERROR_INVALID_VALUE (error 1) due to "invalid argument" on CUDA API call to cuGetProcAddress_v2.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame:  [0x10f2a] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x24134] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x150d9] in cydriver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x4128e2] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame: PyObject_Vectorcall [0x140136] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1509ae] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_CallOneArg [0x18591e] in libpython3.13.so.1.0
+=========         Host Frame: _PyObject_GenericGetAttrWithDict [0x1708d4] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_GetAttr [0x1401dc] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x15111d] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adea9] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x22820c] in libpython3.13.so.1.0
+=========         Host Frame:  [0x278fc1] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2377e5] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame: PyEval_EvalCode [0x22a1ba] in libpython3.13.so.1.0
+=========         Host Frame:  [0x267a72] in libpython3.13.so.1.0
+=========         Host Frame:  [0x264e44] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2624d5] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261ace] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261820] in libpython3.13.so.1.0
+=========         Host Frame: Py_RunMain [0x25f81f] in libpython3.13.so.1.0
+=========         Host Frame: Py_BytesMain [0x217b6b] in libpython3.13.so.1.0
+=========         Host Frame: __libc_start_call_main [0x3447] in libc.so.6
+=========         Host Frame: __libc_start_main [0x350a] in libc.so.6
+=========         Host Frame: _start [0x1094] in python
+=========         Host Frame: get_compute_capability_major_minor in cuda.py:163
+=========         Host Frame: detect_gpu_arch in env_manager.py:422
+=========         Host Frame: arch in env_manager.py:999
+=========         Host Frame: apply_envar_settings in compiler.py:1202
+=========         Host Frame: _prepare_compilation in dsl.py:2722
+=========         Host Frame: _func_impl in dsl.py:2811
+=========         Host Frame: _func in dsl.py:2764
+=========         Host Frame: _compile in compiler.py:1739
+=========         Host Frame: __call__ in compiler.py:1569
+=========         Host Frame: main in grid_barrier_probe.py:140
+========= 
+========= Program hit CUDA_ERROR_INVALID_VALUE (error 1) due to "invalid argument" on CUDA API call to cuGetProcAddress_v2.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame:  [0x10f51] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x24134] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x150d9] in cydriver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x4128e2] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame: PyObject_Vectorcall [0x140136] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1509ae] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_CallOneArg [0x18591e] in libpython3.13.so.1.0
+=========         Host Frame: _PyObject_GenericGetAttrWithDict [0x1708d4] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_GetAttr [0x1401dc] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x15111d] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adea9] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x22820c] in libpython3.13.so.1.0
+=========         Host Frame:  [0x278fc1] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2377e5] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame: PyEval_EvalCode [0x22a1ba] in libpython3.13.so.1.0
+=========         Host Frame:  [0x267a72] in libpython3.13.so.1.0
+=========         Host Frame:  [0x264e44] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2624d5] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261ace] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261820] in libpython3.13.so.1.0
+=========         Host Frame: Py_RunMain [0x25f81f] in libpython3.13.so.1.0
+=========         Host Frame: Py_BytesMain [0x217b6b] in libpython3.13.so.1.0
+=========         Host Frame: __libc_start_call_main [0x3447] in libc.so.6
+=========         Host Frame: __libc_start_main [0x350a] in libc.so.6
+=========         Host Frame: _start [0x1094] in python
+=========         Host Frame: get_compute_capability_major_minor in cuda.py:163
+=========         Host Frame: detect_gpu_arch in env_manager.py:422
+=========         Host Frame: arch in env_manager.py:999
+=========         Host Frame: apply_envar_settings in compiler.py:1202
+=========         Host Frame: _prepare_compilation in dsl.py:2722
+=========         Host Frame: _func_impl in dsl.py:2811
+=========         Host Frame: _func in dsl.py:2764
+=========         Host Frame: _compile in compiler.py:1739
+=========         Host Frame: __call__ in compiler.py:1569
+=========         Host Frame: main in grid_barrier_probe.py:140
+========= 
+========= Program hit CUDA_ERROR_INVALID_VALUE (error 1) due to "invalid argument" on CUDA API call to cuGetProcAddress_v2.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame:  [0x10f78] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x24134] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x150d9] in cydriver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x4128e2] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame: PyObject_Vectorcall [0x140136] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1509ae] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_CallOneArg [0x18591e] in libpython3.13.so.1.0
+=========         Host Frame: _PyObject_GenericGetAttrWithDict [0x1708d4] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_GetAttr [0x1401dc] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x15111d] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adea9] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x22820c] in libpython3.13.so.1.0
+=========         Host Frame:  [0x278fc1] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2377e5] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame: PyEval_EvalCode [0x22a1ba] in libpython3.13.so.1.0
+=========         Host Frame:  [0x267a72] in libpython3.13.so.1.0
+=========         Host Frame:  [0x264e44] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2624d5] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261ace] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261820] in libpython3.13.so.1.0
+=========         Host Frame: Py_RunMain [0x25f81f] in libpython3.13.so.1.0
+=========         Host Frame: Py_BytesMain [0x217b6b] in libpython3.13.so.1.0
+=========         Host Frame: __libc_start_call_main [0x3447] in libc.so.6
+=========         Host Frame: __libc_start_main [0x350a] in libc.so.6
+=========         Host Frame: _start [0x1094] in python
+=========         Host Frame: get_compute_capability_major_minor in cuda.py:163
+=========         Host Frame: detect_gpu_arch in env_manager.py:422
+=========         Host Frame: arch in env_manager.py:999
+=========         Host Frame: apply_envar_settings in compiler.py:1202
+=========         Host Frame: _prepare_compilation in dsl.py:2722
+=========         Host Frame: _func_impl in dsl.py:2811
+=========         Host Frame: _func in dsl.py:2764
+=========         Host Frame: _compile in compiler.py:1739
+=========         Host Frame: __call__ in compiler.py:1569
+=========         Host Frame: main in grid_barrier_probe.py:140
+========= 
+========= Program hit CUDA_ERROR_INVALID_VALUE (error 1) due to "invalid argument" on CUDA API call to cuGetProcAddress_v2.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame:  [0x10f9f] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x24134] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x150d9] in cydriver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x4128e2] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame: PyObject_Vectorcall [0x140136] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1509ae] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_CallOneArg [0x18591e] in libpython3.13.so.1.0
+=========         Host Frame: _PyObject_GenericGetAttrWithDict [0x1708d4] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_GetAttr [0x1401dc] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x15111d] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adea9] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x22820c] in libpython3.13.so.1.0
+=========         Host Frame:  [0x278fc1] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2377e5] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame: PyEval_EvalCode [0x22a1ba] in libpython3.13.so.1.0
+=========         Host Frame:  [0x267a72] in libpython3.13.so.1.0
+=========         Host Frame:  [0x264e44] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2624d5] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261ace] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261820] in libpython3.13.so.1.0
+=========         Host Frame: Py_RunMain [0x25f81f] in libpython3.13.so.1.0
+=========         Host Frame: Py_BytesMain [0x217b6b] in libpython3.13.so.1.0
+=========         Host Frame: __libc_start_call_main [0x3447] in libc.so.6
+=========         Host Frame: __libc_start_main [0x350a] in libc.so.6
+=========         Host Frame: _start [0x1094] in python
+=========         Host Frame: get_compute_capability_major_minor in cuda.py:163
+=========         Host Frame: detect_gpu_arch in env_manager.py:422
+=========         Host Frame: arch in env_manager.py:999
+=========         Host Frame: apply_envar_settings in compiler.py:1202
+=========         Host Frame: _prepare_compilation in dsl.py:2722
+=========         Host Frame: _func_impl in dsl.py:2811
+=========         Host Frame: _func in dsl.py:2764
+=========         Host Frame: _compile in compiler.py:1739
+=========         Host Frame: __call__ in compiler.py:1569
+=========         Host Frame: main in grid_barrier_probe.py:140
+========= 
+========= Program hit CUDA_ERROR_INVALID_VALUE (error 1) due to "invalid argument" on CUDA API call to cuGetProcAddress_v2.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame:  [0x10fc6] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x24134] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x150d9] in cydriver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame:  [0x4128e2] in driver.cpython-313-x86_64-linux-gnu.so
+=========         Host Frame: PyObject_Vectorcall [0x140136] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1509ae] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_CallOneArg [0x18591e] in libpython3.13.so.1.0
+=========         Host Frame: _PyObject_GenericGetAttrWithDict [0x1708d4] in libpython3.13.so.1.0
+=========         Host Frame: PyObject_GetAttr [0x1401dc] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x15111d] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adff0] in libpython3.13.so.1.0
+=========         Host Frame:  [0x237857] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x1adea9] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame:  [0x22820c] in libpython3.13.so.1.0
+=========         Host Frame:  [0x278fc1] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2377e5] in libpython3.13.so.1.0
+=========         Host Frame: _PyEval_EvalFrameDefault [0x1551e8] in libpython3.13.so.1.0
+=========         Host Frame: PyEval_EvalCode [0x22a1ba] in libpython3.13.so.1.0
+=========         Host Frame:  [0x267a72] in libpython3.13.so.1.0
+=========         Host Frame:  [0x264e44] in libpython3.13.so.1.0
+=========         Host Frame:  [0x2624d5] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261ace] in libpython3.13.so.1.0
+=========         Host Frame:  [0x261820] in libpython3.13.so.1.0
+=========         Host Frame: Py_RunMain [0x25f81f] in libpython3.13.so.1.0
+=========         Host Frame: Py_BytesMain [0x217b6b] in libpython3.13.so.1.0
+=========         Host Frame: __libc_start_call_main [0x3447] in libc.so.6
+=========         Host Frame: __libc_start_main [0x350a] in libc.so.6
+=========         Host Frame: _start [0x1094] in python
+=========         Host Frame: get_compute_capability_major_minor in cuda.py:163
+=========         Host Frame: detect_gpu_arch in env_manager.py:422
+=========         Host Frame: arch in env_manager.py:999
+=========         Host Frame: apply_envar_settings in compiler.py:1202
+=========         Host Frame: _prepare_compilation in dsl.py:2722
+=========         Host Frame: _func_impl in dsl.py:2811
+=========         Host Frame: _func in dsl.py:2764
+=========         Host Frame: _compile in compiler.py:1739
+=========         Host Frame: __call__ in compiler.py:1569
+=========         Host Frame: main in grid_barrier_probe.py:140
+========= 
+========= ERROR SUMMARY: 20 errors

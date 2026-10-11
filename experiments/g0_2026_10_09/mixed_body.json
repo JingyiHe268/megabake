@@ -1,0 +1,190 @@
+{
+  "status": "passed",
+  "gpu": "_CudaDeviceProperties(name='NVIDIA H200 MIG 3g.71gb', major=9, minor=0, total_memory=71424MB, multi_processor_count=60, uuid=9dea0b6d-ef2b-c5f3-8f4d-f2e6b5a59394, pci_bus_id=173, pci_device_id=0, pci_domain_id=0, L2_cache_size=29MB)",
+  "cooperative_launch": true,
+  "torch": "2.14.0+cu130",
+  "torch_git": "08187d9e0fba026dc8217405802ab5381dc88d90",
+  "cute": "4.8.0",
+  "checkpoint_dimensions": {
+    "hidden": 576,
+    "intermediate": 1536
+  },
+  "provider_source": {
+    "repository": "NVIDIA/cutlass",
+    "revision": "0b55a2f691d69981583568fd9eb69687b1f0de8a",
+    "path": "examples/python/CuTeDSL/cute/hopper/kernel/dense_gemm/dense_gemm_persistent.py",
+    "sha256": "65088a1fd7655ed46ad54fecd08e1461a334fb38f1b2d1da7cf252e465afc130",
+    "license": "BSD-3-Clause; original notice retained in generated source"
+  },
+  "body_configuration": {
+    "tile_m": 64,
+    "tile_n": 64,
+    "cluster": [
+      1,
+      1
+    ]
+  },
+  "body_contract": {
+    "work_iterator": "CuTe static persistent tile-scheduler parameters; z dimension is the worker range",
+    "bindings": "TMA descriptors and tensors rebuilt from current input/output addresses on each host call",
+    "thread_participation": {
+      "threads_per_cta": 256,
+      "dma_warp_group": "warps 0-3; warp 0 issues TMA loads",
+      "mma_warp_group": "warps 4-7 issue WGMMA and perform the epilogue reduction/store work",
+      "tma_store_warp": 4
+    },
+    "scratch": "one CTA-local SharedStorage allocated by the enclosing kernel and reused only after TMA store tail completion",
+    "epilogue": "source GEMM TMA output followed by generated BF16 vector and row-reduction work",
+    "visibility": "each CTA publishes a device-scope release marker; CTA 0 acquires all markers then broadcasts a release marker that every other CTA acquires before dependent reads",
+    "state": "caller-owned marker slots plus one release slot; host supplies a fresh four-value epoch range; no clearing launch",
+    "pipeline_exit": "input TMA producer tail, WGMMA wait_group(0), and output TMA store tail complete before each inter-phase grid barrier",
+    "shortcut": "fixed-argument CUDA Graph replay repeats the epoch; add graph-local epoch ownership before enabling replay"
+  },
+  "resource_admission": {
+    "threads_per_cta": 256,
+    "compiled_kernel": {
+      "name": "kernel_cutlass_mixed_kernel___main___mixed_classlocalsMixedBody_object_at__Copy_Atom_ThrID_10_TV_Layout_Src_1409601_TV_Layout_Dst_1409601_Value_type_bf16_tensor000_o_111012_Copy_Atom_ThrI_0",
+      "registers_per_thread": 232,
+      "static_shared_bytes": 0,
+      "local_bytes_per_thread": 0,
+      "shared_storage_bytes": 230400,
+      "active_blocks_per_sm": 1
+    },
+    "sm_count": 60,
+    "max_workers": 60,
+    "admission_limit": 60,
+    "launched_workers": 60,
+    "oversized_grid_rejected": true
+  },
+  "phases": [
+    "GEMM [M,576] x [1536,576] -> BF16 T",
+    "grid barrier",
+    "generated BF16 vector: cast(T,FP32)*0.5+0.125 -> BF16 U",
+    "grid barrier",
+    "generated FP32 row sum(U) -> BF16 R",
+    "grid barrier",
+    "generated BF16 vector: U+cast(R,FP32)*0.25-0.5 -> BF16 V",
+    "grid barrier",
+    "GEMM [M,1536] x [576,1536] -> BF16 Y"
+  ],
+  "generated_bodies": [
+    {
+      "name": "_vector_affine",
+      "expression": "cast_f32(x) * scale + offset",
+      "input_dtype": "bf16",
+      "accumulator_dtype": null,
+      "output_dtype": "bf16",
+      "source_sha256": "59e0dd377ca6d209d3b072b6d28b9004c9b69d1dfcac65a306c50faf9807c033"
+    },
+    {
+      "name": "_vector_row_bias",
+      "expression": "cast_f32(x) + cast_f32(row) * scale + offset",
+      "input_dtype": "bf16",
+      "accumulator_dtype": null,
+      "output_dtype": "bf16",
+      "source_sha256": "21a7d0ea8dd5b63531d9ea8f0456a59db758b56b2c2de27242db2c0cb1128344"
+    },
+    {
+      "name": "_row_reduce",
+      "expression": "sum(cast_f32(x))",
+      "input_dtype": "bf16",
+      "accumulator_dtype": "f32",
+      "output_dtype": "bf16",
+      "source_sha256": "a4d84f1dea8e39241b08afc0a9abbd43d46838133387c2bcfd481b9319c9fbc8"
+    }
+  ],
+  "scalar_variants": {
+    "first_vector": {
+      "scale_fp32": 0.5,
+      "offset_fp32": 0.125
+    },
+    "row_broadcast_vector": {
+      "scale_fp32": 0.25,
+      "offset_fp32": -0.5
+    }
+  },
+  "correctness_tolerance": "relative L2 < 0.01 for every intermediate and final output",
+  "repeated_calls": [
+    {
+      "m": 4,
+      "epoch": 1,
+      "delay_cta": 23,
+      "delay_sum": 100000.0,
+      "max_abs_error": {
+        "t": 6.103515625e-05,
+        "u": 0.0,
+        "rows": 1.0,
+        "v": 0.5,
+        "y": 1.0
+      }
+    },
+    {
+      "m": 4,
+      "epoch": 5,
+      "delay_cta": 23,
+      "delay_sum": 100000.0,
+      "max_abs_error": {
+        "t": 0.000244140625,
+        "u": 0.0,
+        "rows": 2.0,
+        "v": 0.5,
+        "y": 1.0
+      }
+    },
+    {
+      "m": 4,
+      "epoch": 9,
+      "delay_cta": 23,
+      "delay_sum": 100000.0,
+      "max_abs_error": {
+        "t": 1.52587890625e-05,
+        "u": 0.0,
+        "rows": 1.0,
+        "v": 0.5,
+        "y": 1.0
+      }
+    }
+  ],
+  "launch_trace": [
+    {
+      "path": "/workspace/megabake/experiments/g0_2026_10_09/mixed_kernel_trace.json",
+      "kernel_events": [
+        "kernel_cutlass_mixed_kernel___main___mixed_classlocalsMixedBody_object_at__Copy_Atom_ThrID_10_TV_Layout_Src_1409601_TV_Layout_Dst_1409601_Value_type_bf16_tensor000_o_111012_Copy_Atom_ThrI_0"
+      ],
+      "launch_count": 1
+    }
+  ],
+  "launch_count": 1,
+  "gpu_latency_us": {
+    "samples": [
+      1376.2240409851074,
+      1319.9679851531982,
+      1327.3600339889526,
+      1325.8559703826904,
+      1352.8640270233154,
+      1313.0559921264648,
+      1324.8319625854492,
+      1325.984001159668,
+      1322.208046913147,
+      1336.7359638214111,
+      1347.6799726486206
+    ],
+    "median": 1325.984001159668
+  },
+  "host_call_latency_us": {
+    "samples": [
+      1379.743218421936,
+      1325.7600367069244,
+      1333.3037495613098,
+      1331.8005949258804,
+      1358.8238507509232,
+      1319.0675526857376,
+      1330.8878988027573,
+      1331.619918346405,
+      1327.9542326927185,
+      1342.708244919777,
+      1354.258507490158
+    ],
+    "median": 1331.8005949258804
+  }
+}

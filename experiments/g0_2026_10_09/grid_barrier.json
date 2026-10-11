@@ -1,0 +1,65 @@
+{
+  "gpu": "_CudaDeviceProperties(name='NVIDIA H200 MIG 3g.71gb', major=9, minor=0, total_memory=71424MB, multi_processor_count=60, uuid=9dea0b6d-ef2b-c5f3-8f4d-f2e6b5a59394, pci_bus_id=173, pci_device_id=0, pci_domain_id=0, L2_cache_size=29MB)",
+  "cooperative_launch": true,
+  "active_blocks_per_sm": 16,
+  "largest_grid_workers": 960,
+  "kernel_resources": {
+    "name": "kernel_cutlass__work_then_barrier_tensorptrf32gmemalign16o41_tensorptrf32gmemalign16o41_tensorptrf32gmemalign16o41_tensorptri32gmemalign16o41____0",
+    "registers_per_thread": 32,
+    "static_shared_bytes": 0,
+    "local_bytes_per_thread": 0,
+    "active_blocks_per_sm": 16
+  },
+  "block_threads": 128,
+  "protocol": "CTA release exchange; CTA acquire CAS polling; CTA barriers on each side",
+  "state": "one invocation-owned ready slot per CTA; host advances epoch; no memset launch",
+  "repeated_bindings": [
+    {
+      "epoch": 1,
+      "workers": 2,
+      "delay_cta": 0,
+      "output": [
+        800006.0,
+        10.0
+      ],
+      "sum": [
+        800016.0,
+        800016.0
+      ]
+    },
+    {
+      "epoch": 2,
+      "workers": 3,
+      "delay_cta": 2,
+      "output": [
+        -4.0,
+        14.0,
+        599998.0
+      ],
+      "sum": [
+        600008.0,
+        600008.0,
+        600008.0
+      ]
+    },
+    {
+      "epoch": 3,
+      "workers": 4,
+      "delay_cta": 1,
+      "output": [
+        22.0,
+        3000026.0,
+        34.0,
+        38.0
+      ],
+      "sum": [
+        3000120.0,
+        3000120.0,
+        3000120.0,
+        3000120.0
+      ]
+    }
+  ],
+  "largest_grid_passed": true,
+  "status": "passed"
+}
