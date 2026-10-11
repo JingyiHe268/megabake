@@ -99,12 +99,12 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Implement in:** `lowering.py`, with `lower_semantics(graph)` and a registry keyed by exact FX targets.
 
-- [ ] Define typed scalar expressions for constants, arithmetic, comparisons, selection, and casts needed by the fixture.
-- [ ] Define iteration domains, indexed loads, reduction axes, predicates, and stores within each operation's tensor program.
-- [ ] Lower elementwise operations with explicit broadcasting. Compose view coordinates with source strides.
-- [ ] Lower GEMM as indexed contraction, with explicit accumulator and result types. Preserve source rounding points.
-- [ ] Lower sum and mean reductions. Use selected decompositions for supported composite operations and retain source provenance.
-- [ ] Leave an unknown operation opaque with a missing-rule reason. Detect unsupported effects before device planning.
+- [x] Define typed scalar expressions for constants, arithmetic, comparisons, selection, and casts needed by the fixture.
+- [x] Define iteration domains, indexed loads, reduction axes, predicates, and stores within each operation's tensor program.
+- [x] Lower elementwise operations with explicit broadcasting. Compose view coordinates with source strides.
+- [x] Lower GEMM as indexed contraction, with explicit accumulator and result types. Preserve source rounding points.
+- [x] Lower sum and mean reductions. Use selected decompositions for supported composite operations and retain source provenance.
+- [x] Leave an unknown operation opaque with a missing-rule reason. Detect unsupported effects before device planning.
 
 **Output:** executable meaning for known operations, plus explicit unresolved operations.
 

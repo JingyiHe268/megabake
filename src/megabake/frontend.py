@@ -282,6 +282,16 @@ def _safe_model_name(model_name: str) -> str:
     return safe_name or "model"
 
 
+def _reject_symbolic_shapes(graph: Any) -> None:
+    for node in graph.graph.nodes:
+        leaves, _ = pytree.tree_flatten(node.meta.get("val"))
+        for leaf in leaves:
+            if isinstance(leaf, torch.Tensor) and any(
+                not isinstance(dimension, int) for dimension in leaf.shape
+            ):
+                raise ValueError("Symbolic tensor shape is unsupported")
+
+
 def _prepare_fx_graph(
     graph: Any,
     example_inputs: Sequence[Any],
@@ -294,18 +304,19 @@ def _prepare_fx_graph(
     model_name: str | None = None,
 ) -> PreparedFX:
     internals = _torch_internals()
+    _reject_symbolic_shapes(graph)
     dump_directory = (
         Path(options["dump_dir"])
         / _safe_model_name(model_name or options["model_name"])
         if options["dump_dir"] is not None
         else None
     )
-    # dump_graph(
-    #     "input", graph, dump_directory, "Initial FX graph received by MegaBake."
-    # )
+    dump_graph(
+        "input", graph, dump_directory, "Initial FX graph received by MegaBake."
+    )
     if not internals.graph_returns_tuple(graph):
         internals.make_graph_return_tuple(graph, example_inputs, lambda value, _: value)
-    # dump_graph("normalized", graph, dump_directory, "Normalized FX graph return.")
+    dump_graph("normalized", graph, dump_directory, "Normalized FX graph return.")
     context = _make_context(
         graph, example_inputs, options, input_kinds, parameter_names
     )
@@ -317,7 +328,7 @@ def _prepare_fx_graph(
 
     def pre_grad_callback(pre_grad_graph: Any, inputs: Sequence[Any]) -> Any:
         transformed = internals.run_pre_grad_passes(pre_grad_graph, inputs)
-        # dump_graph("pre_grad", transformed, dump_directory)
+        dump_graph("pre_grad", transformed, dump_directory)
         context.captures.append(
             CaptureRecord("pre_grad", "miss", _graph_hash(transformed))
         )
@@ -326,44 +337,44 @@ def _prepare_fx_graph(
     def prepare_aot_graph(
         prepared_graph: Any, inputs: Sequence[Any]
     ) -> Callable[..., Any]:
-        # dump_graph(
-        #     "aot",
-        #     prepared_graph,
-        #     dump_directory,
-        #     "AOTAutograd inference FX graph after decomposition.",
-        # )
+        dump_graph(
+            "aot",
+            prepared_graph,
+            dump_directory,
+            "AOTAutograd inference FX graph after decomposition.",
+        )
         key = _capture_key(prepared_graph, inputs)
         cache_state = "disabled"
         if options["cache"]:
             entry = cache.get(key)
             cache_state = "hit" if entry is not None else "miss"
-            # dump_graph(
-            #     "cache",
-            #     prepared_graph,
-            #     dump_directory,
-            #     f"cache_state={cache_state}\nkey={key}",
-            # )
+            dump_graph(
+                "cache",
+                prepared_graph,
+                dump_directory,
+                f"cache_state={cache_state}\nkey={key}",
+            )
             if entry is not None:
-                # dump_graph("prepared", prepared_graph, dump_directory)
+                dump_graph("prepared", prepared_graph, dump_directory)
                 final_graphs.append(entry.post_grad_graph)
-                # dump_graph(
-                #     "post_grad",
-                #     entry.post_grad_graph,
-                #     dump_directory,
-                #     "Cache hit; reusing the transformed post-grad FX graph.",
-                # )
+                dump_graph(
+                    "post_grad",
+                    entry.post_grad_graph,
+                    dump_directory,
+                    "Cache hit; reusing the transformed post-grad FX graph.",
+                )
                 context.record(entry.post_grad_graph, "post_grad", "hit")
                 return entry.fx_forward
         else:
             cache.misses += 1
-            # dump_graph(
-            #     "cache",
-            #     prepared_graph,
-            #     dump_directory,
-            #     "cache_state=disabled",
-            # )
+            dump_graph(
+                "cache",
+                prepared_graph,
+                dump_directory,
+                "cache_state=disabled",
+            )
 
-        # dump_graph("prepared", prepared_graph, dump_directory)
+        dump_graph("prepared", prepared_graph, dump_directory)
         context.record(prepared_graph, "prepared", "miss")
         internals.view_to_reshape(prepared_graph)
         fake_mode = internals.fake_tensor_prop(prepared_graph, inputs)
@@ -374,7 +385,7 @@ def _prepare_fx_graph(
             internals.recursive_post_grad_passes(prepared_graph, is_inference=True)
         prepared_graph.recompile()
         final_graphs.append(prepared_graph)
-        # dump_graph("post_grad", prepared_graph, dump_directory)
+        dump_graph("post_grad", prepared_graph, dump_directory)
         context.record(prepared_graph, "post_grad", "miss")
         fx_forward = internals.make_boxed_func(prepared_graph.forward)
         if options["cache"]:

@@ -13,6 +13,7 @@ from .frontend import make_backend
 from .fx_handler.export import capture_exported_program
 from .fx_handler.transformers import capture_transformer
 from .graph import dump_compute_graph, import_fx
+from .lowering import dump_lowering_graph, lower_semantics
 
 
 def _backend(args: argparse.Namespace) -> Any:
@@ -68,16 +69,25 @@ def _run_transformers(args: argparse.Namespace) -> int:
     )
     output = capture.run(input_ids)
     compute_graph_path = None
-    if getattr(args, "dump_compute_graph", False):
+    lowering_graph_path = None
+    if getattr(args, "dump_compute_graph", False) or getattr(
+        args, "dump_lowering_graph", False
+    ):
         compute_graph = import_fx(capture.graph, capture.context)
         model_name = args.model_name
         safe_model_name = re.sub(r"[^A-Za-z0-9_.-]+", "__", model_name).strip("._")
         output_directory = Path(args.dump_dir or "fx_traces") / (
             safe_model_name or "model"
         )
-        compute_graph_path = dump_compute_graph(
-            compute_graph, output_directory / "compute_graph.txt"
-        )
+        if getattr(args, "dump_compute_graph", False):
+            compute_graph_path = dump_compute_graph(
+                compute_graph, output_directory / "compute_graph.txt"
+            )
+        if getattr(args, "dump_lowering_graph", False):
+            lowering_graph_path = dump_lowering_graph(
+                lower_semantics(compute_graph),
+                output_directory / "lowering_graph.txt",
+            )
     print(f"transformers: PASS {_summary(output)}")
     print(
         f"capture: phase={capture.context.phase} "
@@ -86,6 +96,8 @@ def _run_transformers(args: argparse.Namespace) -> int:
     )
     if compute_graph_path is not None:
         print(f"compute graph: {compute_graph_path}")
+    if lowering_graph_path is not None:
+        print(f"lowering graph: {lowering_graph_path}")
     return 0
 
 
@@ -153,6 +165,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     transformers_parser.add_argument(
         "--dump-compute-graph", action="store_true", default=False
+    )
+    transformers_parser.add_argument(
+        "--dump-lowering-graph", action="store_true", default=False
     )
     transformers_parser.set_defaults(handler=_run_transformers)
 

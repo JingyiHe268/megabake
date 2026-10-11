@@ -99,11 +99,13 @@ def _nodes_in(value: Any) -> list[torch.fx.Node]:
 
 def _tensor_metadata(value: Any) -> dict[str, Any]:
     if isinstance(value, torch.Tensor):
+        shape = _static_dimensions(value.shape, "tensor shape")
+        strides = _static_dimensions(value.stride(), "tensor strides")
         return {
-            "shape": tuple(int(dim) for dim in value.shape),
+            "shape": shape,
             "dtype": str(value.dtype),
             "device": str(value.device),
-            "strides": tuple(int(stride) for stride in value.stride()),
+            "strides": strides,
             "type_name": "Tensor",
         }
     return {
@@ -116,13 +118,27 @@ def _tensor_metadata(value: Any) -> dict[str, Any]:
 
 
 def _spec_metadata(spec: Any) -> dict[str, Any]:
+    shape = (
+        _static_dimensions(spec.shape, "input shape") if spec.shape is not None else None
+    )
+    strides = (
+        _static_dimensions(spec.stride, "input strides")
+        if spec.stride is not None
+        else None
+    )
     return {
-        "shape": tuple(spec.shape) if spec.shape is not None else None,
+        "shape": shape,
         "dtype": spec.dtype,
         "device": spec.device,
-        "strides": tuple(spec.stride) if spec.stride is not None else None,
+        "strides": strides,
         "type_name": "Tensor" if spec.shape is not None else None,
     }
+
+
+def _static_dimensions(dimensions: Any, description: str) -> tuple[int, ...]:
+    if any(not isinstance(dimension, int) for dimension in dimensions):
+        raise ValueError(f"Symbolic {description} is unsupported")
+    return tuple(int(dimension) for dimension in dimensions)
 
 
 def _metadata(node: torch.fx.Node, graph: torch.fx.GraphModule, spec: Any) -> Any:
