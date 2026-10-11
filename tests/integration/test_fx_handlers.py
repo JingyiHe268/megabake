@@ -32,6 +32,7 @@ def test_exported_fx_rebinds_inputs_parameters_and_uses_post_grad_cache():
     assert capture.context.cache_state == "miss"
     assert capture.context.parameter_names == {"linear.weight", "linear.bias"}
     assert isinstance(capture.graph, torch.fx.GraphModule)
+    assert capture.graph is capture.context.graph
 
     with torch.no_grad():
         assert torch.allclose(capture.run(first), model(first))

@@ -8,6 +8,7 @@ build/
 dist/
 /agent_space/*
 !/agent_space/.gitkeep
-# /fx_traces/*
-# !/fx_traces/.gitkeep
-# experiments/*
+fx_traces/*
+!/fx_traces/.gitkeep
+experiments/*
+!/experiments/.gitkeep

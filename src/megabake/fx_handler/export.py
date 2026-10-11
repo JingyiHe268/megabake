@@ -124,7 +124,7 @@ def capture_exported_program(
     return ExportedCapture(
         exported_program=exported,
         model=model,
-        graph=graph,
+        graph=prepared.graph,
         context=context,
         forward=prepared.forward,
         input_defaults=dict(input_defaults or {}),
