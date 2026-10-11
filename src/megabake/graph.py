@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+import operator
 from typing import Any, Mapping
 
 import torch
@@ -208,6 +209,15 @@ def _storage_relation(
     node_values: Mapping[torch.fx.Node, tuple[str, ...]],
     value_id: str,
 ) -> StorageRelation:
+    if node.target is operator.getitem:
+        source_node, result_index = node.args
+        source_id = node_values[source_node][result_index]
+        source = values[source_id].storage_relation
+        return StorageRelation(
+            storage_id=source.storage_id or source_id,
+            aliases=(source_id,),
+            unknown=source.unknown,
+        )
     schema = getattr(node.target, "_schema", None)
     if schema is None:
         operand_ids = tuple(
@@ -248,6 +258,8 @@ def _storage_relation(
 
 def _effects(node: torch.fx.Node) -> dict[str, Any]:
     if node.op == "get_attr":
+        return {"unknown": False, "mutates_inputs": False}
+    if node.target is operator.getitem:
         return {"unknown": False, "mutates_inputs": False}
     schema = getattr(node.target, "_schema", None)
     if schema is None:

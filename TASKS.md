@@ -21,6 +21,7 @@ PyTorch model and live inputs
   -> Dynamo capture and pinned AOT/Inductor preparation
   -> live post-grad FX with its runtime contract
   -> ComputeGraph with typed tensor programs
+  -> canonical semantic programs for shared post-grad operations
   -> regions and valid body configurations
   -> tile maps, dependencies, phases, and storage
   -> KernelPlan
@@ -34,6 +35,7 @@ PyTorch model and live inputs
 | After step | You have |
 | --- | --- |
 | 01 | A backend that receives the required live FX graph |
+| 04A | Canonical semantics for shared post-grad transformer operations |
 | 04 | An imported graph with explicit computation, regions, and source references |
 | 09 | Generic generators and a composable fast GEMM provider |
 | 12 | A complete plan with layouts, dependencies, and storage |
@@ -110,9 +112,25 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Check:** evaluate small tensor programs with a test-only reference evaluator. Compare casts, broadcasts, transposes, and reductions with the original graph.
 
+## 04A. Canonicalize shared post-grad semantics
+
+**Input:** an imported ComputeGraph (`canonicalize_semantics` lowers it first).
+
+**Implement in:** `lowering.py`, with `canonicalize_semantics(graph) -> ComputeGraph`.
+
+- [x] Define canonical program families for maps, reductions, contractions, gathers, copies, and layout transformations. Preserve source FX IDs, tensor programs, aliases, and numerical policies.
+- [x] Support multi-result operations and pure tuple projections. Represent `prepare_softmax_online` as a canonical `softmax_statistics` program with explicit max and sum-exp result roles.
+- [x] Lower the shared targets found by the model survey: `expand`, `unsqueeze`, `slice`, `clone`, `cat`, `pow`, `rsqrt`, `exp`, `bmm`, `cos`, `sin`, `iota`, `full`, `scalar_tensor`, `index`, `embedding`, and `bitwise_and`.
+- [x] Keep every unsupported operation opaque with a source-linked rejection reason. Do not add model-specific softmax matchers.
+- [x] Report canonical, generic, and unresolved operation counts for the captured model fixtures.
+
+**Output:** a Compute Graph whose shared transformer operations have canonical semantics and whose remaining operations are explicit rejections.
+
+**Check:** run the SmolLM, Gemma, and DeepSeek trace fixtures. Verify tuple projection purity, `softmax_statistics` result roles, complete source-operation accounting, and the coverage report. Use Qwen3.5 only to confirm that its gated-delta operations remain explicit rejections rather than false-effect failures.
+
 ## 04. Form regions without losing source operations
 
-**Input:** a Compute Graph with known tensor programs.
+**Input:** a canonicalized Compute Graph with known tensor programs.
 
 **Implement in:** `regions.py`, with `form_regions(graph)`.
 

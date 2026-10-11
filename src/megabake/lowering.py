@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+import operator
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -66,6 +67,14 @@ class Unary:
 
 
 @dataclass(frozen=True)
+class AxisIndex:
+    axis: str
+    dtype: str
+    start: int = 0
+    step: int = 1
+
+
+@dataclass(frozen=True)
 class Binary:
     operator: str
     lhs: ScalarExpression
@@ -93,6 +102,7 @@ ScalarExpression = (
     | Load
     | Accumulator
     | Unary
+    | AxisIndex
     | Binary
     | Where
     | Cast
@@ -115,11 +125,22 @@ class TensorProgram:
     predicates: tuple[AxisPredicate, ...]
 
 
+@dataclass(frozen=True)
+class CanonicalProgram:
+    family: str
+    source_target: str
+    decomposition: str
+    result_roles: tuple[str, ...]
+    semantics: Mapping[str, Any]
+
+
 class UnsupportedLowering(ValueError):
     pass
 
 
-LoweringRule = Callable[[torch.fx.Node, Op, ComputeGraph], TensorProgram]
+LoweringRule = Callable[
+    [torch.fx.Node, Op, ComputeGraph], TensorProgram | CanonicalProgram
+]
 
 
 def _node_value(node: torch.fx.Node, graph: ComputeGraph) -> Value:
@@ -340,14 +361,6 @@ def _view_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorPro
         or result.storage_relation.storage_id != source.storage_relation.storage_id
     ):
         raise UnsupportedLowering("view result does not alias its source")
-    source_elements = 1
-    result_elements = 1
-    for size in source.shape:
-        source_elements *= size
-    for size in result.shape:
-        result_elements *= size
-    if source_elements != result_elements:
-        raise UnsupportedLowering("view changes the number of elements")
     domains = _domains("o", result.shape)
     load = IndexedLoad(
         id="load:0",
@@ -383,6 +396,114 @@ def _view_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorPro
     )
 
 
+def _copy_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorProgram:
+    def build(loads: list[Load]) -> ScalarExpression:
+        if not loads:
+            raise UnsupportedLowering("copy has no tensor operand")
+        return loads[0]
+
+    return _elementwise_program(
+        node, op, graph, "copy", build, "materializing copy"
+    )
+
+
+def _typed_constant(value: Any, dtype: str) -> Constant:
+    if not isinstance(value, (bool, int, float)):
+        raise UnsupportedLowering(f"unsupported scalar constant {value!r}")
+    return Constant(value=value, dtype=dtype)
+
+
+def _constant_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorProgram:
+    result = _result_value(op, graph)
+    if result.shape is None:
+        raise UnsupportedLowering("constant result lacks a shape")
+    value = node.args[1] if node.target is torch.ops.aten.full.default else node.args[0]
+    domains = _domains("o", result.shape)
+    return TensorProgram(
+        family="elementwise",
+        source_target=str(node.target),
+        decomposition="constant generator",
+        iteration_domains=domains,
+        reduction_axes=(),
+        loads=(),
+        init=None,
+        combine=_typed_constant(value, result.dtype or ""),
+        post=None,
+        accumulator_dtype=None,
+        store=TensorStore(
+            result.id, result.shape, result.dtype or "", result.strides, True
+        ),
+        predicates=_predicates(domains),
+    )
+
+
+def _iota_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorProgram:
+    result = _result_value(op, graph)
+    length = node.args[0]
+    if result.shape != (length,):
+        raise UnsupportedLowering("iota result shape does not match its length")
+    domains = _domains("o", result.shape)
+    return TensorProgram(
+        family="elementwise",
+        source_target=str(node.target),
+        decomposition="affine axis generator",
+        iteration_domains=domains,
+        reduction_axes=(),
+        loads=(),
+        init=None,
+        combine=AxisIndex(
+            axis="o0",
+            dtype=result.dtype or "",
+            start=node.kwargs.get("start", 0),
+            step=node.kwargs.get("step", 1),
+        ),
+        post=None,
+        accumulator_dtype=None,
+        store=TensorStore(
+            result.id, result.shape, result.dtype or "", result.strides, True
+        ),
+        predicates=_predicates(domains),
+    )
+
+
+def _tuple_projection_program(
+    node: torch.fx.Node, op: Op, graph: ComputeGraph
+) -> TensorProgram:
+    result = _result_value(op, graph)
+    result_index = node.args[1]
+    if not isinstance(result_index, int) or not 0 <= result_index < len(op.operands):
+        raise UnsupportedLowering("tuple projection has an invalid result index")
+    source = graph.values[op.operands[result_index]]
+    if source.shape is None or source.dtype != result.dtype:
+        raise UnsupportedLowering("tuple projection source and result differ")
+    domains = _domains("o", result.shape or ())
+    load = IndexedLoad(
+        id="load:0",
+        value_id=source.id,
+        axes=tuple(domain.axis for domain in domains),
+        strides=result.strides or (),
+        dtype=source.dtype or "",
+    )
+    return TensorProgram(
+        family="view",
+        source_target=str(node.target),
+        decomposition="pure tuple result projection",
+        iteration_domains=domains,
+        reduction_axes=(),
+        loads=(load,),
+        init=None,
+        combine=Load(load.id, load.dtype),
+        post=None,
+        accumulator_dtype=None,
+        store=TensorStore(
+            result.id,
+            result.shape or (),
+            result.dtype or "",
+            result.strides or (),
+            False,
+        ),
+        predicates=_predicates(domains),
+    )
 def _dtype_value(dtype_name: str) -> torch.dtype:
     dtype = getattr(torch, dtype_name.removeprefix("torch."), None)
     if not isinstance(dtype, torch.dtype):
@@ -563,6 +684,165 @@ def _addmm_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorPr
     )
 
 
+def _bmm_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorProgram:
+    if len(node.args) != 2:
+        raise UnsupportedLowering("bmm must have two arguments")
+    left = _node_value(node.args[0], graph)
+    right = _node_value(node.args[1], graph)
+    result = _result_value(op, graph)
+    if (
+        left.shape is None
+        or right.shape is None
+        or result.shape is None
+        or len(left.shape) != 3
+        or len(right.shape) != 3
+        or len(result.shape) != 3
+    ):
+        raise UnsupportedLowering("bmm operands and result must be static 3-D tensors")
+    batch, rows, reduction = left.shape
+    right_batch, right_reduction, columns = right.shape
+    if (
+        batch != right_batch
+        or reduction != right_reduction
+        or result.shape != (batch, rows, columns)
+    ):
+        raise UnsupportedLowering("bmm operand and result shapes do not match")
+    output_domains = (
+        IterationDomain("o0", batch),
+        IterationDomain("o1", rows),
+        IterationDomain("o2", columns),
+    )
+    reduction_domain = IterationDomain("r0", reduction)
+    left_load = _load(left, ("o0", "o1", "r0"), 0)
+    right_load = _load(right, ("o0", "r0", "o2"), 1)
+    accumulator_dtype = _accumulator_dtype(
+        result.dtype or "", [left.dtype or "", right.dtype or ""]
+    )
+    product = Binary(
+        "mul",
+        _cast_load(Load(left_load.id, left_load.dtype), accumulator_dtype),
+        _cast_load(Load(right_load.id, right_load.dtype), accumulator_dtype),
+        accumulator_dtype,
+    )
+    return TensorProgram(
+        family="contraction",
+        source_target=str(node.target),
+        decomposition="batched indexed multiply-accumulate with result cast",
+        iteration_domains=(*output_domains, reduction_domain),
+        reduction_axes=("r0",),
+        loads=(left_load, right_load),
+        init=_zero(accumulator_dtype),
+        combine=Binary(
+            "add", Accumulator(accumulator_dtype), product, accumulator_dtype
+        ),
+        post=_contraction_post(accumulator_dtype, result.dtype or "", None),
+        accumulator_dtype=accumulator_dtype,
+        store=TensorStore(
+            result.id, result.shape, result.dtype or "", result.strides, True
+        ),
+        predicates=_predicates((*output_domains, reduction_domain)),
+    )
+
+
+def _normalized_dimension(dimension: int, rank: int) -> int:
+    normalized = dimension + rank if dimension < 0 else dimension
+    if not 0 <= normalized < rank:
+        raise UnsupportedLowering(f"dimension {dimension} is invalid for rank {rank}")
+    return normalized
+
+
+def _concat_program(
+    node: torch.fx.Node, op: Op, graph: ComputeGraph
+) -> CanonicalProgram:
+    result = _result_value(op, graph)
+    if result.shape is None:
+        raise UnsupportedLowering("concat result lacks a shape")
+    operand_nodes = node.args[0]
+    if not isinstance(operand_nodes, Sequence) or not operand_nodes:
+        raise UnsupportedLowering("concat requires a nonempty operand list")
+    axis = _normalized_dimension(node.args[1], len(result.shape))
+    return CanonicalProgram(
+        family="concat",
+        source_target=str(node.target),
+        decomposition="ordered multi-source materializing copy",
+        result_roles=("result",),
+        semantics={
+            "axis": axis,
+            "operands": tuple(_node_value(operand_node, graph).id for operand_node in operand_nodes),
+        },
+    )
+
+
+def _embedding_program(
+    node: torch.fx.Node, op: Op, graph: ComputeGraph
+) -> CanonicalProgram:
+    weight = _node_value(node.args[0], graph)
+    indices = _node_value(node.args[1], graph)
+    result = _result_value(op, graph)
+    if weight.shape is None or indices.shape is None or result.shape is None:
+        raise UnsupportedLowering("embedding operands need static shapes")
+    if result.shape != (*indices.shape, *weight.shape[1:]):
+        raise UnsupportedLowering("embedding result shape does not match its operands")
+    return CanonicalProgram(
+        family="gather",
+        source_target=str(node.target),
+        decomposition="weight rows selected by integer indices",
+        result_roles=("result",),
+        semantics={
+            "data": weight.id,
+            "indices": indices.id,
+            "index_axis": 0,
+            "trailing_shape": weight.shape[1:],
+        },
+    )
+
+
+def _index_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> CanonicalProgram:
+    source = _node_value(node.args[0], graph)
+    index_nodes = node.args[1]
+    if not isinstance(index_nodes, Sequence) or not index_nodes:
+        raise UnsupportedLowering("index requires a nonempty index list")
+    return CanonicalProgram(
+        family="gather",
+        source_target=str(node.target),
+        decomposition="source elements selected by advanced index operands",
+        result_roles=("result",),
+        semantics={
+            "source": source.id,
+            "indices": tuple(_node_value(index_node, graph).id for index_node in index_nodes),
+        },
+    )
+
+
+def _softmax_statistics_program(
+    node: torch.fx.Node, op: Op, graph: ComputeGraph
+) -> CanonicalProgram:
+    source = _node_value(node.args[0], graph)
+    if source.shape is None or len(op.results) != 2:
+        raise UnsupportedLowering("online softmax requires a tensor and two results")
+    axis = _normalized_dimension(node.args[1], len(source.shape))
+    for result_id in op.results:
+        result = graph.values[result_id]
+        expected_shape = tuple(
+            1 if dimension == axis else size
+            for dimension, size in enumerate(source.shape)
+        )
+        if result.shape != expected_shape:
+            raise UnsupportedLowering("online softmax result shape does not match its axis")
+    return CanonicalProgram(
+        family="softmax_statistics",
+        source_target=str(node.target),
+        decomposition="online maximum and sum-exp statistics",
+        result_roles=("max", "sum_exp"),
+        semantics={
+            "input": source.id,
+            "axis": axis,
+            "input_shape": source.shape,
+            "numerical_policy": "online_softmax",
+        },
+    )
+
+
 def _normalized_dims(dims: Any, rank: int) -> tuple[int, ...]:
     if dims is None:
         return tuple(range(rank))
@@ -679,6 +959,12 @@ LOWERERS: dict[Any, LoweringRule] = {
     torch.ops.aten.sub.Tensor: lambda node, op, graph: _binary_program(node, op, graph, "sub"),
     torch.ops.aten.mul.Tensor: lambda node, op, graph: _binary_program(node, op, graph, "mul"),
     torch.ops.aten.div.Tensor: lambda node, op, graph: _binary_program(node, op, graph, "div"),
+    torch.ops.aten.pow.Tensor_Scalar: lambda node, op, graph: _binary_program(
+        node, op, graph, "pow"
+    ),
+    torch.ops.aten.bitwise_and.Tensor: lambda node, op, graph: _binary_program(
+        node, op, graph, "bitwise_and"
+    ),
     torch.ops.aten.eq.Tensor: lambda node, op, graph: _binary_program(node, op, graph, "eq"),
     torch.ops.aten.ne.Tensor: lambda node, op, graph: _binary_program(node, op, graph, "ne"),
     torch.ops.aten.lt.Tensor: lambda node, op, graph: _binary_program(node, op, graph, "lt"),
@@ -697,28 +983,45 @@ LOWERERS: dict[Any, LoweringRule] = {
     torch.ops.aten.abs.default: lambda node, op, graph: _unary_program(node, op, graph, "abs"),
     torch.ops.aten.sigmoid.default: lambda node, op, graph: _unary_program(node, op, graph, "sigmoid"),
     torch.ops.aten.tanh.default: lambda node, op, graph: _unary_program(node, op, graph, "tanh"),
+    torch.ops.aten.rsqrt.default: lambda node, op, graph: _unary_program(node, op, graph, "rsqrt"),
+    torch.ops.aten.exp.default: lambda node, op, graph: _unary_program(node, op, graph, "exp"),
+    torch.ops.aten.cos.default: lambda node, op, graph: _unary_program(node, op, graph, "cos"),
+    torch.ops.aten.sin.default: lambda node, op, graph: _unary_program(node, op, graph, "sin"),
     torch.ops.aten._to_copy.default: _cast_program,
     torch.ops.aten.to.dtype: _cast_program,
     torch.ops.prims.convert_element_type.default: _cast_program,
     torch.ops.aten.view.dtype: _view_program,
     torch.ops.aten.reshape.default: _view_program,
+    torch.ops.aten.expand.default: _view_program,
+    torch.ops.aten.unsqueeze.default: _view_program,
+    torch.ops.aten.slice.Tensor: _view_program,
+    torch.ops.aten.clone.default: _copy_program,
     torch.ops.aten.t.default: _view_program,
     torch.ops.aten.transpose.int: _view_program,
     torch.ops.aten.permute.default: _view_program,
     torch.ops.aten.mm.default: _mm_program,
+    torch.ops.aten.bmm.default: _bmm_program,
     torch.ops.aten.addmm.default: _addmm_program,
     torch.ops.aten.linear.default: _linear_program,
     torch.ops.aten.sum.dim_IntList: lambda node, op, graph: _reduction_program(node, op, graph, False),
     torch.ops.aten.mean.dim: lambda node, op, graph: _reduction_program(node, op, graph, True),
     torch.ops.aten.sum.default: lambda node, op, graph: _reduction_program(node, op, graph, False),
     torch.ops.aten.mean.default: lambda node, op, graph: _reduction_program(node, op, graph, True),
+    operator.getitem: _tuple_projection_program,
+    torch.ops.aten.cat.default: _concat_program,
+    torch.ops.aten.embedding.default: _embedding_program,
+    torch.ops.aten.index.Tensor: _index_program,
+    torch.ops.aten.full.default: _constant_program,
+    torch.ops.aten.scalar_tensor.default: _constant_program,
+    torch.ops.prims.iota.default: _iota_program,
+    "prims.prepare_softmax_online.default": _softmax_statistics_program,
 }
 
 
 def _expression_loads(expression: ScalarExpression) -> set[str]:
     if isinstance(expression, Load):
         return {expression.load_id}
-    if isinstance(expression, Constant) or isinstance(expression, Accumulator):
+    if isinstance(expression, (Constant, Accumulator, AxisIndex)):
         return set()
     if isinstance(expression, Unary):
         return _expression_loads(expression.operand)
@@ -738,7 +1041,7 @@ def _expression_loads(expression: ScalarExpression) -> set[str]:
 def _expression_has_accumulator(expression: ScalarExpression) -> bool:
     if isinstance(expression, Accumulator):
         return True
-    if isinstance(expression, Constant) or isinstance(expression, Load):
+    if isinstance(expression, (Constant, Load, AxisIndex)):
         return False
     if isinstance(expression, Unary):
         return _expression_has_accumulator(expression.operand)
@@ -806,8 +1109,12 @@ def _verify_tensor_program(program: TensorProgram, op: Op, graph: ComputeGraph) 
             raise UnsupportedLowering(f"load {load.id} may read outside its source storage")
     if _expression_loads(program.combine) - load_ids:
         raise UnsupportedLowering("combine expression uses an unknown load")
+    if isinstance(program.combine, AxisIndex) and program.combine.axis not in axes:
+        raise UnsupportedLowering("axis index uses an unbound iteration axis")
     if program.post is not None and _expression_loads(program.post) - load_ids:
         raise UnsupportedLowering("post expression uses an unknown load")
+    if isinstance(program.post, AxisIndex) and program.post.axis not in axes:
+        raise UnsupportedLowering("axis index uses an unbound iteration axis")
     if program.family in {"reduction", "contraction"}:
         if not program.reduction_axes or program.init is None or program.post is None:
             raise UnsupportedLowering("reduction lacks an accumulator or result expression")
@@ -833,13 +1140,58 @@ def _verify_tensor_program(program: TensorProgram, op: Op, graph: ComputeGraph) 
         raise UnsupportedLowering("elementwise combine expression uses the accumulator")
 
 
+def _verify_canonical_program(
+    program: CanonicalProgram, op: Op, graph: ComputeGraph
+) -> None:
+    if len(program.result_roles) != len(op.results):
+        raise UnsupportedLowering("canonical result roles do not match results")
+    if len(set(program.result_roles)) != len(program.result_roles):
+        raise UnsupportedLowering("canonical program has duplicate result roles")
+    if program.family == "concat":
+        operands = program.semantics.get("operands")
+        if (
+            not isinstance(operands, tuple)
+            or not operands
+            or not set(operands) <= set(op.operands)
+        ):
+            raise UnsupportedLowering("concat semantics do not match its operands")
+    elif program.family == "gather":
+        operand_ids = set(op.operands)
+        referenced_ids = {
+            value_id
+            for key in ("data", "indices", "source")
+            for value_id in (
+                program.semantics[key]
+                if isinstance(program.semantics.get(key), tuple)
+                else (program.semantics.get(key),)
+            )
+            if value_id is not None
+        }
+        if not referenced_ids or not referenced_ids <= operand_ids:
+            raise UnsupportedLowering("gather semantics reference non-operand values")
+    elif program.family == "softmax_statistics":
+        if program.semantics.get("input") not in op.operands:
+            raise UnsupportedLowering("softmax semantics reference a non-operand value")
+    else:
+        raise UnsupportedLowering(f"unknown canonical family {program.family}")
+
+
+def _verify_program(
+    program: TensorProgram | CanonicalProgram, op: Op, graph: ComputeGraph
+) -> None:
+    if isinstance(program, TensorProgram):
+        _verify_tensor_program(program, op, graph)
+    else:
+        _verify_canonical_program(program, op, graph)
+
+
 def lower_semantics(graph: ComputeGraph) -> ComputeGraph:
     lowered_ops: dict[str, Op] = {}
     for op_id, operation in graph.ops.items():
         source_id = operation.source_fx_ids[0]
         node = graph.source_nodes[source_id]
         target = node.target
-        rule = LOWERERS.get(target)
+        rule = LOWERERS.get(target) or LOWERERS.get(str(target))
         unsupported_effects = bool(
             operation.effects.get("unknown")
             or operation.effects.get("mutates_inputs")
@@ -856,7 +1208,7 @@ def lower_semantics(graph: ComputeGraph) -> ComputeGraph:
         else:
             try:
                 tensor_program = rule(node, operation, graph)
-                _verify_tensor_program(tensor_program, operation, graph)
+                _verify_program(tensor_program, operation, graph)
                 reason = ""
             except UnsupportedLowering as error:
                 tensor_program = None
@@ -883,12 +1235,86 @@ def lower_semantics(graph: ComputeGraph) -> ComputeGraph:
     return lowered
 
 
-def dump_lowering_graph(graph: ComputeGraph, path: str | Path) -> Path:
+CANONICAL_TARGETS = frozenset(
+    {
+        operator.getitem,
+        torch.ops.aten.bitwise_and.Tensor,
+        torch.ops.aten.bmm.default,
+        torch.ops.aten.cat.default,
+        torch.ops.aten.clone.default,
+        torch.ops.aten.cos.default,
+        torch.ops.aten.embedding.default,
+        torch.ops.aten.exp.default,
+        torch.ops.aten.expand.default,
+        torch.ops.aten.full.default,
+        torch.ops.aten.index.Tensor,
+        torch.ops.prims.iota.default,
+        torch.ops.aten.pow.Tensor_Scalar,
+        "prims.prepare_softmax_online.default",
+        torch.ops.aten.rsqrt.default,
+        torch.ops.aten.scalar_tensor.default,
+        torch.ops.aten.sin.default,
+        torch.ops.aten.slice.Tensor,
+        torch.ops.aten.unsqueeze.default,
+    }
+)
+
+
+def canonicalize_semantics(graph: ComputeGraph) -> ComputeGraph:
+    lowered = lower_semantics(graph)
+    canonical_ops: dict[str, Op] = {}
+    for op_id, operation in lowered.ops.items():
+        target = lowered.source_nodes[operation.source_fx_ids[0]].target
+        program = operation.tensor_program
+        canonical = program is not None and (
+            target in CANONICAL_TARGETS
+            or str(target) in CANONICAL_TARGETS
+            or isinstance(program, CanonicalProgram)
+        )
+        result_roles = (
+            program.result_roles
+            if isinstance(program, CanonicalProgram)
+            else ("result",)
+            if program is not None
+            else ()
+        )
+        numerical_rules = {
+            **operation.numerical_rules,
+            "canonical": canonical,
+            "result_roles": result_roles,
+        }
+        canonical_ops[op_id] = replace(
+            operation, numerical_rules=numerical_rules
+        )
+    canonicalized = replace(lowered, ops=canonical_ops)
+    from .graph import verify_compute_graph
+
+    verify_compute_graph(canonicalized)
+    return canonicalized
+
+
+def semantic_coverage(graph: ComputeGraph) -> dict[str, int]:
+    canonical = sum(
+        bool(operation.numerical_rules.get("canonical"))
+        for operation in graph.ops.values()
+    )
     known = sum(operation.tensor_program is not None for operation in graph.ops.values())
+    return {
+        "canonical": canonical,
+        "generic": known - canonical,
+        "unresolved": len(graph.ops) - known,
+    }
+
+
+def dump_lowering_graph(graph: ComputeGraph, path: str | Path) -> Path:
+    coverage = semantic_coverage(graph)
+    known = coverage["canonical"] + coverage["generic"]
     lines = [
         "# LoweringGraph",
         f"values={len(graph.values)} operations={len(graph.ops)} "
         f"known={known} unknown={len(graph.ops) - known} "
+        f"canonical={coverage['canonical']} generic={coverage['generic']} "
+        f"unresolved={coverage['unresolved']} "
         f"inputs={len(graph.inputs)} outputs={len(graph.outputs)}",
         "",
         "## Operations",
@@ -902,6 +1328,7 @@ def dump_lowering_graph(graph: ComputeGraph, path: str | Path) -> Path:
             f"results={list(operation.results)} "
             f"family={program.family if program is not None else None} "
             f"known={program is not None} "
+            f"canonical={bool(operation.numerical_rules.get('canonical'))} "
             f"reason={operation.numerical_rules.get('reason', '')!r}"
         )
 
@@ -909,6 +1336,18 @@ def dump_lowering_graph(graph: ComputeGraph, path: str | Path) -> Path:
     for operation in graph.ops.values():
         program = operation.tensor_program
         if program is None:
+            continue
+        if isinstance(program, CanonicalProgram):
+            lines.extend(
+                [
+                    f"### {operation.id}",
+                    f"source_target={program.source_target}",
+                    f"decomposition={program.decomposition}",
+                    f"result_roles={list(program.result_roles)}",
+                    f"semantics={dict(program.semantics)!r}",
+                    "",
+                ]
+            )
             continue
         lines.extend(
             [

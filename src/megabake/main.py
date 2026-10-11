@@ -13,7 +13,7 @@ from .frontend import make_backend
 from .fx_handler.export import capture_exported_program
 from .fx_handler.transformers import capture_transformer
 from .graph import dump_compute_graph, import_fx
-from .lowering import dump_lowering_graph, lower_semantics
+from .lowering import canonicalize_semantics, dump_lowering_graph
 
 
 def _backend(args: argparse.Namespace) -> Any:
@@ -85,7 +85,7 @@ def _run_transformers(args: argparse.Namespace) -> int:
             )
         if getattr(args, "dump_lowering_graph", False):
             lowering_graph_path = dump_lowering_graph(
-                lower_semantics(compute_graph),
+                canonicalize_semantics(compute_graph),
                 output_directory / "lowering_graph.txt",
             )
     print(f"transformers: PASS {_summary(output)}")
