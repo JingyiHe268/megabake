@@ -134,11 +134,11 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Implement in:** `regions.py`, with `form_regions(graph)`.
 
-- [ ] Start with one region per operation. Store source IDs instead of copying operations into another graph.
-- [ ] Compute each region's external inputs and every output used outside it, including graph outputs.
-- [ ] Normalize supported view-plus-GEMM forms through index maps. Preserve aliases and explicit materialization when needed.
-- [ ] Add exact semantic annotations only where a matcher succeeds. Keep unmatched operations available for generic lowering.
-- [ ] Verify that region coverage includes every source operation and preserves effect ordering.
+- [x] Start with one region per operation. Store source IDs instead of copying operations into another graph.
+- [x] Compute each region's external inputs and every output used outside it, including graph outputs.
+- [x] Normalize supported view-plus-GEMM forms through index maps. Preserve aliases and explicit materialization when needed.
+- [x] Add exact semantic annotations only where a matcher succeeds. Keep unmatched operations available for generic lowering.
+- [x] Verify that region coverage includes every source operation and preserves effect ordering.
 
 **Output:** baseline regions that body providers can inspect.
 

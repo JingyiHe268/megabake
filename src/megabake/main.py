@@ -14,6 +14,7 @@ from .fx_handler.export import capture_exported_program
 from .fx_handler.transformers import capture_transformer
 from .graph import dump_compute_graph, import_fx
 from .lowering import canonicalize_semantics, dump_lowering_graph
+from .regions import dump_region_graph, form_regions
 
 
 def _backend(args: argparse.Namespace) -> Any:
@@ -70,9 +71,10 @@ def _run_transformers(args: argparse.Namespace) -> int:
     output = capture.run(input_ids)
     compute_graph_path = None
     lowering_graph_path = None
+    region_graph_path = None
     if getattr(args, "dump_compute_graph", False) or getattr(
         args, "dump_lowering_graph", False
-    ):
+    ) or getattr(args, "dump_region_graph", False):
         compute_graph = import_fx(capture.graph, capture.context)
         model_name = args.model_name
         safe_model_name = re.sub(r"[^A-Za-z0-9_.-]+", "__", model_name).strip("._")
@@ -82,11 +84,16 @@ def _run_transformers(args: argparse.Namespace) -> int:
         if getattr(args, "dump_compute_graph", False):
             compute_graph_path = dump_compute_graph(
                 compute_graph, output_directory / "compute_graph.txt"
-            )
+        )
         if getattr(args, "dump_lowering_graph", False):
+            canonical_graph = canonicalize_semantics(compute_graph)
             lowering_graph_path = dump_lowering_graph(
-                canonicalize_semantics(compute_graph),
-                output_directory / "lowering_graph.txt",
+                canonical_graph, output_directory / "lowering_graph.txt"
+            )
+        if getattr(args, "dump_region_graph", False):
+            region_graph = form_regions(canonicalize_semantics(compute_graph))
+            region_graph_path = dump_region_graph(
+                region_graph, output_directory / "region_graph.txt"
             )
     print(f"transformers: PASS {_summary(output)}")
     print(
@@ -98,6 +105,8 @@ def _run_transformers(args: argparse.Namespace) -> int:
         print(f"compute graph: {compute_graph_path}")
     if lowering_graph_path is not None:
         print(f"lowering graph: {lowering_graph_path}")
+    if region_graph_path is not None:
+        print(f"region graph: {region_graph_path}")
     return 0
 
 
@@ -168,6 +177,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     transformers_parser.add_argument(
         "--dump-lowering-graph", action="store_true", default=False
+    )
+    transformers_parser.add_argument(
+        "--dump-region-graph", action="store_true", default=False
     )
     transformers_parser.set_defaults(handler=_run_transformers)
 

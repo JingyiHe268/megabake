@@ -12,6 +12,7 @@ from .lowering import (
     lower_semantics,
     semantic_coverage,
 )
+from .regions import dump_region_graph, form_regions
 
 __all__ = [
     "CaptureCache",
@@ -23,6 +24,8 @@ __all__ = [
     "dump_lowering_graph",
     "lower_semantics",
     "semantic_coverage",
+    "form_regions",
+    "dump_region_graph",
     "make_backend",
     "prepare_fx_graph",
 ]
