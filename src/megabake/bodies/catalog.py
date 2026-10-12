@@ -74,7 +74,7 @@ class GenericBodyProvider:
                     ),
                 ),
             )
-        if family not in {"elementwise", "reduction", "contraction"}:
+        if family not in {"elementwise", "copy", "reduction", "contraction"}:
             return CandidateSet(
                 (),
                 (

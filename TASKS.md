@@ -166,10 +166,10 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Implement in:** `generic.py`, with `emit_map_body(program, config)`.
 
-- [ ] Assign output coordinates to threads through a concrete tile map.
-- [ ] Generate indexed loads, broadcasts, typed expressions, explicit casts, and stores.
-- [ ] Predicate out-of-range coordinates. Preserve the required behavior for supported strided inputs and outputs.
-- [ ] Generate device-callable CuTe code. Reuse the typed-expression approach in the G0 mixed-body probe.
+- [x] Assign output coordinates to threads through a concrete tile map.
+- [x] Generate indexed loads, broadcasts, typed expressions, explicit casts, and stores.
+- [x] Predicate out-of-range coordinates. Preserve the required behavior for supported strided inputs and outputs.
+- [x] Generate device-callable CuTe code. Reuse the typed-expression approach in the G0 mixed-body probe.
 
 **Output:** generated map bodies that the future enclosing kernel can call.
 

@@ -1,4 +1,5 @@
 from .catalog import get_candidates
+from .generic import GeneratedMapBody, UnsupportedMapBody, emit_map_body
 from .interface import (
     BodyConfig,
     BodyProvider,
@@ -12,6 +13,9 @@ from .interface import (
 
 __all__ = [
     "get_candidates",
+    "GeneratedMapBody",
+    "UnsupportedMapBody",
+    "emit_map_body",
     "BodyConfig",
     "BodyProvider",
     "CandidateSet",

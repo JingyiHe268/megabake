@@ -9,6 +9,7 @@ from megabake.bodies import (
     InvalidBodyConfig,
     SelectionPolicy,
     TargetFacts,
+    emit_map_body,
     validate_body_config,
 )
 from megabake.bodies.catalog import get_candidates
@@ -78,6 +79,22 @@ def test_catalog_returns_generic_map_contract():
     assert config.participants.participating_threads == 128
     assert config.completion.outputs_ready.startswith("assigned output elements")
     assert config.completion.scratch_reusable == "scratch is reusable when run returns"
+
+
+def test_emit_map_body_generates_copy_source():
+    class Model(torch.nn.Module):
+        def forward(self, value):
+            return value.clone()
+
+    region = _regions(Model(), torch.randn(5, 70))[0]
+    config = get_candidates(region, _target(), _policy()).configurations[0]
+    body = emit_map_body(region.tensor_programs[0], config)
+
+    assert body.function_name == "run"
+    assert body.tile_count == 3
+    assert body.work_iterator_dtype == "torch.int64"
+    assert "tensor_bindings[0][o0, o1]" in body.source
+    assert "output[o0, o1] = value" in body.source
 
 
 def test_catalog_describes_g0_range_and_rejects_incompatible_target():
