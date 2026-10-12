@@ -150,11 +150,11 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Implement in:** `bodies/interface.py` and `bodies/catalog.py`, under `src/megabake`.
 
-- [ ] Implement `get_candidates(region, target, policy) -> configurations or rejection reasons`.
-- [ ] Define `BodyConfig` using architecture section 5. Include semantic support, layouts, tiles, participants, stages, scratch, and completion rules.
-- [ ] Define the device entry `run(work_iterator, tensor_bindings, scratch, epilogue)`.
-- [ ] State which threads participate, when outputs become ready, and when scratch can be reused.
-- [ ] Require generic and tuned providers to use this interface. Keep whole-kernel launch wrappers outside device-body selection.
+- [x] Implement `get_candidates(region, target, policy) -> configurations or rejection reasons`.
+- [x] Define `BodyConfig` using architecture section 5. Include semantic support, layouts, tiles, participants, stages, scratch, and completion rules.
+- [x] Define the device entry `run(work_iterator, tensor_bindings, scratch, epilogue)`.
+- [x] State which threads participate, when outputs become ready, and when scratch can be reused.
+- [x] Require generic and tuned providers to use this interface. Keep whole-kernel launch wrappers outside device-body selection.
 
 **Output:** one common contract for generated primitives and tuned bodies.
 

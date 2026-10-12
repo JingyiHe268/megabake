@@ -58,6 +58,7 @@ class Region:
     external_inputs: tuple[str, ...]
     live_outputs: tuple[str, ...]
     semantic_facts: dict[str, Any] = field(default_factory=dict)
+    tensor_programs: tuple[Any, ...] = ()
 
 
 @dataclass(frozen=True)

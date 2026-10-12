@@ -16,6 +16,9 @@ def form_regions(graph: ComputeGraph) -> ComputeGraph:
             external_inputs=_external_inputs((operation,), graph),
             live_outputs=_live_outputs((operation,), graph),
             semantic_facts=_semantic_facts(operation, graph),
+            tensor_programs=(operation.tensor_program,)
+            if operation.tensor_program is not None
+            else (),
         )
         for operation in graph.ops.values()
     )

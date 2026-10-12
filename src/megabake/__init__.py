@@ -13,6 +13,7 @@ from .lowering import (
     semantic_coverage,
 )
 from .regions import dump_region_graph, form_regions
+from .bodies import BodyConfig, SelectionPolicy, TargetFacts, get_candidates
 
 __all__ = [
     "CaptureCache",
@@ -26,6 +27,10 @@ __all__ = [
     "semantic_coverage",
     "form_regions",
     "dump_region_graph",
+    "BodyConfig",
+    "SelectionPolicy",
+    "TargetFacts",
+    "get_candidates",
     "make_backend",
     "prepare_fx_graph",
 ]
