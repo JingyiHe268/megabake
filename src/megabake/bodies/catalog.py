@@ -206,7 +206,12 @@ def _generic_config(region: Region, program: Any) -> BodyConfig:
     is_reduction = program.family == "reduction"
     is_contraction = program.family == "contraction"
     threads = 128
-    scratch_bytes = 512 if is_reduction else 0
+    warp_count = threads // 32
+    scratch_bytes = (
+        warp_count * _DTYPE_BYTES[program.accumulator_dtype]
+        if is_reduction
+        else 0
+    )
     barriers = ("cta_reduction",) if is_reduction else ()
     cta_shape = (128,) + (1,) * max(len(output_axes) - 1, 0)
     if is_contraction:
@@ -220,6 +225,23 @@ def _generic_config(region: Region, program: Any) -> BodyConfig:
         else "scratch is reusable when run returns",
         register_fragments="none",
         warp_roles_on_return="unchanged",
+    )
+    evidence = (
+        ResourceEvidence(
+            measured=False,
+            source="generated CuTe reduction; composition informed by Mirage primitive-body and Hopper norm tasks",
+            revision="mirage@f9eb70c254acefc9f3667b2a973d0dcf25471fce; task-07",
+            resources={"threads": threads, "shared_bytes": scratch_bytes},
+            measurements={},
+        )
+        if is_reduction
+        else ResourceEvidence(
+            measured=False,
+            source="generated baseline contract",
+            revision="task-05",
+            resources={"threads": threads, "shared_bytes": scratch_bytes},
+            measurements={},
+        )
     )
     return BodyConfig(
         provider=GenericBodyProvider.provider_name,
@@ -239,11 +261,15 @@ def _generic_config(region: Region, program: Any) -> BodyConfig:
         tiles=TileContract(
             cta_shape=cta_shape,
             cluster_shape=(1,) * len(cta_shape),
-            work_partition="one output element per thread"
+            work_partition=(
+                "one output row per CTA"
+                if is_reduction
+                else "one output element per thread"
+            )
             if not is_contraction
             else "disjoint output tiles per CTA",
             mma_family=None,
-            reduction_tile=(32,) if program.reduction_axes else (),
+            reduction_tile=(threads,) if is_reduction else (),
         ),
         participants=ParticipantContract(
             participating_threads=threads,
@@ -256,7 +282,11 @@ def _generic_config(region: Region, program: Any) -> BodyConfig:
             barriers=barriers,
             async_operations=(),
             shared_memory_layouts=(
-                {"reduction_partials": "one scalar per participating thread"}
+                {
+                    "reduction_partials": (
+                        "one accumulator scalar per warp in the CTA scratch row"
+                    )
+                }
                 if is_reduction
                 else {}
             ),
@@ -272,13 +302,7 @@ def _generic_config(region: Region, program: Any) -> BodyConfig:
             reuse_rule=completion.scratch_reusable,
         ),
         completion=completion,
-        evidence=ResourceEvidence(
-            measured=False,
-            source="generated baseline contract",
-            revision="task-05",
-            resources={"threads": threads, "shared_bytes": scratch_bytes},
-            measurements={},
-        ),
+        evidence=evidence,
     )
 
 

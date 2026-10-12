@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Mapping
 
 from ..lowering import (
     AxisIndex,
+    Accumulator,
     Binary,
     Cast,
     Constant,
@@ -37,6 +38,36 @@ class GeneratedMapBody:
 
 
 @dataclass(frozen=True)
+class GeneratedReductionBody:
+    """A device-callable reduction body and its work-iterator encoding."""
+
+    source: str
+    function_name: str = "run"
+    threads_per_cta: int = 128
+    reduction_tile: int = 128
+    tile_count: int = 1
+    scratch_elements: int = 4
+    work_iterator_dtype: str = "torch.int64"
+    work_iterator_encoding: str = "one flat output index per CTA"
+    scratch_encoding: str = "scratch[block, warp] holds one accumulator partial per warp"
+    phases: tuple[str, ...] = ("thread_partial", "warp_partial", "cta_merge", "epilogue")
+    phase_descriptions: Mapping[str, str] = field(
+        default_factory=lambda: {
+            "thread_partial": "each thread accumulates bounded reduction strips",
+            "warp_partial": "lane zero stores one deterministic warp partial",
+            "cta_merge": "all threads merge warp partials in warp order",
+            "epilogue": "thread zero applies the post expression and stores",
+        }
+    )
+    arguments: tuple[str, ...] = (
+        "work_iterator",
+        "tensor_bindings",
+        "scratch",
+        "epilogue",
+    )
+
+
+@dataclass(frozen=True)
 class _TypedExpression:
     code: str
     dtype: str
@@ -44,6 +75,9 @@ class _TypedExpression:
 
 class UnsupportedMapBody(ValueError):
     pass
+
+
+UnsupportedReductionBody = UnsupportedMapBody
 
 
 _CUTLASS_TYPES = {
@@ -127,6 +161,95 @@ def run(
     )
 
 
+def emit_reduction_body(
+    program: TensorProgram, config: BodyConfig
+) -> GeneratedReductionBody:
+    _validate_reduction_body(program, config)
+
+    threads = config.participants.participating_threads
+    warps = threads // 32
+    output_domains = [
+        domain
+        for domain in program.iteration_domains
+        if domain.axis not in program.reduction_axes
+    ]
+    reduction_domain = next(
+        domain for domain in program.iteration_domains if domain.axis in program.reduction_axes
+    )
+    axis_coordinates = {
+        domain.axis: f"o{index}" for index, domain in enumerate(output_domains)
+    }
+    reduction_coordinate = f"r{program.reduction_axes.index(reduction_domain.axis)}"
+    load_indices = {load.id: index for index, load in enumerate(program.loads)}
+
+    accumulator = _emit_expression(program.init, load_indices, axis_coordinates, program.loads)
+    combine = _emit_expression(
+        program.combine,
+        load_indices,
+        {**axis_coordinates, reduction_domain.axis: reduction_coordinate},
+        program.loads,
+    )
+    assert program.post is not None
+    post = _emit_expression(program.post, load_indices, axis_coordinates, program.loads)
+
+    coordinate_lines = _coordinate_lines(program.store.shape, "output_index")
+    output_coordinates = ", ".join(
+        axis_coordinates[domain.axis] for domain in output_domains
+    )
+    binding_type = ", ".join(
+        "cute.Tensor" for _ in range(len(program.loads) + 1)
+    )
+    accumulator_type = _cutlass_type(program.accumulator_dtype or "")
+    source = f'''import cutlass
+import cutlass.cute as cute
+
+
+@cute.kernel
+def run(
+    work_iterator: cute.Tensor,
+    tensor_bindings: tuple[{binding_type}],
+    scratch: cute.Tensor,
+    epilogue,
+):
+    block, _, _ = cute.arch.block_idx()
+    thread, _, _ = cute.arch.thread_idx()
+    workers, _, _ = cute.arch.grid_dim()
+    warp = thread // 32
+    lane = thread % 32
+    warps = {warps}
+    output = tensor_bindings[{len(program.loads)}]
+    output_count = cute.size(output)
+    for tile in cutlass.range(block, cute.size(work_iterator), workers):
+        output_index = work_iterator[tile]
+        if output_index < output_count:
+{coordinate_lines}            accumulator = {accumulator_type}({accumulator.code})
+            for reduction_index in cutlass.range(thread, {reduction_domain.size}, {threads}):
+                {reduction_coordinate} = reduction_index
+                accumulator = {combine.code}
+            warp_partial = cute.arch.warp_reduction_sum(accumulator)
+            if lane == 0:
+                scratch[block, warp] = warp_partial
+            cute.arch.sync_threads()
+            accumulator = {accumulator_type}({accumulator.code})
+            for warp_index in cutlass.range(warps):
+                accumulator = accumulator + scratch[block, warp_index]
+            value = {post.code}
+            if thread == 0:
+                output[{output_coordinates}] = value
+            cute.arch.sync_threads()
+'''
+    output_count = 1
+    for size in program.store.shape:
+        output_count *= size
+    return GeneratedReductionBody(
+        source=source,
+        threads_per_cta=threads,
+        reduction_tile=threads,
+        tile_count=output_count,
+        scratch_elements=warps,
+    )
+
+
 def _validate_map_body(program: TensorProgram, config: BodyConfig) -> None:
     validate_body_config(config)
     if program.family not in {"elementwise", "copy"}:
@@ -157,18 +280,75 @@ def _validate_map_body(program: TensorProgram, config: BodyConfig) -> None:
     if any(stride < 0 for stride in program.store.strides):
         raise UnsupportedMapBody("negative output strides are not supported")
 
+    _validate_body_layouts(program, config, program.iteration_domains)
+
+
+def _validate_reduction_body(program: TensorProgram, config: BodyConfig) -> None:
+    validate_body_config(config)
+    # shortcut: one reduction axis and ordered addition only, add more when a captured fixture needs them.
+    if program.family != "reduction":
+        raise UnsupportedReductionBody(
+            f"reduction body generator supports reduction, not {program.family}"
+        )
+    if config.semantic.operation_family != program.family:
+        raise UnsupportedReductionBody("body config and tensor program families differ")
+    if len(program.reduction_axes) != 1:
+        raise UnsupportedReductionBody(
+            "reduction body generator supports one reduction axis"
+        )
+    if program.init is None or program.post is None or program.accumulator_dtype is None:
+        raise UnsupportedReductionBody("reduction body requires complete reduction state")
+    if not _is_add_reduction(program.combine):
+        raise UnsupportedReductionBody("reduction body generator supports ordered addition")
+    if program.init.dtype != program.accumulator_dtype:
+        raise UnsupportedReductionBody("initializer and accumulator dtypes differ")
+
+    threads = config.participants.participating_threads
+    warps = threads // 32
+    if threads <= 0 or threads % 32:
+        raise UnsupportedReductionBody("reduction body requires whole warps")
+    if config.tiles.cta_shape != (threads,) + (1,) * (
+        len(program.iteration_domains) - len(program.reduction_axes) - 1
+    ):
+        raise UnsupportedReductionBody("reduction body requires one CTA per output row")
+    if config.tiles.work_partition != "one output row per CTA":
+        raise UnsupportedReductionBody("reduction body requires one output row per CTA")
+    if config.tiles.reduction_tile != (threads,):
+        raise UnsupportedReductionBody("reduction body requires one reduction strip per thread")
+    if config.scratch.owner != "cta" or config.scratch.size_bytes < warps * _dtype_bytes(
+        program.accumulator_dtype
+    ):
+        raise UnsupportedReductionBody("reduction body lacks warp-partial scratch")
+
+    output_domains = tuple(
+        domain
+        for domain in program.iteration_domains
+        if domain.axis not in program.reduction_axes
+    )
+    if not output_domains or any(domain.size <= 0 for domain in output_domains):
+        raise UnsupportedReductionBody("reduction body requires a nonempty output row")
+    if any(domain.size <= 0 for domain in program.iteration_domains):
+        raise UnsupportedReductionBody("reduction body requires a nonempty reduction extent")
+    if any(stride < 0 for stride in program.store.strides):
+        raise UnsupportedReductionBody("negative output strides are not supported")
+
+    _validate_body_layouts(program, config, output_domains)
+
+
+def _validate_body_layouts(
+    program: TensorProgram,
+    config: BodyConfig,
+    output_domains: tuple,
+) -> None:
     expected_input_ids = {load.value_id for load in program.loads}
     if set(config.layouts.inputs) != expected_input_ids:
         raise UnsupportedMapBody("body input layouts do not match tensor program loads")
     if set(config.layouts.outputs) != {program.store.value_id}:
         raise UnsupportedMapBody("body output layouts do not match tensor program store")
 
-    expected_output_axes = tuple(
-        domain.axis for domain in program.iteration_domains
-    )
     output_layout = config.layouts.outputs[program.store.value_id]
     if (
-        output_layout.axes != expected_output_axes
+        output_layout.axes != tuple(domain.axis for domain in output_domains)
         or output_layout.strides != tuple(program.store.strides)
         or output_layout.dtype != program.store.dtype
     ):
@@ -186,9 +366,38 @@ def _validate_map_body(program: TensorProgram, config: BodyConfig) -> None:
             raise UnsupportedMapBody("negative input strides are not supported")
 
 
-def _coordinate_lines(shape: tuple[int, ...]) -> str:
+def _is_add_reduction(expression: ScalarExpression) -> bool:
+    if not isinstance(expression, Binary) or expression.operator != "add":
+        return False
+    left = _expression_has_accumulator(expression.lhs)
+    right = _expression_has_accumulator(expression.rhs)
+    return left != right
+
+
+def _expression_has_accumulator(expression: ScalarExpression) -> bool:
+    if isinstance(expression, Accumulator):
+        return True
+    if isinstance(expression, Binary):
+        return _expression_has_accumulator(expression.lhs) or _expression_has_accumulator(
+            expression.rhs
+        )
+    if isinstance(expression, Unary):
+        return _expression_has_accumulator(expression.operand)
+    if isinstance(expression, Cast):
+        return _expression_has_accumulator(expression.operand)
+    if isinstance(expression, Where):
+        return any(
+            _expression_has_accumulator(value)
+            for value in (expression.condition, expression.true_value, expression.false_value)
+        )
+    return False
+
+
+def _coordinate_lines(
+    shape: tuple[int, ...], value: str = "linear_index"
+) -> str:
     lines: list[str] = []
-    remainder = "linear_index"
+    remainder = value
     for index, size in enumerate(shape):
         coordinate = f"o{index}"
         lines.append(f"            {coordinate} = {remainder} % {size}\n")
@@ -221,6 +430,8 @@ def _emit_expression(
             f"{_cutlass_type(expression.dtype)}({expression.value!r})",
             expression.dtype,
         )
+    if isinstance(expression, Accumulator):
+        return _TypedExpression("accumulator", expression.dtype)
     if isinstance(expression, AxisIndex):
         coordinate = axis_coordinates.get(expression.axis)
         if coordinate is None:
@@ -248,14 +459,15 @@ def _emit_expression(
         else:
             left = _cast_expression(left, expression.dtype)
             right = _cast_expression(right, expression.dtype)
-        symbol = _BINARY_SYMBOLS.get(expression.operator)
-        if symbol is None:
-            raise UnsupportedMapBody(f"unsupported binary operator {expression.operator}")
-        code = (
-            f"cute.pow({left.code}, {right.code})"
-            if expression.operator == "pow"
-            else f"({left.code} {symbol} {right.code})"
-        )
+        if expression.operator == "pow":
+            code = f"cute.pow({left.code}, {right.code})"
+        else:
+            symbol = _BINARY_SYMBOLS.get(expression.operator)
+            if symbol is None:
+                raise UnsupportedMapBody(
+                    f"unsupported binary operator {expression.operator}"
+                )
+            code = f"({left.code} {symbol} {right.code})"
         return _TypedExpression(code, expression.dtype)
     if isinstance(expression, Where):
         condition = _emit_expression(
@@ -299,6 +511,7 @@ def _unary_code(operator: str, operand: _TypedExpression) -> str:
         "sigmoid": "sigmoid",
         "tanh": "cute.tanh",
         "rsqrt": "cute.rsqrt",
+        "sqrt": "cute.sqrt",
         "exp": "cute.exp",
         "cos": "cute.cos",
         "sin": "cute.sin",
@@ -371,3 +584,24 @@ def _larger_float(left: str, right: str) -> str:
 
 def _larger_integer(left: str, right: str) -> str:
     return left if _integer_rank(left) > _integer_rank(right) else right
+
+
+_DTYPE_BYTES = {
+    "torch.bool": 1,
+    "torch.uint8": 1,
+    "torch.int8": 1,
+    "torch.int16": 2,
+    "torch.int32": 4,
+    "torch.int64": 8,
+    "torch.float16": 2,
+    "torch.bfloat16": 2,
+    "torch.float32": 4,
+    "torch.float64": 8,
+}
+
+
+def _dtype_bytes(dtype: str) -> int:
+    try:
+        return _DTYPE_BYTES[dtype]
+    except KeyError as error:
+        raise UnsupportedReductionBody(f"unsupported dtype {dtype}") from error

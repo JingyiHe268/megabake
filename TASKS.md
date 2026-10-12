@@ -181,10 +181,10 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Implement in:** `generic.py`, with `emit_reduction_body(program, config)`.
 
-- [ ] Start with one CTA owning an output row. Loop over the reduction domain in bounded chunks.
-- [ ] Generate expressions before and after reduction. Preserve accumulator types, casts, axes, and epsilon placement.
-- [ ] Support reductions larger than a single loaded tile. Keep barriers consistent across participating threads.
-- [ ] Add partial-result and merge phases only where the numerical policy allows them. Describe both phases in the plan.
+- [x] Start with one CTA owning an output row. Loop over the reduction domain in bounded chunks.
+- [x] Generate expressions before and after reduction. Preserve accumulator types, casts, axes, and epsilon placement.
+- [x] Support reductions larger than a single loaded tile. Keep barriers consistent across participating threads.
+- [x] Add partial-result and merge phases only where the numerical policy allows them. Describe both phases in the plan.
 
 **Output:** reusable reduction schedules that generate different norms and reductions from their source expressions.
 
