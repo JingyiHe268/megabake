@@ -68,6 +68,43 @@ class GeneratedReductionBody:
 
 
 @dataclass(frozen=True)
+class GeneratedContractionBody:
+    """A device-callable baseline contraction and its work-iterator encoding."""
+
+    source: str
+    function_name: str = "run"
+    threads_per_cta: int = 128
+    output_tile_elements: int = 128
+    reduction_chunk: int = 32
+    tile_count: int = 1
+    work_iterator_dtype: str = "torch.int64"
+    work_iterator_encoding: str = (
+        "one flat output-tile base index per CTA; thread adds its lane"
+    )
+    phases: tuple[str, ...] = (
+        "output_tile",
+        "bounded_reduction",
+        "epilogue",
+    )
+    phase_descriptions: Mapping[str, str] = field(
+        default_factory=lambda: {
+            "output_tile": "each thread owns one predicated output coordinate",
+            "bounded_reduction": (
+                "the owning thread accumulates indexed products over "
+                "fixed-size reduction chunks with a tail predicate"
+            ),
+            "epilogue": "the post expression applies the final cast and store",
+        }
+    )
+    arguments: tuple[str, ...] = (
+        "work_iterator",
+        "tensor_bindings",
+        "scratch",
+        "epilogue",
+    )
+
+
+@dataclass(frozen=True)
 class _TypedExpression:
     code: str
     dtype: str
@@ -78,6 +115,7 @@ class UnsupportedMapBody(ValueError):
 
 
 UnsupportedReductionBody = UnsupportedMapBody
+UnsupportedContractionBody = UnsupportedMapBody
 
 
 _CUTLASS_TYPES = {
@@ -250,6 +288,94 @@ def run(
     )
 
 
+def emit_contraction_body(
+    program: TensorProgram, config: BodyConfig
+) -> GeneratedContractionBody:
+    _validate_contraction_body(program, config)
+
+    threads = config.participants.participating_threads
+    reduction_chunk = config.tiles.reduction_tile[0]
+    output_domains = [
+        domain
+        for domain in program.iteration_domains
+        if domain.axis not in program.reduction_axes
+    ]
+    reduction_domain = next(
+        domain
+        for domain in program.iteration_domains
+        if domain.axis in program.reduction_axes
+    )
+    axis_coordinates = {
+        domain.axis: f"o{index}" for index, domain in enumerate(output_domains)
+    }
+    reduction_coordinate = f"r{program.reduction_axes.index(reduction_domain.axis)}"
+    load_indices = {load.id: index for index, load in enumerate(program.loads)}
+
+    accumulator = _emit_expression(
+        program.init, load_indices, axis_coordinates, program.loads
+    )
+    combine = _emit_expression(
+        program.combine,
+        load_indices,
+        {**axis_coordinates, reduction_domain.axis: reduction_coordinate},
+        program.loads,
+    )
+    assert program.post is not None
+    post = _emit_expression(
+        program.post, load_indices, axis_coordinates, program.loads
+    )
+
+    coordinate_lines = _coordinate_lines(program.store.shape)
+    output_coordinates = ", ".join(
+        axis_coordinates[domain.axis] for domain in output_domains
+    )
+    binding_type = ", ".join(
+        "cute.Tensor" for _ in range(len(program.loads) + 1)
+    )
+    accumulator_type = _cutlass_type(program.accumulator_dtype or "")
+    output_cutlass_type = _cutlass_type(program.store.dtype)
+    source = f'''import cutlass
+import cutlass.cute as cute
+
+
+@cute.kernel
+def run(
+    work_iterator: cute.Tensor,
+    tensor_bindings: tuple[{binding_type}],
+    scratch,
+    epilogue,
+):
+    block, _, _ = cute.arch.block_idx()
+    thread, _, _ = cute.arch.thread_idx()
+    workers, _, _ = cute.arch.grid_dim()
+    output = tensor_bindings[{len(program.loads)}]
+    output_count = cute.size(output)
+    for tile in cutlass.range(block, cute.size(work_iterator), workers):
+        linear_index = work_iterator[tile] + thread
+        if linear_index < output_count:
+{coordinate_lines}            accumulator = {accumulator_type}({accumulator.code})
+            for reduction_base in cutlass.range(0, {reduction_domain.size}, {reduction_chunk}):
+                for reduction_offset in cutlass.range({reduction_chunk}):
+                    reduction_index = reduction_base + reduction_offset
+                    if reduction_index < {reduction_domain.size}:
+                        {reduction_coordinate} = reduction_index
+                        accumulator = {combine.code}
+            stored_value = {output_cutlass_type}({post.code})
+            output[{output_coordinates}] = stored_value
+'''
+    element_count = 1
+    for size in program.store.shape:
+        element_count *= size
+    tile_count = (element_count + threads - 1) // threads
+    return GeneratedContractionBody(
+        source=source,
+        threads_per_cta=threads,
+        output_tile_elements=threads,
+        reduction_chunk=reduction_chunk,
+        tile_count=tile_count,
+    )
+
+
 def _validate_map_body(program: TensorProgram, config: BodyConfig) -> None:
     validate_body_config(config)
     if program.family not in {"elementwise", "copy"}:
@@ -331,6 +457,76 @@ def _validate_reduction_body(program: TensorProgram, config: BodyConfig) -> None
         raise UnsupportedReductionBody("reduction body requires a nonempty reduction extent")
     if any(stride < 0 for stride in program.store.strides):
         raise UnsupportedReductionBody("negative output strides are not supported")
+
+    _validate_body_layouts(program, config, output_domains)
+
+
+def _validate_contraction_body(program: TensorProgram, config: BodyConfig) -> None:
+    validate_body_config(config)
+    if program.family != "contraction":
+        raise UnsupportedContractionBody(
+            f"contraction body generator supports contraction, not {program.family}"
+        )
+    if config.semantic.operation_family != program.family:
+        raise UnsupportedContractionBody(
+            "body config and tensor program families differ"
+        )
+    if len(program.reduction_axes) != 1:
+        raise UnsupportedContractionBody(
+            "contraction body generator supports one reduction axis"
+        )
+    if program.init is None or program.post is None or program.accumulator_dtype is None:
+        raise UnsupportedContractionBody(
+            "contraction body requires complete reduction state"
+        )
+    if not _is_add_reduction(program.combine):
+        raise UnsupportedContractionBody(
+            "contraction body generator supports ordered multiply-accumulate"
+        )
+    if program.init.dtype != program.accumulator_dtype:
+        raise UnsupportedContractionBody(
+            "initializer and accumulator dtypes differ"
+        )
+
+    threads = config.participants.participating_threads
+    if threads <= 0:
+        raise UnsupportedContractionBody("contraction body requires participating threads")
+    output_domains = tuple(
+        domain
+        for domain in program.iteration_domains
+        if domain.axis not in program.reduction_axes
+    )
+    if config.tiles.cta_shape != (threads,) + (1,) * (len(output_domains) - 1):
+        raise UnsupportedContractionBody(
+            "contraction body requires a flat one-output-element-per-thread tile"
+        )
+    if config.tiles.work_partition != "one output element per thread":
+        raise UnsupportedContractionBody(
+            "contraction body requires one output element per thread"
+        )
+    if (
+        not config.tiles.reduction_tile
+        or config.tiles.reduction_tile[0] <= 0
+        or len(config.tiles.reduction_tile) != 1
+    ):
+        raise UnsupportedContractionBody(
+            "contraction body requires one positive reduction chunk"
+        )
+    if config.scratch.owner != "none" or config.scratch.size_bytes != 0:
+        raise UnsupportedContractionBody("contraction body does not use scratch")
+
+    if not program.store.shape or any(size <= 0 for size in program.store.shape):
+        raise UnsupportedContractionBody(
+            "contraction body requires a nonempty positive-rank output"
+        )
+    if any(domain.size <= 0 for domain in program.iteration_domains):
+        raise UnsupportedContractionBody(
+            "contraction body requires a nonempty positive reduction extent"
+        )
+    if any(stride < 0 for stride in program.store.strides):
+        raise UnsupportedContractionBody(
+            "negative output strides are not supported"
+        )
 
     _validate_body_layouts(program, config, output_domains)
 

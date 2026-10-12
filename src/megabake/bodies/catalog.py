@@ -214,11 +214,13 @@ def _generic_config(region: Region, program: Any) -> BodyConfig:
     )
     barriers = ("cta_reduction",) if is_reduction else ()
     cta_shape = (128,) + (1,) * max(len(output_axes) - 1, 0)
-    if is_contraction:
-        cta_shape = (32, 32)
     completion = CompletionContract(
         outputs_ready="assigned output elements are stored when run returns",
-        output_tiles_ready="each assigned element is ready after its predicated store",
+        output_tiles_ready=(
+            "each assigned element is ready after its predicated store"
+            if not is_contraction
+            else "each assigned element is ready after its reduction and store"
+        ),
         async_work_complete="run performs no asynchronous work",
         scratch_reusable="scratch is reusable after the CTA reduction barrier"
         if is_reduction
@@ -235,6 +237,21 @@ def _generic_config(region: Region, program: Any) -> BodyConfig:
             measurements={},
         )
         if is_reduction
+        else ResourceEvidence(
+            measured=False,
+            source=(
+                "generated CuTe indexed contraction; accumulation and epilogue "
+                "structure informed by Mirage forloop-accum and threadblock epilogues"
+            ),
+            revision="mirage@f9eb70c254acefc9f3667b2a973d0dcf25471fce; task-08",
+            resources={
+                "threads": threads,
+                "shared_bytes": scratch_bytes,
+                "reduction_chunk": 32,
+            },
+            measurements={},
+        )
+        if is_contraction
         else ResourceEvidence(
             measured=False,
             source="generated baseline contract",
@@ -265,11 +282,11 @@ def _generic_config(region: Region, program: Any) -> BodyConfig:
                 "one output row per CTA"
                 if is_reduction
                 else "one output element per thread"
-            )
-            if not is_contraction
-            else "disjoint output tiles per CTA",
+            ),
             mma_family=None,
-            reduction_tile=(threads,) if is_reduction else (),
+            reduction_tile=(threads,) if is_reduction else (32,)
+            if is_contraction
+            else (),
         ),
         participants=ParticipantContract(
             participating_threads=threads,

@@ -9,6 +9,8 @@ from megabake.bodies import (
     InvalidBodyConfig,
     SelectionPolicy,
     TargetFacts,
+    UnsupportedContractionBody,
+    emit_contraction_body,
     emit_map_body,
     emit_reduction_body,
     validate_body_config,
@@ -198,6 +200,115 @@ def test_emit_reduction_body_preserves_norm_epsilon_and_cast():
 
     assert "cutlass.Float32(1e-06)" in body.source
     assert ".to(cutlass.BFloat16)" in body.source
+
+
+def test_emit_contraction_body_generates_gemm_source():
+    class Model(torch.nn.Module):
+        def forward(self, source, weight):
+            return source @ weight.T
+
+    source = torch.randn(5, 70, dtype=torch.bfloat16)
+    weight = torch.randn(33, 70, dtype=torch.bfloat16)
+    region = next(
+        region
+        for region in _regions(Model(), source, weight)
+        if region.semantic_facts.get("family") == "view_plus_gemm"
+    )
+    config = get_candidates(region, _target(), _policy()).configurations[0]
+
+    body = emit_contraction_body(region.tensor_programs[0], config)
+
+    assert config.provider == "generic"
+    assert config.tiles.cta_shape == (128, 1)
+    assert config.tiles.work_partition == "one output element per thread"
+    assert config.tiles.reduction_tile == (32,)
+    assert config.evidence.revision.startswith(
+        "mirage@f9eb70c254acefc9f3667b2a973d0dcf25471fce"
+    )
+    assert body.function_name == "run"
+    assert body.threads_per_cta == 128
+    assert body.output_tile_elements == 128
+    assert body.reduction_chunk == 32
+    assert body.tile_count == 2
+    assert body.phases == ("output_tile", "bounded_reduction", "epilogue")
+    assert "if linear_index < output_count" in body.source
+    assert "cutlass.range(0, 70, 32)" in body.source
+    assert "if reduction_index < 70" in body.source
+    assert "accumulator = cutlass.Float32(cutlass.Float32(0))" in body.source
+    assert "tensor_bindings[0][o0, r0]" in body.source
+    assert "tensor_bindings[1][r0, o1]" in body.source
+    assert (
+        "stored_value = cutlass.BFloat16((accumulator).to(cutlass.BFloat16))"
+        in body.source
+    )
+    assert "output[o0, o1] = stored_value" in body.source
+
+
+def test_emit_contraction_body_preserves_bias_partial_dimensions_and_cast():
+    class Model(torch.nn.Module):
+        def forward(self, source, weight, bias):
+            return torch.nn.functional.linear(source, weight, bias)
+
+    source = torch.randn(7, 67, dtype=torch.bfloat16)
+    weight = torch.randn(29, 67, dtype=torch.bfloat16)
+    bias = torch.randn(29, dtype=torch.bfloat16)
+    region = next(
+        region
+        for region in _regions(Model(), source, weight, bias)
+        if region.tensor_programs
+        and region.tensor_programs[0].family == "contraction"
+    )
+    program = region.tensor_programs[0]
+    config = get_candidates(region, _target(), _policy()).configurations[0]
+    program = replace(
+        program,
+        post=Cast(program.post.operand, "torch.float32", "none"),
+        store=replace(program.store, dtype="torch.float32"),
+    )
+    output_layout = replace(
+        config.layouts.outputs[program.store.value_id], dtype="torch.float32"
+    )
+    config = replace(
+        config,
+        layouts=replace(
+            config.layouts, outputs={program.store.value_id: output_layout}
+        ),
+    )
+
+    body = emit_contraction_body(program, config)
+
+    assert body.tile_count == 2
+    assert "cutlass.range(0, 67, 32)" in body.source
+    assert "if reduction_index < 67" in body.source
+    assert "tensor_bindings[2][o1]" in body.source
+    assert ".to(cutlass.Float32)" in body.source
+
+
+def test_emit_contraction_body_rejects_incompatible_schedule():
+    class Model(torch.nn.Module):
+        def forward(self, source, weight):
+            return source @ weight.T
+
+    source = torch.randn(5, 70, dtype=torch.bfloat16)
+    weight = torch.randn(33, 70, dtype=torch.bfloat16)
+    region = next(
+        region
+        for region in _regions(Model(), source, weight)
+        if region.semantic_facts.get("family") == "view_plus_gemm"
+    )
+    config = get_candidates(region, _target(), _policy()).configurations[0]
+
+    bad_tiles = replace(config.tiles, cta_shape=(32, 32))
+    with pytest.raises(UnsupportedContractionBody, match="flat"):
+        emit_contraction_body(
+            region.tensor_programs[0], replace(config, tiles=bad_tiles)
+        )
+
+    bad_reduction = replace(config.tiles, reduction_tile=())
+    with pytest.raises(UnsupportedContractionBody, match="reduction chunk"):
+        emit_contraction_body(
+            region.tensor_programs[0], replace(config, tiles=bad_reduction)
+        )
 
 
 def test_catalog_describes_g0_range_and_rejects_incompatible_target():

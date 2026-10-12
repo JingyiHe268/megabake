@@ -196,10 +196,10 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Implement in:** `generic.py`, with `emit_contraction_body(program, config)`.
 
-- [ ] Assign disjoint output coordinates to threads. Accumulate indexed products over bounded reduction loops.
-- [ ] Generate operand predicates, explicit accumulator types, and final casts from the tensor program.
-- [ ] Support the initial GEMM fixture, including supported strides and tails.
-- [ ] Keep this provider available when no tuned configuration supports an otherwise known contraction.
+- [x] Assign disjoint output coordinates to threads. Accumulate indexed products over bounded reduction loops.
+- [x] Generate operand predicates, explicit accumulator types, and final casts from the tensor program.
+- [x] Support the initial GEMM fixture, including supported strides and tails.
+- [x] Keep this provider available when no tuned configuration supports an otherwise known contraction.
 
 **Output:** a correct baseline contraction provider that uses the common device interface.
 
