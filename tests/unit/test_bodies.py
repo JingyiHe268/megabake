@@ -16,6 +16,7 @@ from megabake.bodies import (
     validate_body_config,
 )
 from megabake.bodies.catalog import get_candidates
+from megabake.bodies.gemm import gemm_candidates
 from megabake.frontend import prepare_fx_graph
 from megabake.graph import import_fx
 from megabake.graph import Region
@@ -341,6 +342,32 @@ def test_catalog_describes_g0_range_and_rejects_incompatible_target():
     assert [config.provider for config in rejected.configurations] == ["generic"]
     assert rejected.rejections[-1].provider == "g0_range"
     assert "shared memory" in rejected.rejections[-1].reason
+
+
+def test_gemm_candidates_reject_incompatible_operand_layout():
+    class Model(torch.nn.Module):
+        def forward(self, source, weight):
+            return source @ weight.T
+
+    source = torch.randn(4, 576, dtype=torch.bfloat16)
+    weight = torch.randn(1536, 576, dtype=torch.bfloat16)
+    region = next(
+        region
+        for region in _regions(Model(), source, weight)
+        if region.semantic_facts.get("family") == "view_plus_gemm"
+    )
+    program = region.tensor_programs[0]
+
+    assert len(gemm_candidates(region, _target()).configurations) == 1
+
+    left = replace(program.loads[0], strides=(1, 576))
+    incompatible = replace(program, loads=(left, program.loads[1]))
+    bad_region = replace(region, tensor_programs=(incompatible,))
+    result = gemm_candidates(bad_region, _target())
+
+    assert result.configurations == ()
+    assert result.rejections[0].provider == "g0_range"
+    assert "K-major" in result.rejections[0].reason
 
 
 def test_region_without_tensor_program_is_rejected():

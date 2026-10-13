@@ -1,4 +1,5 @@
 from .catalog import get_candidates
+from .gemm import gemm_candidates
 from .generic import (
     GeneratedContractionBody,
     GeneratedMapBody,
@@ -23,6 +24,7 @@ from .interface import (
 
 __all__ = [
     "get_candidates",
+    "gemm_candidates",
     "GeneratedContractionBody",
     "GeneratedMapBody",
     "GeneratedReductionBody",

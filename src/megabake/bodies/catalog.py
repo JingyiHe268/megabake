@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from ..graph import Region
+from .gemm import G0RangeBodyProvider
 from .interface import (
     BodyConfig,
     CandidateSet,
@@ -85,92 +86,6 @@ class GenericBodyProvider:
             )
 
         return CandidateSet((_generic_config(region, program),), ())
-
-
-class G0RangeBodyProvider:
-    provider_name = "g0_range"
-
-    def get_candidates(
-        self, region: Region, target: TargetFacts, policy: SelectionPolicy
-    ) -> CandidateSet:
-        if not policy.allow_tuned:
-            return CandidateSet(
-                (), (ProviderRejection(self.provider_name, "tuned providers disabled"),)
-            )
-        if not region.tensor_programs or len(region.tensor_programs) != 1:
-            return CandidateSet(
-                (),
-                (
-                    ProviderRejection(
-                        self.provider_name, "region has no single tensor program"
-                    ),
-                ),
-            )
-        program = region.tensor_programs[0]
-        if program.family != "contraction":
-            return CandidateSet(
-                (),
-                (
-                    ProviderRejection(
-                        self.provider_name, "provider supports contraction only"
-                    ),
-                ),
-            )
-        if len(program.loads) != 2:
-            return CandidateSet(
-                (),
-                (
-                    ProviderRejection(
-                        self.provider_name, "bias epilogues are not supported"
-                    ),
-                ),
-            )
-        if (
-            any(load.dtype != "torch.bfloat16" for load in program.loads)
-            or program.store.dtype != "torch.bfloat16"
-        ):
-            return CandidateSet(
-                (),
-                (ProviderRejection(self.provider_name, "provider supports BF16 only"),),
-            )
-
-        rows, columns = program.store.shape
-        reduction_size = next(
-            domain.size
-            for domain in program.iteration_domains
-            if domain.axis in program.reduction_axes
-        )
-        if columns % 64 or reduction_size % 64:
-            return CandidateSet(
-                (),
-                (
-                    ProviderRejection(
-                        self.provider_name, "N and K must be multiples of 64"
-                    ),
-                ),
-            )
-        if target.architecture != "sm90a":
-            return CandidateSet(
-                (),
-                (ProviderRejection(self.provider_name, "provider targets sm90a only"),),
-            )
-        if not target.supports_tma or not target.supports_wgmma:
-            return CandidateSet(
-                (),
-                (
-                    ProviderRejection(
-                        self.provider_name, "target lacks TMA or WGMMA"
-                    ),
-                ),
-            )
-
-        small_m = rows <= 64
-        tile = (64, 64) if small_m else (64, 128)
-        stages = 13 if small_m else 8
-        shared_bytes = 230_400 if small_m else 214_016
-        return CandidateSet(
-            (_g0_config(region, program, tile, stages, shared_bytes),), ()
-        )
 
 
 PROVIDERS: tuple[GenericBodyProvider | G0RangeBodyProvider, ...] = (
@@ -320,114 +235,6 @@ def _generic_config(region: Region, program: Any) -> BodyConfig:
         ),
         completion=completion,
         evidence=evidence,
-    )
-
-
-def _g0_config(
-    region: Region,
-    program: Any,
-    tile: tuple[int, int],
-    stages: int,
-    shared_bytes: int,
-) -> BodyConfig:
-    return BodyConfig(
-        provider=G0RangeBodyProvider.provider_name,
-        name=f"g0_range_{tile[0]}x{tile[1]}",
-        semantic=SemanticContract(
-            operation_family="view_plus_gemm"
-            if region.semantic_facts.get("family") == "view_plus_gemm"
-            else "contraction",
-            source_op_ids=region.source_op_ids,
-            numerical_policy="source_semantics",
-            expression_hooks=(),
-            expression_hook_restrictions=(
-                "none; the provider implements the complete source contraction",
-            ),
-            access_effects=_access_effects(program),
-            access_restrictions=(
-                "BF16 2-D operands",
-                "N and K are multiples of 64; partial M tiles are predicated",
-            ),
-        ),
-        layouts=_layouts(program, alignment_bytes=16),
-        tiles=TileContract(
-            cta_shape=tile,
-            cluster_shape=(1, 1),
-            work_partition="persistent range of output tiles",
-            mma_family="wgmma",
-            reduction_tile=(64,),
-        ),
-        participants=ParticipantContract(
-            participating_threads=256,
-            waiting_threads=256,
-            warp_roles=(
-                "tma_load",
-                "tma_load",
-                "tma_load",
-                "tma_load",
-                "wgmma_epilogue",
-                "wgmma_epilogue",
-                "wgmma_epilogue",
-                "wgmma_epilogue",
-            ),
-            registers_per_thread=232,
-        ),
-        pipeline=PipelineContract(
-            stage_count=stages,
-            barriers=("producer_tail", "wgmma_wait_group_0", "tma_store_producer_tail"),
-            async_operations=("tma_load", "wgmma", "tma_store"),
-            shared_memory_layouts={
-                "A": "staged TMA input tile",
-                "B": "staged TMA input tile",
-                "C": "staged epilogue tile",
-            },
-            drain_rule=(
-                "run returns only after input producer tail, WGMMA wait, "
-                "and TMA store producer tail"
-            ),
-        ),
-        scratch=ScratchContract(
-            owner="cta",
-            size_bytes=shared_bytes,
-            alignment_bytes=128,
-            initial_state="CTA-local staged buffers and pipeline barriers",
-            reuse_rule="scratch is reusable only after all pipeline tails complete",
-        ),
-        completion=CompletionContract(
-            outputs_ready=(
-                "all assigned range outputs are globally stored when run returns; "
-                "another CTA may read them after the enclosing kernel grid-synchronizes"
-            ),
-            output_tiles_ready=(
-                "tile stores are submitted in the persistent range; cross-CTA "
-                "visibility requires the enclosing grid synchronization"
-            ),
-            async_work_complete="all TMA and WGMMA work is drained before return",
-            scratch_reusable="scratch is reusable when run returns",
-            register_fragments=(
-                "WGMMA accumulators feed the body epilogue without conversion"
-            ),
-            warp_roles_on_return="drained and unchanged for the next body",
-        ),
-        evidence=ResourceEvidence(
-            measured=True,
-            source="experiments/g0_2026_10_09/resident_range_probe.py",
-            revision="0b55a2f691d69981583568fd9eb69687b1f0de8a",
-            resources={
-                "threads": 256,
-                "registers_per_thread": 232,
-                "shared_storage_bytes": shared_bytes,
-                "active_blocks_per_sm": 1,
-            },
-            measurements={
-                "selected_tile": tile,
-                "pipeline_stages": stages,
-                "max_admitted_workers": 60,
-                "resident_range_gpu_us_by_m": {4: 4.057, 256: 4.339}
-                if tile == (64, 64)
-                else {256: 5.602, 1024: 9.458},
-            },
-        ),
     )
 
 

@@ -211,11 +211,11 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Implement in:** `gemm.py`, with `gemm_candidates(region, target)` and a device range entry.
 
-- [ ] Adapt [resident_range_probe.py](experiments/g0_2026_10_09/resident_range_probe.py) into a maintained provider.
-- [ ] Preserve the source license and revision. Replace experimental source rewriting with an explicit implementation before treating it as production code.
-- [ ] Retain the pipeline across a range of tiles. Bind scratch, descriptors, and current tensor addresses through the common interface.
-- [ ] Return coupled instruction, tile, layout, stage, and warp configurations. Check shape, stride, alignment, and tail restrictions.
-- [ ] Keep the original CuTe launch as a comparison. Reuse existing changed-binding and tile-count fixtures.
+- [x] Adapt [resident_range_probe.py](experiments/g0_2026_10_09/resident_range_probe.py) into a maintained provider.
+- [x] Preserve the source license and revision. Replace experimental source rewriting with an explicit implementation before treating it as production code.
+- [x] Retain the pipeline across a range of tiles. Bind scratch, descriptors, and current tensor addresses through the common interface.
+- [x] Return coupled instruction, tile, layout, stage, and warp configurations. Check shape, stride, alignment, and tail restrictions.
+- [x] Keep the original CuTe launch as a comparison. Reuse existing changed-binding and tile-count fixtures.
 
 **Output:** a tuned GEMM provider alongside the baseline contraction provider.
 
