@@ -22,13 +22,17 @@ The compilation path is:
 2. Receive live FX after the pinned AOT/Inductor preparation and post-grad passes, before lowering and scheduling.
 3. Recover tensor semantics and source-backed regions with explicit layouts, dependencies, effects, and numerical requirements.
 4. Generate baseline CuTe bodies from supported tensor primitives and add valid tuned candidates. Plan their execution in one persistent kernel where legal.
-5. Check the complete invocation and measure it against an equivalent `torch.compile` baseline.
+5. Check the complete invocation and measure it against the strongest equivalent baseline: `torch.compile` and CUDA Graph replay.
 
 The design preserves the tuned pipeline inside each body. It starts with ordered phases and refines tile readiness where measurements justify it. The frontend accepts `--mode prefill|decode` and records that policy; mode-specific decode scheduling is not implemented yet. On an SM90 CUDA device, `make_backend()` compiles supported post-grad graphs into one cooperative CuTe workload kernel and rebinds current inputs and parameters on every call. Pass `compile_kernel=False` to retain the FX reference path for CPU-only capture work.
 
 A complete-model request includes all requested outputs and state updates. Named region matchers enable optimizations. Unfamiliar combinations of supported primitives use generic lowering. Unknown operator semantics or an illegal composition produce an explicit failure. The proposed `fallback=inductor` option can delegate the whole invocation and report that result as external fallback. Strict megakernel compilation defaults to `fallback=error`. These paths are not implemented yet.
 
 The first frontend-to-kernel compiler path is implemented for supported SM90 workloads. Complete-model coverage, stateful decode, fallback delegation, and measured optimization work remain open in later TASKS.md steps.
+
+## Current performance
+
+The compiled MLP is correct and runs as one kernel, but it is 12.5x to 15x slower than CUDA Graph replay. [PERFORMANCE_REPORT.md](PERFORMANCE_REPORT.md) gives the measurements, causes, and ordered fixes. Most of that gap is per-call Python binding, not the kernel and not compilation. `benchmarks/isolated.py` times each mode's final kernels with launch and device execution only; use it to judge the kernel.
 
 ## Current frontend
 

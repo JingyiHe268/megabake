@@ -407,14 +407,14 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 - [x] Measure equivalent eager, CUDA Graph reference, `torch.compile`, and MegaBake invocations. Match inputs, outputs, precision, and GPU resources.
 - [x] Record warm GPU and complete host-call latency. Separate compilation, setup, packing, and first-call costs.
 - [x] Attribute losses to body throughput, traffic, padding, restart, conversions, waits, or occupancy.
-- [x] Change the component responsible for the dominant loss. Repeat the complete MLP comparison.
+- [ ] Change the component responsible for the dominant loss. Repeat the complete MLP comparison. The scheduler change addressed the phase barrier; the dominant loss is per-call binding work and the unfused elementwise chain, which remain.
 - [x] Record G1 pass or hold for each regime. Require an improvement beyond measurement noise before broad model expansion.
 
 **Output:** a useful compiler-generated MLP on each passing target, with its remaining failures visible.
 
 **Check:** include the resource cost of the full body mixture. Complete G0 integration and G1 evidence before proceeding to wider coverage.
 
-**Evidence:** [Task 20 measured scheduler evidence](artifacts/task20/README.md). Automatic phase/event selection improves the measured complete MLP by 15.4% at batch 4 and 25.2% at batch 256, but G1 remains on hold because CUDA Graph replay is still substantially faster.
+**Evidence:** [Task 20 measured scheduler evidence](artifacts/task20/README.md). Automatic phase/event selection improves the measured complete MLP by 15.4% at batch 4 and 25.2% at batch 256, but G1 remains on hold because CUDA Graph replay is still 12.5x and 15.0x faster. [PERFORMANCE_REPORT.md](PERFORMANCE_REPORT.md) gives the attribution, the ordered fixes, and the gates to pass before step 21. Judge the kernel by launch plus compute from `benchmarks/isolated.py`; complete-call time also contains per-call binding work.
 
 ## 21. Cache compiled plans while retaining live bindings
 
@@ -736,4 +736,4 @@ The entries below retain the completed work from the previous checklist. Their t
 - [x] Test repeated calls, changed bindings, delayed producers, and the largest valid worker grid.
 - [x] Run the relevant memory/race checks. Save the launch trace and complete resource report.
 
-**Deliverable:** complete for the G0 probe. The cooperative M=4 kernel passes repeated changed bindings and delayed producers at the compiled 60-worker limit; repeated M=4→1 and M=4→256 rebinds also pass. A 61-worker request is rejected before the workload launch. The trace contains one kernel, and memcheck, racecheck, and synccheck are clean at 60 workers. CUDA Graph replay is outside this probe; tested calls supply their barrier epochs on the host. See [g0_status.json](experiments/g0_2026_10_09/g0_status.json), [mixed_body.json](experiments/g0_2026_10_09/mixed_body.json), [mixed_shape_m1.json](experiments/g0_2026_10_09/mixed_shape_m1.json), [mixed_shape_m256.json](experiments/g0_2026_10_09/mixed_shape_m256.json), and [mixed_kernel_trace.json](experiments/g0_2026_10_09/mixed_kernel_trace.json).
+**Deliverable:** complete for correctness only. The probe's timing loop kept its deliberate producer delay, so the recorded 1,326 us GPU latency in `mixed_body.json` is not a composition cost and no clean one was measured. The cooperative M=4 kernel passes repeated changed bindings and delayed producers at the compiled 60-worker limit; repeated M=4→1 and M=4→256 rebinds also pass. A 61-worker request is rejected before the workload launch. The trace contains one kernel, and memcheck, racecheck, and synccheck are clean at 60 workers. CUDA Graph replay is outside this probe; tested calls supply their barrier epochs on the host. See [g0_status.json](experiments/g0_2026_10_09/g0_status.json), [mixed_body.json](experiments/g0_2026_10_09/mixed_body.json), [mixed_shape_m1.json](experiments/g0_2026_10_09/mixed_shape_m1.json), [mixed_shape_m256.json](experiments/g0_2026_10_09/mixed_shape_m256.json), and [mixed_kernel_trace.json](experiments/g0_2026_10_09/mixed_kernel_trace.json).

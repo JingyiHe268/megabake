@@ -2,6 +2,10 @@
 
 This report consolidates the final Task 20 measurement in `artifacts/task20/mlp.json`, the Chrome traces under `artifacts/task20/traces/`, and the historical Task 16–19 artifacts. All times are microseconds unless explicitly marked otherwise.
 
+> **Correction, 2026-10-13.** A later profile of the warm call showed that the time outside the kernel is Python binding work, not launch or scheduling. The real launch takes about 30 us. The affected statements below are corrected in place. See [PERFORMANCE_REPORT.md](PERFORMANCE_REPORT.md) for the attribution and next steps.
+>
+> No warm number in this document includes compilation. The complete-call numbers do include per-call Python binding, so they describe the wrapper as well as the kernel. Judge the kernel by launch plus compute only, measured with `benchmarks/isolated.py`.
+
 ## 1. Executive summary
 
 MegaBake now compiles the complete gated MLP to **one cooperative CUDA kernel**, preserves the eager output within a measured relative L2 error of **0.0**, and automatically chooses between the phase and region-event schedules by measured synchronized complete-call latency.
@@ -21,7 +25,7 @@ The event schedule is a real improvement, but G1 remains **hold** because the co
 The short version of the attribution is:
 
 1. **Phase restart/barrier loss was real.** Region events remove full-grid barriers between locally independent regions and improve candidate medians by 15.4% and 25.2%.
-2. **Batch 4 is still dominated by launch and scheduling overhead.** The MegaBake kernel executes for only 20.48 us, but the synchronized complete call is 367.67 us.
+2. **Batch 4 is still dominated by per-call Python binding work.** The MegaBake kernel executes for only 20.48 us, but the synchronized complete call is 367.67 us.
 3. **Batch 256 is dominated by mixed-body throughput after overlap.** The one kernel executes for 176.92 us, while CUDA Graph's five kernels sum to only 15.74 us.
 4. **CUDA Graph is currently the strongest baseline** because replay removes almost all host launch cost and preserves the well-tuned native GEMM/elementwise mixture.
 5. **MegaBake cannot yet be captured in a CUDA Graph.** The phase and event runtimes explicitly reject stream capture for cooperative launches, so there is no “MegaBake + CUDA Graph” measurement in this report.
@@ -332,7 +336,7 @@ This matters for interpretation: MegaBake currently fuses scheduling into one ke
 | Host complete call minus event span | 13.91 |
 | Profiler launch-to-last-kernel minus kernel duration | 281.62 |
 
-The kernel itself is only 20.48 us. The dominant loss is the approximately 333 us device-visible launch/scheduling gap, not arithmetic.
+The kernel itself is only 20.48 us. The dominant loss is approximately 333 us of host-side argument binding before the launch is enqueued, not arithmetic. The CUDA event span includes it because the start event completes at once.
 
 ### Batch 256
 
@@ -348,7 +352,7 @@ The kernel itself is only 20.48 us. The dominant loss is the approximately 333 u
 
 Batch 256 has both problems:
 
-- roughly 338 us of device-visible launch/scheduling gap;
+- roughly 338 us of host-side argument binding before the launch;
 - a much larger 176.92 us mixed-body kernel, compared with 15.74 us of total CUDA Graph kernel work.
 
 Therefore, reducing launch overhead alone would not make batch 256 competitive. The full body mixture also needs better throughput, likely through paired GEMM epilogues, fewer elementwise phases, and better work partitioning.
@@ -417,8 +421,8 @@ The event scheduler is a real, measured improvement and is now the default autom
 
 Highest-value next steps:
 
-1. Reduce the roughly 333–338 us device-visible launch/scheduling gap.
+1. Remove the roughly 333–338 us of per-call binding work: build launch arguments once and reuse them.
 2. Implement a paired gate/up GEMM body with a multi-store epilogue, while preserving secondary outputs.
 3. Fuse the activation/multiply chain into the GEMM epilogue instead of executing separate generic elementwise phases.
-4. Revisit cooperative-launch admission and argument preparation; the profiled warm Python/CuTe binding path is not free.
+4. Fuse the SiLU chain into one elementwise region before attempting the paired GEMM; it is the cheaper change and removes most of the batch-256 kernel time.
 5. Only after those changes, consider CUDA Graph capture support for the MegaBake cooperative launch.

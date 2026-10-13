@@ -41,7 +41,7 @@ A successful megakernel has these properties:
 2. It preserves guards, bindings, aliases, mutations, and the numerical contract.
 3. Its recurring GPU work executes in one workload kernel. This includes required reset, conversion, and state-update work.
 4. Every dependency has a visibility rule and a forward-progress argument.
-5. It reports complete-call correctness and latency against an equivalent `torch.compile` baseline.
+5. It reports complete-call correctness and latency against the strongest equivalent baseline. This includes `torch.compile` and CUDA Graph replay of the native kernels.
 
 A correct kernel and a faster kernel are separate results. A correct generic megakernel establishes support for its declared workload even if it is slow. It does not pass a performance gate. An eager call, library launch, or CUDA Graph is a useful reference, but does not count as an emitted megakernel.
 
@@ -70,6 +70,8 @@ potential savings = launches removed + traffic avoided + useful overlap
 new costs         = body slowdown + dispatch + synchronization
                   + layout conversion + spills + lost parallelism
 ```
+
+Measured on the first MLP, CUDA Graph replay leaves about 0.25 µs between kernels. Against that baseline, `launches removed` is worth about 1 µs for five kernels. The savings must come from avoided traffic and useful overlap. See [PERFORMANCE_REPORT.md](PERFORMANCE_REPORT.md).
 
 Accept the performance claim only after measuring the complete workload. These terms interact, so adding isolated timings is a diagnostic, not a proof.
 
