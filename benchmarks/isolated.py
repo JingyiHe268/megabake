@@ -13,6 +13,7 @@ argument binding, dispatcher work, or output allocation is inside a sample.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import shutil
 import statistics
@@ -125,17 +126,40 @@ def _relative_l2(actual, expected):
     ).item()
 
 
+def _graph_ordered_inputs(compiled, inputs):
+    """Reorder the caller's arguments to match the AOT-decomposed graph.
+
+    AOT functionalization lifts parameters ahead of runtime inputs, so the
+    graph placeholder order can differ from the original function signature.
+    The placeholder names carry an ``l_`` prefix and a trailing ``_``; strip
+    both and match against the workload's parameter names.
+    """
+    parameters = inspect.signature(mlp).parameters
+    positions = {name: index for index, name in enumerate(parameters)}
+    ordered = [None] * len(inputs)
+    for graph_name, tensor in zip(compiled.input_order, inputs, strict=False):
+        name = graph_name.removeprefix("l_").removesuffix("_")
+        if name not in positions:
+            raise ValueError(
+                f"cannot map graph input {graph_name!r} to a parameter of mlp"
+            )
+        ordered[positions[name]] = tensor
+    if any(tensor is None for tensor in ordered):
+        raise ValueError("could not map every graph input to an mlp parameter")
+    return tuple(ordered)
+
+
 class _MegaBakeKernel:
     """The compiled megakernel with every binding fixed ahead of the launch."""
 
-    def __init__(self, kernel, inputs):
+    def __init__(self, kernel, inputs, graph_inputs):
         self.kernel = kernel
         self.executor = kernel.compiled
         plan = kernel.plan
         self.state = _RuntimeState.create(
             plan,
             kernel.generated,
-            _input_tensors(plan.graph, inputs),
+            _input_tensors(plan.graph, graph_inputs),
             ready=kernel.ready,
             work_iterators=kernel.work_iterators,
         )
@@ -263,7 +287,8 @@ def main() -> None:
             batch_size,
         )
 
-        megabake = _MegaBakeKernel(compiled, inputs)
+        graph_inputs = _graph_ordered_inputs(compiled, inputs)
+        megabake = _MegaBakeKernel(compiled, inputs, graph_inputs)
         if megabake.fast_path:
             modes["megabake_fast"] = _measure(
                 "megabake_fast",

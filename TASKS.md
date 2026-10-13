@@ -42,6 +42,7 @@ PyTorch model and live inputs
 | 15 | A small FX graph executing as one generated CuTe kernel |
 | 16 | A complete MLP compiled through that path |
 | 20 | Measured MLP performance after targeted optimization |
+| 20A | The SiLU chain fused into one elementwise region |
 | 23 | Generic graph coverage and explicit external fallback |
 | 29 | Complete transformer blocks in prefill and stateful decode |
 | 31 | The complete captured model executing as one workload kernel |
@@ -415,6 +416,24 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 **Check:** include the resource cost of the full body mixture. Complete G0 integration and G1 evidence before proceeding to wider coverage.
 
 **Evidence:** [Task 20 measured scheduler evidence](artifacts/task20/README.md). Automatic phase/event selection improves the measured complete MLP by 15.4% at batch 4 and 25.2% at batch 256, but G1 remains on hold because CUDA Graph replay is still 12.5x and 15.0x faster. [PERFORMANCE_REPORT.md](PERFORMANCE_REPORT.md) gives the attribution, the ordered fixes, and the gates to pass before step 21. Judge the kernel by launch plus compute from `benchmarks/isolated.py`; complete-call time also contains per-call binding work.
+
+## 20A. Fuse the SiLU chain into one elementwise region
+
+**Input:** the compiler-generated MLP and the measured plan showing seven separate elementwise phases.
+
+**Implement in:** `regions.py` and `bodies/generic.py`.
+
+- [x] Relax the scalar-chain layout check so intermediates may change dtype when shape and stride ownership are preserved. This unblocks the five-operation SiLU suffix (`neg → exp → add → div → convert`) and the following multiply when both feed a single tail.
+- [x] Topologically sort selected bodies after dependencies are computed so storage-order checks do not create false cycles for fused regions. The fused region previously appeared before its producers in the selection list; `_storage_order_dependencies` then added a conflicting WRITE_AFTER_READ edge.
+- [ ] Extend the chain walker to accept DAG-shaped scalar regions where every user of an intermediate value is also inside the region. The SiLU FP32 cast currently has two users (`neg` and `div`); both are internal but the linear walker stops at the first multi-use producer.
+- [ ] Compose the resulting expression DAG in `_compose_scalar_chain`, preserving every source cast and rounding point.
+- [ ] Measure the complete MLP and record the phase count and kernel time. Compare against the unfused baseline and Inductor.
+
+**Output:** a fused scalar region that replaces the seven separate elementwise phases with one, then zero once the multiply joins the GEMM epilogue.
+
+**Check:** the fused region preserves exact output, every source cast, and every secondary output. The selected plan contains one elementwise region or none. Kernel time at batch 256 drops by roughly the measured elementwise overhead (about 160 µs unfused).
+
+**Evidence:** the unfused baseline is in [PERFORMANCE_REPORT.md](PERFORMANCE_REPORT.md) section 5. After the first two items, the MLP plan drops from 10 phases to 5 (`mm`, `convert`, `mm_1`, `mul:fused`, `mm_2`) with exact output. Isolated kernel time at batch 1 improves from 38.4 to 14.1 µs (parity with eager CUDA Graph at 14.2 µs); batch 256 improves from 176.9 to 62.5 µs. The remaining elementwise gap is the separate BF16→FP32 cast and the scalar body.
 
 ## 21. Cache compiled plans while retaining live bindings
 

@@ -191,7 +191,7 @@ def _scalar_fusion_candidate(tail: Op, graph: ComputeGraph) -> RegionCandidate |
     ):
         rejections.append("an intermediate value has an external use")
     if not all(
-        _same_tensor_layout(operation.results[0], tail.results[0], graph)
+        _same_chain_layout(operation.results[0], tail.results[0], graph)
         for operation in chain
     ):
         rejections.append("source ownership or broadcast contract changes")
@@ -527,6 +527,12 @@ def _same_tensor_layout(left_id: str, right_id: str, graph: ComputeGraph) -> boo
     left = graph.values[left_id]
     right = graph.values[right_id]
     return left.shape == right.shape and left.dtype == right.dtype and left.strides == right.strides
+
+
+def _same_chain_layout(left_id: str, right_id: str, graph: ComputeGraph) -> bool:
+    left = graph.values[left_id]
+    right = graph.values[right_id]
+    return left.shape == right.shape and left.strides == right.strides
 
 
 def _same_strides(left_id: str, right_id: str, graph: ComputeGraph) -> bool:

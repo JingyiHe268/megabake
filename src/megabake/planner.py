@@ -148,6 +148,7 @@ def _enumerate_body_selections(
             )
             for selected in selected_bodies
         ]
+        selected_bodies = _topological_sort_bodies(selected_bodies)
         conversions = _insert_layout_conversions(tuple(selected_bodies))
         selections.append(
             BodySelectionPlan(
@@ -194,6 +195,35 @@ def _selected_body(
         participants=body.participants,
         resources=_resource_requirements(body),
     )
+
+
+def _topological_sort_bodies(
+    bodies: Sequence[SelectedBody],
+) -> tuple[SelectedBody, ...]:
+    positions = {body.region_id: position for position, body in enumerate(bodies)}
+    consumers = {region_id: [] for region_id in positions}
+    indegree = {region_id: 0 for region_id in positions}
+    for body in bodies:
+        for producer_id in body.dependencies:
+            if producer_id in consumers:
+                consumers[producer_id].append(body.region_id)
+                indegree[body.region_id] += 1
+    import heapq
+
+    ready = [positions[region_id] for region_id, degree in indegree.items() if degree == 0]
+    heapq.heapify(ready)
+    order: list[int] = []
+    while ready:
+        position = heapq.heappop(ready)
+        region_id = bodies[position].region_id
+        order.append(position)
+        for consumer in consumers[region_id]:
+            indegree[consumer] -= 1
+            if indegree[consumer] == 0:
+                heapq.heappush(ready, positions[consumer])
+    if len(order) != len(bodies):
+        raise ValueError("body selection contains a dependency cycle")
+    return tuple(bodies[position] for position in order)
 
 
 def _body_order(config: BodyConfig) -> tuple[int, int, int]:
