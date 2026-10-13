@@ -59,6 +59,23 @@ class Region:
     live_outputs: tuple[str, ...]
     semantic_facts: dict[str, Any] = field(default_factory=dict)
     tensor_programs: tuple[Any, ...] = ()
+    fusion_candidates: tuple[Any, ...] = ()
+
+
+@dataclass(frozen=True)
+class RegionCandidate:
+    id: str
+    source_op_ids: tuple[str, ...]
+    external_inputs: tuple[str, ...]
+    live_outputs: tuple[str, ...]
+    tensor_program: Any | None
+    semantic_facts: dict[str, Any] = field(default_factory=dict)
+    cost_bytes: int = 0
+    rejections: tuple[str, ...] = ()
+
+    @property
+    def executable(self) -> bool:
+        return self.tensor_program is not None and not self.rejections
 
 
 @dataclass(frozen=True)

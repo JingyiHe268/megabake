@@ -70,6 +70,45 @@ def test_select_bodies_prefers_measured_gemm_and_maps_complete_reduction_domain(
     assert right.element_offset((0, 0)) == 0
 
 
+def test_select_bodies_uses_legal_vector_chain_and_preserves_fallback():
+    class Model(torch.nn.Module):
+        def forward(self, value):
+            return (torch.relu(value) + 1) * 2
+
+    class ExternalIntermediate(torch.nn.Module):
+        def forward(self, value):
+            activated = torch.relu(value)
+            return activated, activated + 1
+
+    torch.manual_seed(71)
+    value = torch.randn(2, 3)
+    selection = select_bodies(_graph(Model(), value), _target())
+
+    assert [selected.region_id for selected in selection.selections] == [
+        "region:mul:fused"
+    ]
+    selected = selection.selections[0]
+    assert selected.source_op_ids == ("op:relu", "op:add", "op:mul")
+    assert selected.inputs == ("value:arg0_1",)
+    assert selected.outputs == ("value:mul",)
+    assert selected.body.provider == "generic"
+    assert selected.body.name == "generic_elementwise_fused"
+    assert selected.body.semantic.expression_hooks == ("vector_chain",)
+    assert selected.body.evidence.measurements["fusion_saved_bytes"] == 2 * 3 * 4 * 4
+    assert selection.report.complete
+
+    fallback = select_bodies(_graph(ExternalIntermediate(), value), _target())
+    assert [selected.region_id for selected in fallback.selections] == [
+        "region:relu",
+        "region:add",
+    ]
+    assert any(
+        rejection.region_id == "region:add:fused"
+        and rejection.reason == "an intermediate value has an external use"
+        for rejection in fallback.report.rejections
+    )
+
+
 def test_make_tile_maps_clips_partial_output_tiles():
     class Model(torch.nn.Module):
         def forward(self, source, weight):

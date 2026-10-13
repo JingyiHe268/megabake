@@ -347,15 +347,17 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Implement in:** `regions.py` and the relevant generators.
 
-- [ ] Adapt Mirage's local fusion-chain rules as the starting point. Check every external use and source cast.
-- [ ] Generate compatible scalar work in GEMM epilogues or vector chains. Preserve exact thread/fragment ownership.
-- [ ] Add an exact gated-MLP matcher. Return fused candidates while retaining the baseline region expansion.
-- [ ] Compare separate gate/up work with valid combined or paired candidates. Count packing and conversion costs.
-- [ ] Keep secondary outputs and effects explicit. Reject fusion when its resource or numerical contract fails.
+- [x] Adapt Mirage's local fusion-chain rules as the starting point. Check every external use and source cast.
+- [x] Generate compatible scalar work in GEMM epilogues or vector chains. Preserve exact thread/fragment ownership.
+- [x] Add an exact gated-MLP matcher. Return fused candidates while retaining the baseline region expansion.
+- [x] Compare separate gate/up work with valid combined or paired candidates. Count packing and conversion costs.
+- [x] Keep secondary outputs and effects explicit. Reject fusion when its resource or numerical contract fails.
 
 **Output:** optimized candidates for the same source graph.
 
 **Check:** compare fused and unfused executions, including an extra intermediate output. Measure the full MLP after each accepted change.
+
+**Evidence:** [MegaBake complete-call report](artifacts/task17/mlp.json), [native/Inductor baseline](artifacts/task17/mlp_baseline.json), and [recurring-work traces](artifacts/task17/traces). The report records exact correctness and one-CUDA-kernel execution at batch sizes 4 and 256.
 
 ## 18. Search a small coupled configuration space
 

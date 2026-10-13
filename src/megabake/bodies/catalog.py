@@ -120,6 +120,7 @@ def _generic_config(region: Region, program: Any) -> BodyConfig:
     )
     is_reduction = program.family == "reduction"
     is_contraction = program.family == "contraction"
+    is_fused_chain = region.semantic_facts.get("fusion") == "vector_chain"
     threads = 128
     warp_count = threads // 32
     scratch_bytes = (
@@ -172,17 +173,21 @@ def _generic_config(region: Region, program: Any) -> BodyConfig:
             source="generated baseline contract",
             revision="task-05",
             resources={"threads": threads, "shared_bytes": scratch_bytes},
-            measurements={},
+            measurements=(
+                {"fusion_saved_bytes": region.semantic_facts["fusion_saved_bytes"]}
+                if is_fused_chain
+                else {}
+            ),
         )
     )
     return BodyConfig(
         provider=GenericBodyProvider.provider_name,
-        name=f"generic_{program.family}",
+        name=f"generic_{program.family}_fused" if is_fused_chain else f"generic_{program.family}",
         semantic=SemanticContract(
             operation_family=program.family,
             source_op_ids=region.source_op_ids,
             numerical_policy="source_semantics",
-            expression_hooks=(),
+            expression_hooks=("vector_chain",) if is_fused_chain else (),
             expression_hook_restrictions=(
                 "none; expressions are generated from the tensor program",
             ),

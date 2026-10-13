@@ -69,6 +69,92 @@ def test_form_regions_preserves_intermediate_graph_output_and_operation_coverage
     )
 
 
+def test_form_regions_builds_executable_vector_chain_candidate_and_keeps_baselines():
+    class Model(torch.nn.Module):
+        def forward(self, value):
+            return (torch.relu(value) + 1) * 2
+
+    torch.manual_seed(59)
+    value = torch.randn(2, 3)
+    graph = form_regions(_import(Model(), value))
+
+    assert len(graph.regions) == len(graph.ops)
+    candidate = graph.regions[-1].fusion_candidates[0]
+    assert candidate.id == "region:mul:fused"
+    assert candidate.source_op_ids == ("op:relu", "op:add", "op:mul")
+    assert candidate.external_inputs == ("value:arg0_1",)
+    assert candidate.live_outputs == ("value:mul",)
+    assert candidate.executable
+    assert candidate.cost_bytes == 2 * 3 * 4 * 4
+    assert candidate.tensor_program.loads[0].value_id == "value:arg0_1"
+    assert candidate.semantic_facts["source_casts"] == "preserved"
+
+
+def test_form_regions_rejects_vector_chain_when_intermediate_is_external():
+    class Model(torch.nn.Module):
+        def forward(self, value):
+            activated = torch.relu(value)
+            return activated, activated + 1
+
+    torch.manual_seed(61)
+    value = torch.randn(2, 3)
+    graph = form_regions(_import(Model(), value))
+
+    candidate = graph.regions[-1].fusion_candidates[0]
+    assert not candidate.executable
+    assert candidate.rejections == ("an intermediate value has an external use",)
+    assert len(graph.regions) == len(graph.ops)
+
+
+def test_form_regions_matches_gated_mlp_and_counts_candidate_costs():
+    class Model(torch.nn.Module):
+        def forward(self, source, gate_weight, up_weight):
+            gate = torch.nn.functional.linear(source, gate_weight)
+            up = torch.nn.functional.linear(source, up_weight)
+            activated = torch.nn.functional.silu(gate)
+            return activated * up, gate, activated
+
+    torch.manual_seed(67)
+    source = torch.randn(4, 8, dtype=torch.bfloat16)
+    gate_weight = torch.randn(6, 8, dtype=torch.bfloat16)
+    up_weight = torch.randn(6, 8, dtype=torch.bfloat16)
+    graph = form_regions(_import(Model(), source, gate_weight, up_weight))
+
+    candidate = next(
+        candidate
+        for region in graph.regions
+        for candidate in region.fusion_candidates
+        if candidate.semantic_facts["family"] == "gated_mlp"
+    )
+    facts = candidate.semantic_facts
+    assert candidate.source_op_ids == (
+        "op:mm",
+        "op:mm_1",
+        "op:convert_element_type_4",
+        "op:neg",
+        "op:exp",
+        "op:add",
+        "op:div",
+        "op:convert_element_type_5",
+        "op:mul",
+    )
+    assert facts["gate_contraction"] == "op:mm"
+    assert facts["up_contraction"] == "op:mm_1"
+    assert facts["activation"] == "op:convert_element_type_5"
+    assert set(facts["secondary_outputs"]) == {
+        "value:mul",
+        "value:mm",
+        "value:convert_element_type_5",
+    }
+    assert facts["separate_work_bytes"] == 1056
+    assert facts["paired_work_bytes"] == 144
+    assert facts["packing_cost_bytes"] == 4 * 6 * 2
+    assert facts["conversion_cost_bytes"] == 0
+    assert facts["scalar_fusion_saved_bytes"] == 960
+    assert not candidate.executable
+    assert "paired GEMM provider is not implemented" in candidate.rejections
+
+
 def test_form_regions_matches_view_plus_gemm_and_preserves_alias_index_map():
     class Model(torch.nn.Module):
         def forward(self, x, weight, bias):

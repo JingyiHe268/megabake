@@ -8,7 +8,7 @@ from typing import Any
 
 from .bodies.catalog import get_candidates
 from .bodies.interface import BodyConfig, SelectionPolicy, TargetFacts
-from .graph import ComputeGraph
+from .graph import ComputeGraph, Region
 from .lowering import TensorProgram
 from .plan import (
     BodySelectionPlan,
@@ -35,8 +35,64 @@ def select_bodies(
     selections: list[SelectedBody] = []
     rejections: list[RejectionRecord] = []
     unsupported: list[UnsupportedRegion] = []
+    covered_operations: set[str] = set()
 
     for region in graph.regions:
+        for candidate in region.fusion_candidates:
+            if not candidate.executable:
+                rejections.append(
+                    RejectionRecord(
+                        candidate.id,
+                        "fusion",
+                        "; ".join(candidate.rejections) or "candidate has no tensor program",
+                    )
+                )
+                continue
+            assert candidate.tensor_program is not None
+            candidate_region = Region(
+                id=candidate.id,
+                source_op_ids=candidate.source_op_ids,
+                external_inputs=candidate.external_inputs,
+                live_outputs=candidate.live_outputs,
+                semantic_facts={
+                    **region.semantic_facts,
+                    **candidate.semantic_facts,
+                    "fusion_saved_bytes": candidate.cost_bytes,
+                },
+                tensor_programs=(candidate.tensor_program,),
+            )
+            candidates = get_candidates(candidate_region, target, selected_policy)
+            rejections.extend(
+                RejectionRecord(candidate.id, rejection.provider, rejection.reason)
+                for rejection in candidates.rejections
+            )
+            if not candidates.configurations:
+                rejections.append(
+                    RejectionRecord(
+                        candidate.id, "fusion", "no valid fused provider candidate"
+                    )
+                )
+                continue
+            body = _choose_body(candidates.configurations)
+            program = candidate.tensor_program
+            selections.append(
+                SelectedBody(
+                    region_id=candidate.id,
+                    source_op_ids=candidate.source_op_ids,
+                    body=body,
+                    program=program,
+                    inputs=tuple(load.value_id for load in program.loads),
+                    outputs=(program.store.value_id,),
+                    dependencies=(),
+                    participants=body.participants,
+                    resources=_resource_requirements(body),
+                )
+            )
+            covered_operations.update(candidate.source_op_ids)
+
+    for region in graph.regions:
+        if covered_operations.intersection(region.source_op_ids):
+            continue
         if not region.tensor_programs:
             unsupported.append(UnsupportedRegion(region.id, "region has no tensor program"))
             continue
@@ -77,9 +133,9 @@ def select_bodies(
         )
 
     region_ids_by_operation = {
-        operation_id: region.id
-        for region in graph.regions
-        for operation_id in region.source_op_ids
+        operation_id: selection.region_id
+        for selection in selections
+        for operation_id in selection.source_op_ids
     }
     selections = [
         replace(
@@ -116,10 +172,14 @@ def _choose_body(configurations: Sequence[BodyConfig]) -> BodyConfig:
 
 
 def _body_cost(config: BodyConfig) -> tuple[int, int]:
-    return (
+    base_cost = (
         config.participants.participating_threads
         * config.participants.registers_per_thread
-        + config.scratch.size_bytes,
+        + config.scratch.size_bytes
+    )
+    saved_bytes = config.evidence.measurements.get("fusion_saved_bytes", 0)
+    return (
+        max(0, base_cost - saved_bytes) if isinstance(saved_bytes, int) else base_cost,
         -len(config.evidence.measurements),
     )
 
