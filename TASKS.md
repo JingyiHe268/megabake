@@ -243,12 +243,12 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Implement in:** `schedule.py`, with `derive_dependencies(selection)` and `make_phase_schedule(selection, dependencies)`.
 
-- [ ] Add producer-to-consumer dependencies for every required value. Include all input tiles needed by each reduction.
-- [ ] Add write-after-read and write-after-write ordering for state or reused source storage.
-- [ ] For irregular accesses, use a conservative domain when exact analysis is unavailable.
-- [ ] Topologically order the work. Start with one body region per phase and a grid barrier at each required boundary.
-- [ ] Assign tile ranges to workers. Keep workers without tiles in the barrier protocol.
-- [ ] Retain arbitrary prerequisite sets in the plan. Keep operation names independent of runtime event encoding.
+- [x] Add producer-to-consumer dependencies for every required value. Include all input tiles needed by each reduction.
+- [x] Add write-after-read and write-after-write ordering for state or reused source storage.
+- [x] For irregular accesses, use a conservative domain when exact analysis is unavailable.
+- [x] Topologically order the work. Start with one body region per phase and a grid barrier at each required boundary.
+- [x] Assign tile ranges to workers. Keep workers without tiles in the barrier protocol.
+- [x] Retain arbitrary prerequisite sets in the plan. Keep operation names independent of runtime event encoding.
 
 **Output:** an executable phase order with explicit work assignments and dependencies.
 

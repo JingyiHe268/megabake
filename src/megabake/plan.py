@@ -218,6 +218,8 @@ class BodySelectionPlan:
     rejections: tuple[RejectionRecord, ...]
     unsupported_regions: tuple[UnsupportedRegion, ...]
     conversions: tuple[ConversionBody, ...]
+    graph: ComputeGraph | None = None
+    target: TargetFacts | None = None
 
     @property
     def report(self) -> PlanReport:
@@ -320,6 +322,8 @@ def select_bodies(
         tuple(rejections),
         tuple(unsupported),
         conversions,
+        graph,
+        target,
     )
 
 

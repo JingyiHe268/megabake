@@ -15,6 +15,12 @@ from .lowering import (
 from .regions import dump_region_graph, form_regions
 from .bodies import BodyConfig, SelectionPolicy, TargetFacts, get_candidates
 from .plan import BodySelectionPlan, make_tile_maps, select_bodies
+from .schedule import (
+    DependencyPlan,
+    derive_dependencies,
+    make_phase_schedule,
+    simulate_phase_schedule,
+)
 
 __all__ = [
     "CaptureCache",
@@ -35,6 +41,10 @@ __all__ = [
     "BodySelectionPlan",
     "make_tile_maps",
     "select_bodies",
+    "DependencyPlan",
+    "derive_dependencies",
+    "make_phase_schedule",
+    "simulate_phase_schedule",
     "make_backend",
     "prepare_fx_graph",
 ]
