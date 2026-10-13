@@ -33,13 +33,14 @@ def test_task17_executes_vector_chain_and_preserves_external_output_fallback(tmp
         torch.testing.assert_close(fused(source), (torch.relu(source) + 1) * 2)
 
     fused_compiled = fused_backend.megabake_last_compiled
-    assert [
-        selection.region_id
-        for selection in fused_compiled.plan.selection.selections
-    ] == ["region:mul:fused"]
-    assert fused_compiled.plan.selection.selections[0].body.name == (
-        "generic_elementwise_fused"
+    search = fused_compiled.search
+    assert search is not None
+    assert any(
+        "region:mul:fused" in candidate.description
+        and candidate.status == "measured"
+        for candidate in search.candidates
     )
+    assert search.selected is fused_compiled.plan
 
     fallback_backend = make_backend(dump_dir=tmp_path / "fallback")
     fallback = torch.compile(

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from importlib.util import module_from_spec, spec_from_file_location
+from statistics import median
 import threading
 import sys
+import time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 import uuid
@@ -22,12 +24,10 @@ from .diagnostics import CompilerDiagnostic, CompilerError
 from .frontend import CaptureContext, PreparedFX
 from .graph import ComputeGraph, import_fx
 from .lowering import canonicalize_semantics
-from .memory import assign_storage, verify_plan
-from .plan import KernelPlan
-from .planner import select_bodies
+from .memory import verify_plan
+from .plan import KernelPlan, PlanMeasurement, SearchBudget, search_plans
 from .regions import form_regions
 from .runtime import RuntimeAdmission, admit_runtime, execute_phase_plan
-from .schedule import derive_dependencies, make_phase_schedule
 
 
 class UnsupportedCompiler(RuntimeError):
@@ -57,6 +57,7 @@ class CompiledKernel:
     parameter_tensors: Mapping[str, torch.Tensor]
     ready: torch.Tensor
     work_iterators: Mapping[str, torch.Tensor]
+    search: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -74,12 +75,45 @@ def compile_post_grad(
     target: TargetFacts | None = None,
     policy: SelectionPolicy | None = None,
     output_dir: Path | str | None = None,
+    search_budget: SearchBudget | int | None = None,
 ) -> Callable[..., Any]:
-    compiled = compile_plan(
-        _plan_post_grad(prepared, target, policy),
-        prepared.example_inputs,
-        output_dir=output_dir,
-    )
+    graph, selected_target = _post_grad_graph(prepared, target)
+    if isinstance(search_budget, int):
+        if search_budget < 1:
+            raise ValueError("search budget must be positive")
+        budget = SearchBudget(max_plans=search_budget)
+    else:
+        budget = search_budget or SearchBudget()
+    if budget.evaluator is None:
+        with torch.no_grad():
+            reference = prepared.forward(*prepared.example_inputs)
+        budget = SearchBudget(
+            budget.max_plans,
+            budget.max_compilations,
+            budget.timing_samples,
+            budget.deadline_seconds,
+            _make_plan_evaluator(prepared, reference, output_dir),
+        )
+
+    result = search_plans(graph, selected_target, policy, budget)
+    if result.selected is None or result.selected_compiled is None:
+        reasons = "; ".join(
+            f"{candidate.description}: {candidate.reason or candidate.status}"
+            for candidate in result.candidates
+            if candidate.status != "measured"
+        )
+        raise CompilerError(
+            CompilerDiagnostic(
+                "plan-search",
+                reasons or "no measured complete plan was produced",
+                _source_op_ids_from_graph(graph),
+                tuple(region.id for region in graph.regions),
+                "one correct measured complete plan",
+            )
+        )
+    compiled = result.selected_compiled
+    result = replace(result, selected=compiled.plan)
+    compiled = replace(compiled, search=result)
     return bind_callable(compiled, prepared.context)
 
 
@@ -355,40 +389,13 @@ def bind_callable(
     return forward
 
 
-def _plan_post_grad(
-    prepared: PreparedFX,
-    target: TargetFacts | None,
-    policy: SelectionPolicy | None,
-) -> KernelPlan:
+def _post_grad_graph(
+    prepared: PreparedFX, target: TargetFacts | None
+) -> tuple[ComputeGraph, TargetFacts]:
     try:
         selected_target = target or _target_facts(_common_cuda_device(prepared.example_inputs))
         graph = import_fx(prepared.graph, prepared.context)
-        regions = form_regions(canonicalize_semantics(graph))
-        selection = select_bodies(regions, selected_target, policy)
-        if not selection.report.complete:
-            unsupported = selection.unsupported_regions
-            region_ids = tuple(record.region_id for record in unsupported)
-            source_op_ids = tuple(
-                operation_id
-                for region in regions
-                if region.id in region_ids
-                for operation_id in region.source_op_ids
-            )
-            reasons = "; ".join(record.reason for record in unsupported)
-            raise CompilerError(
-                CompilerDiagnostic(
-                    "body-selection",
-                    reasons or "graph has unsupported regions",
-                    source_op_ids,
-                    region_ids,
-                    "complete device coverage",
-                )
-            )
-        dependencies = derive_dependencies(selection)
-        schedule = make_phase_schedule(selection, dependencies)
-        plan = assign_storage(schedule)
-        verify_plan(plan)
-        return plan
+        return form_regions(canonicalize_semantics(graph)), selected_target
     except CompilerError:
         raise
     except Exception as error:
@@ -399,6 +406,102 @@ def _plan_post_grad(
                 requirement="valid complete KernelPlan",
             )
         ) from error
+
+
+def _make_plan_evaluator(
+    prepared: PreparedFX,
+    reference: Any,
+    output_dir: Path | str | None,
+):
+    def evaluate(plan: KernelPlan, budget: SearchBudget) -> PlanMeasurement:
+        try:
+            compiled = compile_plan(
+                plan, prepared.example_inputs, output_dir=output_dir
+            )
+            executable = bind_callable(compiled, prepared.context)
+            with torch.no_grad():
+                actual = executable(*prepared.example_inputs)
+            relative_error = _output_relative_l2(reference, actual)
+            if relative_error >= 0.01:
+                return PlanMeasurement(
+                    compiled=compiled,
+                    resources=compiled.resources,
+                    correct=False,
+                    error=f"relative L2 error {relative_error:.6g}",
+                )
+            complete_samples, device_samples = _complete_call_samples(
+                executable,
+                prepared.example_inputs,
+                budget.timing_samples,
+            )
+            verification_samples, _ = _complete_call_samples(
+                executable, prepared.example_inputs, 1
+            )
+            return PlanMeasurement(
+                compiled=compiled,
+                resources=compiled.resources,
+                correct=True,
+                complete_call_samples_us=complete_samples,
+                device_event_span_samples_us=device_samples,
+                median_complete_call_us=median(complete_samples),
+                verification_complete_call_us=verification_samples[0],
+            )
+        except Exception as error:
+            return PlanMeasurement(error=f"{type(error).__name__}: {error}")
+
+    return evaluate
+
+
+def _complete_call_samples(
+    function: Callable[..., Any], arguments: Sequence[Any], count: int
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    host_samples: list[float] = []
+    device_samples: list[float] = []
+    with torch.no_grad():
+        for _ in range(count):
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_host = time.perf_counter()
+            start_event.record()
+            function(*arguments)
+            end_event.record()
+            end_event.synchronize()
+            host_samples.append((time.perf_counter() - start_host) * 1_000_000)
+            device_samples.append(start_event.elapsed_time(end_event) * 1_000)
+    return tuple(host_samples), tuple(device_samples)
+
+
+def _output_relative_l2(expected: Any, actual: Any) -> float:
+    expected_values, _ = pytree.tree_flatten(expected)
+    actual_values, _ = pytree.tree_flatten(actual)
+    if len(expected_values) != len(actual_values):
+        return float("inf")
+    numerator = 0.0
+    denominator = 0.0
+    for expected_value, actual_value in zip(expected_values, actual_values, strict=True):
+        if type(expected_value) is not type(actual_value):
+            return float("inf")
+        if not isinstance(expected_value, torch.Tensor):
+            if expected_value != actual_value:
+                return float("inf")
+            continue
+        if (
+            not isinstance(actual_value, torch.Tensor)
+            or expected_value.shape != actual_value.shape
+            or expected_value.dtype != actual_value.dtype
+        ):
+            return float("inf")
+        difference = (expected_value.float() - actual_value.float()).square().sum()
+        denominator_value = expected_value.float().square().sum()
+        numerator += float(difference.item())
+        denominator += float(denominator_value.item())
+    if denominator == 0:
+        return numerator**0.5
+    return (numerator / denominator) ** 0.5
+
+
+def _source_op_ids_from_graph(graph: ComputeGraph) -> tuple[str, ...]:
+    return tuple(graph.ops)
 
 
 def _reject_invalid_plan(plan: KernelPlan) -> None:

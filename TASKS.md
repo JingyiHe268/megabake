@@ -365,16 +365,18 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Implement in:** `plan.py`, with `search_plans(graph, target, policy, budget)`.
 
-- [ ] Adapt applicable Mirage dimension and mapping enumeration rules. Use provider configurations instead of fixed block heuristics.
-- [ ] Enumerate a small set of tiles, stages, layouts, worker counts, and compatible fusion choices.
-- [ ] Prune invalid alignments, unsupported collectives, excessive storage, and insufficient work before compilation.
-- [ ] Compile remaining complete kernels and check actual resources. Run correctness before retaining timings.
-- [ ] Compare complete-call latency and retain raw samples. Select the fastest correct measured plan within the search budget.
-- [ ] Investigate a specific body gap through CuTe, Mirage, DeepGEMM, or FBGEMM source when current candidates remain slow.
+- [x] Adapt applicable Mirage dimension and mapping enumeration rules. Use provider configurations instead of fixed block heuristics.
+- [x] Enumerate a small set of tiles, stages, layouts, worker counts, and compatible fusion choices.
+- [x] Prune invalid alignments, unsupported collectives, excessive storage, and insufficient work before compilation.
+- [x] Compile remaining complete kernels and check actual resources. Run correctness before retaining timings.
+- [x] Compare complete-call latency and retain raw samples. Select the fastest correct measured plan within the search budget.
+- [x] Investigate a specific body gap through CuTe, Mirage, DeepGEMM, or FBGEMM source when current candidates remain slow.
 
 **Output:** a measured plan selection with explicit rejected candidates and reasons.
 
 **Check:** rerun the selected candidate independently. A faster isolated GEMM must not displace a faster complete MLP plan.
+
+**Evidence:** [MegaBake complete-call report](artifacts/task18/mlp.json) and [Task 18 search summary](artifacts/task18/README.md). The report retains raw complete-call samples, verification reruns, resource attributes, selected worker counts, and explicit rejected-candidate reasons.
 
 ## 19. Add tile events if phase waits limit the target
 

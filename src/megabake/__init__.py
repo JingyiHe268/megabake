@@ -14,7 +14,15 @@ from .lowering import (
 )
 from .regions import dump_region_graph, form_regions
 from .bodies import BodyConfig, SelectionPolicy, TargetFacts, get_candidates
-from .plan import BodySelectionPlan, KernelPlan
+from .plan import (
+    BodySelectionPlan,
+    KernelPlan,
+    PlanCandidate,
+    PlanMeasurement,
+    PlanSearchResult,
+    SearchBudget,
+    search_plans,
+)
 from .planner import make_tile_maps, select_bodies
 from .memory import assign_storage, verify_plan
 from .codegen import emit_cute
@@ -67,6 +75,11 @@ __all__ = [
     "admit_runtime",
     "execute_phase_plan",
     "KernelPlan",
+    "PlanCandidate",
+    "PlanMeasurement",
+    "PlanSearchResult",
+    "SearchBudget",
+    "search_plans",
     "DependencyPlan",
     "derive_dependencies",
     "make_phase_schedule",

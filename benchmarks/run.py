@@ -91,6 +91,9 @@ def main() -> None:
             "inductor": event_samples(lambda: inductor(*inputs)),
             "megabake": event_samples(lambda: compiled(*inputs)),
         }
+        search = getattr(backend.megabake_last_compiled, "search", None)
+        if search is not None:
+            record["plan_search"] = search.report()
         functions = {
             "eager": lambda: mlp(*inputs),
             "inductor": lambda: inductor(*inputs),

@@ -4,6 +4,7 @@ from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from bisect import bisect_left, bisect_right
 import heapq
 
 from .bodies.interface import BodyConfig, ParticipantContract, WorkItem
@@ -182,7 +183,10 @@ def derive_dependencies(selection: BodySelectionPlan) -> DependencyPlan:
 
 
 def make_phase_schedule(
-    selection: BodySelectionPlan, dependencies: DependencyPlan
+    selection: BodySelectionPlan,
+    dependencies: DependencyPlan,
+    *,
+    worker_count: int | None = None,
 ) -> PhaseSchedule:
     if not selection.report.complete:
         raise InvalidSchedule("cannot schedule a plan with unsupported regions")
@@ -206,7 +210,13 @@ def make_phase_schedule(
     tile_maps = {
         tile_map.region_id: tile_map for tile_map in make_tile_maps(selection)
     }
-    worker_count = _worker_count(selection, tile_maps)
+    default_worker_count = _worker_count(selection, tile_maps)
+    if worker_count is None:
+        worker_count = default_worker_count
+    elif not 1 <= worker_count <= default_worker_count:
+        raise InvalidSchedule(
+            f"worker count {worker_count} is outside 1..{default_worker_count}"
+        )
     phases: list[ScheduledPhase] = []
 
     for phase_index, region_id in enumerate(order):
@@ -319,6 +329,9 @@ def _tile_dependency(
     producer_map: TileMap,
     consumer_map: TileMap,
 ) -> RegionDependency:
+    producer_output_tiles = tuple(
+        access.output for access in producer_map.accesses
+    )
     consumer_accesses = tuple(
         access
         for access in consumer_map.accesses
@@ -329,9 +342,14 @@ def _tile_dependency(
             f"{consumer_region_id} has no mapped access to {value_id}"
         )
 
-    producer_tiles: set[tuple[int, ...]] = set()
+    producer_origins: set[tuple[int, ...]] = set()
     consumer_tiles: set[tuple[int, ...]] = set()
     exact = True
+    producer_by_first_origin: dict[int, list[Any]] = {}
+    for tile in producer_output_tiles:
+        producer_by_first_origin.setdefault(tile.origin[0], []).append(tile)
+    first_origins = tuple(sorted(producer_by_first_origin))
+    maximum_first_extent = max(tile.shape[0] for tile in producer_output_tiles)
     for access in consumer_accesses:
         input_tile = next(
             input_tile
@@ -339,15 +357,24 @@ def _tile_dependency(
             if input_tile.value_id == value_id
         )
         matched = False
-        for output_tile in (
-            access.output for access in producer_map.accesses
-        ):
+        consumer_begin = input_tile.origin[0]
+        consumer_end = consumer_begin + input_tile.shape[0]
+        lower = bisect_left(
+            first_origins, consumer_begin - maximum_first_extent + 1
+        )
+        upper = bisect_right(first_origins, consumer_end - 1)
+        candidates = (
+            output_tile
+            for first_origin in first_origins[lower:upper]
+            for output_tile in producer_by_first_origin[first_origin]
+        )
+        for output_tile in candidates:
             overlaps, is_exact = _logical_tiles_overlap(output_tile, input_tile)
             exact = exact and is_exact
             if not is_exact:
                 break
             if overlaps:
-                producer_tiles.add(output_tile.origin)
+                producer_origins.add(output_tile.origin)
                 consumer_tiles.add(access.output.origin)
                 matched = True
         if exact and not matched:
@@ -371,7 +398,7 @@ def _tile_dependency(
         consumer_region_id,
         value_id,
         DependencyKind.PRODUCER_TO_CONSUMER,
-        tuple(sorted(producer_tiles)),
+            tuple(sorted(producer_origins)),
         tuple(sorted(consumer_tiles)),
     )
 

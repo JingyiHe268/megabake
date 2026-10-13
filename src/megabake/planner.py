@@ -31,13 +31,43 @@ def select_bodies(
     target: TargetFacts,
     policy: SelectionPolicy | None = None,
 ) -> BodySelectionPlan:
-    selected_policy = policy or SelectionPolicy()
-    selections: list[SelectedBody] = []
+    selections, rejections, unsupported = _enumerate_body_selections(
+        graph, target, policy or SelectionPolicy()
+    )
+    if not selections:
+        return BodySelectionPlan(
+            (),
+            tuple(rejections),
+            tuple(unsupported),
+            (),
+            graph,
+            target,
+        )
+    return selections[0]
+
+
+def enumerate_body_selections(
+    graph: ComputeGraph,
+    target: TargetFacts,
+    policy: SelectionPolicy | None = None,
+) -> tuple[BodySelectionPlan, ...]:
+    return _enumerate_body_selections(
+        graph, target, policy or SelectionPolicy()
+    )[0]
+
+
+def _enumerate_body_selections(
+    graph: ComputeGraph,
+    target: TargetFacts,
+    selected_policy: SelectionPolicy,
+):
+    type Option = tuple[Region, TensorProgram, BodyConfig] | None
+    options_by_region: list[list[Option]] = []
     rejections: list[RejectionRecord] = []
     unsupported: list[UnsupportedRegion] = []
-    covered_operations: set[str] = set()
 
     for region in graph.regions:
+        options: list[Option] = []
         for candidate in region.fusion_candidates:
             if not candidate.executable:
                 rejections.append(
@@ -61,114 +91,117 @@ def select_bodies(
                 },
                 tensor_programs=(candidate.tensor_program,),
             )
-            candidates = get_candidates(candidate_region, target, selected_policy)
-            rejections.extend(
-                RejectionRecord(candidate.id, rejection.provider, rejection.reason)
-                for rejection in candidates.rejections
+            options.extend(
+                _body_options(candidate_region, candidate.tensor_program, target, selected_policy, rejections)
             )
-            if not candidates.configurations:
-                rejections.append(
-                    RejectionRecord(
-                        candidate.id, "fusion", "no valid fused provider candidate"
-                    )
-                )
-                continue
-            body = _choose_body(candidates.configurations)
-            program = candidate.tensor_program
-            selections.append(
-                SelectedBody(
-                    region_id=candidate.id,
-                    source_op_ids=candidate.source_op_ids,
-                    body=body,
-                    program=program,
-                    inputs=tuple(load.value_id for load in program.loads),
-                    outputs=(program.store.value_id,),
-                    dependencies=(),
-                    participants=body.participants,
-                    resources=_resource_requirements(body),
-                )
-            )
-            covered_operations.update(candidate.source_op_ids)
 
-    for region in graph.regions:
-        if covered_operations.intersection(region.source_op_ids):
-            continue
-        if not region.tensor_programs:
-            unsupported.append(UnsupportedRegion(region.id, "region has no tensor program"))
-            continue
         if all(
             isinstance(program, TensorProgram) and program.family == "view"
             for program in region.tensor_programs
         ):
+            options_by_region.append([None])
             continue
-
-        candidates = get_candidates(region, target, selected_policy)
-        rejections.extend(
-            RejectionRecord(region.id, rejection.provider, rejection.reason)
-            for rejection in candidates.rejections
-        )
-        if not candidates.configurations:
-            unsupported.append(
-                UnsupportedRegion(region.id, "no valid provider candidate")
-            )
-            continue
-
-        body = _choose_body(candidates.configurations)
-        program = region.tensor_programs[0]
-        if not isinstance(program, TensorProgram):
-            unsupported.append(UnsupportedRegion(region.id, "tensor program is unknown"))
-            continue
-        selections.append(
-            SelectedBody(
-                region_id=region.id,
-                source_op_ids=region.source_op_ids,
-                body=body,
-                program=program,
-                inputs=tuple(load.value_id for load in program.loads),
-                outputs=(program.store.value_id,),
-                dependencies=(),
-                participants=body.participants,
-                resources=_resource_requirements(body),
-            )
-        )
-
-    region_ids_by_operation = {
-        operation_id: selection.region_id
-        for selection in selections
-        for operation_id in selection.source_op_ids
-    }
-    selections = [
-        replace(
-            selection,
-            dependencies=tuple(
-                dict.fromkeys(
-                    region_ids_by_operation[graph.values[value_id].producer]
-                    for value_id in selection.inputs
-                    if graph.values[value_id].producer in region_ids_by_operation
+        if region.tensor_programs:
+            program = region.tensor_programs[0]
+            if isinstance(program, TensorProgram):
+                options.extend(
+                    _body_options(region, program, target, selected_policy, rejections)
                 )
-            ),
+            else:
+                unsupported.append(UnsupportedRegion(region.id, "tensor program is unknown"))
+        else:
+            unsupported.append(UnsupportedRegion(region.id, "region has no tensor program"))
+        if not options:
+            unsupported.append(UnsupportedRegion(region.id, "no valid provider candidate"))
+        options_by_region.append(options)
+
+    selections: list[BodySelectionPlan] = []
+    for combination in product(*options_by_region):
+        chosen = []
+        covered_operations: set[str] = set()
+        for option in sorted(
+            (option for option in combination if option is not None),
+            key=lambda option: -len(option[0].source_op_ids),
+        ):
+            if covered_operations.intersection(option[0].source_op_ids):
+                continue
+            chosen.append(option)
+            covered_operations.update(option[0].source_op_ids)
+        if not chosen:
+            continue
+        selected_bodies = [_selected_body(*option) for option in chosen]
+        region_ids_by_operation = {
+            operation_id: selected.region_id
+            for selected in selected_bodies
+            for operation_id in selected.source_op_ids
+        }
+        selected_bodies = [
+            replace(
+                selected,
+                dependencies=tuple(
+                    dict.fromkeys(
+                        region_ids_by_operation[graph.values[value_id].producer]
+                        for value_id in selected.inputs
+                        if graph.values[value_id].producer in region_ids_by_operation
+                    )
+                ),
+            )
+            for selected in selected_bodies
+        ]
+        conversions = _insert_layout_conversions(tuple(selected_bodies))
+        selections.append(
+            BodySelectionPlan(
+                tuple(selected_bodies),
+                tuple(rejections),
+                (),
+                conversions,
+                graph,
+                target,
+            )
         )
-        for selection in selections
-    ]
-    conversions = _insert_layout_conversions(tuple(selections))
-    return BodySelectionPlan(
-        tuple(selections),
-        tuple(rejections),
-        tuple(unsupported),
-        conversions,
-        graph,
-        target,
+    return tuple(selections), rejections, unsupported
+
+
+def _body_options(
+    region: Region,
+    program: TensorProgram,
+    target: TargetFacts,
+    policy: SelectionPolicy,
+    rejections: list[RejectionRecord],
+) -> list[tuple[Region, TensorProgram, BodyConfig]]:
+    candidates = get_candidates(region, target, policy)
+    rejections.extend(
+        RejectionRecord(region.id, rejection.provider, rejection.reason)
+        for rejection in candidates.rejections
     )
+    return [
+        (region, program, body)
+        for body in sorted(candidates.configurations, key=_body_order)
+    ]
+
+
+def _selected_body(
+    region: Region, program: TensorProgram, body: BodyConfig
+) -> SelectedBody:
+    return SelectedBody(
+        region_id=region.id,
+        source_op_ids=region.source_op_ids,
+        body=body,
+        program=program,
+        inputs=tuple(load.value_id for load in program.loads),
+        outputs=(program.store.value_id,),
+        dependencies=(),
+        participants=body.participants,
+        resources=_resource_requirements(body),
+    )
+
+
+def _body_order(config: BodyConfig) -> tuple[int, int, int]:
+    return (0 if config.evidence.measured else 1, *_body_cost(config))
 
 
 def make_tile_maps(selection: BodySelectionPlan) -> tuple[TileMap, ...]:
     return tuple(_make_tile_map(selected, selection.conversions) for selected in selection.selections)
-
-
-def _choose_body(configurations: Sequence[BodyConfig]) -> BodyConfig:
-    measured = [config for config in configurations if config.evidence.measured]
-    available = measured or list(configurations)
-    return min(available, key=_body_cost)
 
 
 def _body_cost(config: BodyConfig) -> tuple[int, int]:

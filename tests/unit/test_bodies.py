@@ -329,17 +329,25 @@ def test_catalog_describes_g0_range_and_rejects_incompatible_target():
     assert [config.provider for config in result.configurations] == [
         "generic",
         "g0_range",
+        "g0_range",
     ]
     tuned = result.configurations[1]
     assert tuned.name == "g0_range_64x64"
     assert tuned.pipeline.stage_count == 13
+    larger_tile = result.configurations[2]
+    assert larger_tile.name == "g0_range_64x128"
+    assert larger_tile.pipeline.stage_count == 8
     assert tuned.participants.registers_per_thread == 232
     assert tuned.scratch.size_bytes == 230_400
+    assert larger_tile.scratch.size_bytes == 214_016
     assert tuned.evidence.revision == "0b55a2f691d69981583568fd9eb69687b1f0de8a"
     assert "WGMMA accumulators" in tuned.completion.register_fragments
 
     rejected = get_candidates(region, _target(max_shared_memory_per_cta=230_399), _policy())
-    assert [config.provider for config in rejected.configurations] == ["generic"]
+    assert [config.provider for config in rejected.configurations] == [
+        "generic",
+        "g0_range",
+    ]
     assert rejected.rejections[-1].provider == "g0_range"
     assert "shared memory" in rejected.rejections[-1].reason
 
@@ -358,7 +366,7 @@ def test_gemm_candidates_reject_incompatible_operand_layout():
     )
     program = region.tensor_programs[0]
 
-    assert len(gemm_candidates(region, _target()).configurations) == 1
+    assert len(gemm_candidates(region, _target()).configurations) == 2
 
     left = replace(program.loads[0], strides=(1, 576))
     incompatible = replace(program, loads=(left, program.loads[1]))

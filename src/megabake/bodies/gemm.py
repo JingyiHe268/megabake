@@ -1494,12 +1494,12 @@ class G0RangeBodyProvider:
         if not target.supports_tma or not target.supports_wgmma:
             return reject("target lacks TMA or WGMMA")
 
-        small_m = rows <= 64
-        tile = (64, 64) if small_m else (64, 128)
-        stages = 13 if small_m else 8
-        shared_bytes = 230_400 if small_m else 214_016
         return CandidateSet(
-            (_g0_config(region, program, tile, stages, shared_bytes),), ()
+            (
+                _g0_config(region, program, (64, 64), 13, 230_400),
+                _g0_config(region, program, (64, 128), 8, 214_016),
+            ),
+            (),
         )
 
 

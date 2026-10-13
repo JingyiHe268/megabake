@@ -11,7 +11,14 @@ from megabake.bodies import TargetFacts
 from megabake.frontend import prepare_fx_graph
 from megabake.graph import import_fx
 from megabake.lowering import canonicalize_semantics
-from megabake.plan import CuTeLayout, CuTeSwizzle, InvalidTileMap
+from megabake.plan import (
+    CuTeLayout,
+    CuTeSwizzle,
+    InvalidTileMap,
+    PlanMeasurement,
+    SearchBudget,
+    search_plans,
+)
 from megabake.regions import form_regions
 
 
@@ -107,6 +114,133 @@ def test_select_bodies_uses_legal_vector_chain_and_preserves_fallback():
         and rejection.reason == "an intermediate value has an external use"
         for rejection in fallback.report.rejections
     )
+
+
+def test_search_plans_measures_provider_and_worker_candidates():
+    class Model(torch.nn.Module):
+        def forward(self, source, weight):
+            return source @ weight.T
+
+    source = torch.randn(128, 128, dtype=torch.bfloat16)
+    weight = torch.randn(128, 128, dtype=torch.bfloat16)
+    calls = []
+
+    def evaluate(plan, budget):
+        body_name = plan.selection.selections[0].body.name
+        calls.append((body_name, plan.launch.grid_size))
+        median = 30.0 if body_name.startswith("generic") else 20.0 if "64x64" in body_name else 10.0
+        return PlanMeasurement(
+            compiled=object(),
+            resources={"registers_per_thread": 1},
+            correct=True,
+            complete_call_samples_us=(median - 1.0, median, median + 1.0),
+            median_complete_call_us=median,
+            verification_complete_call_us=median,
+        )
+
+    result = search_plans(
+        _graph(Model(), source, weight),
+        _target(),
+        budget=SearchBudget(
+            max_plans=8,
+            max_compilations=8,
+            timing_samples=3,
+            evaluator=evaluate,
+        ),
+    )
+
+    assert len(calls) == 6
+    assert {name for name, _ in calls} == {
+        "generic_contraction",
+        "g0_range_64x64",
+        "g0_range_64x128",
+    }
+    assert all(candidate.plan is not None for candidate in result.candidates)
+    assert len(result.measured_candidates) == 6
+    assert result.selected is not None
+    assert result.selected.selection.selections[0].body.name == "g0_range_64x128"
+    assert result.selected_compiled is not None
+    assert result.report()["selected"].startswith("workers=")
+
+
+def test_search_plans_records_unmeasured_candidates_when_budget_is_exhausted():
+    class Model(torch.nn.Module):
+        def forward(self, source, weight):
+            return source @ weight.T
+
+    source = torch.randn(128, 128, dtype=torch.bfloat16)
+    weight = torch.randn(128, 128, dtype=torch.bfloat16)
+
+    def evaluate(plan, budget):
+        return PlanMeasurement(
+            compiled=object(),
+            correct=True,
+            complete_call_samples_us=(10.0,),
+            median_complete_call_us=10.0,
+        )
+
+    result = search_plans(
+        _graph(Model(), source, weight),
+        _target(),
+        budget=SearchBudget(
+            max_plans=3,
+            max_compilations=1,
+            timing_samples=1,
+            evaluator=evaluate,
+        ),
+    )
+
+    assert len(result.measured_candidates) == 1
+    assert sum(candidate.status == "unmeasured" for candidate in result.candidates) == 2
+    assert result.budget_exhausted
+    assert all(
+        candidate.reason == "compilation budget exhausted"
+        for candidate in result.candidates
+        if candidate.status == "unmeasured"
+    )
+
+
+def test_search_plans_prunes_excessive_mixed_g0_storage_before_compilation():
+    class Model(torch.nn.Module):
+        def forward(self, source, weight, other_weight):
+            return source @ weight.T, source @ other_weight.T
+
+    source = torch.randn(4, 576, dtype=torch.bfloat16)
+    weight = torch.randn(1536, 576, dtype=torch.bfloat16)
+    other_weight = torch.randn_like(weight)
+    evaluations = 0
+
+    def evaluate(plan, budget):
+        nonlocal evaluations
+        evaluations += 1
+        return PlanMeasurement(
+            compiled=object(),
+            correct=True,
+            complete_call_samples_us=(10.0,),
+            median_complete_call_us=10.0,
+        )
+
+    result = search_plans(
+        _graph(Model(), source, weight, other_weight),
+        _target(),
+        budget=SearchBudget(
+            max_plans=4,
+            max_compilations=1,
+            timing_samples=1,
+            evaluator=evaluate,
+        ),
+    )
+
+    rejected = [
+        candidate
+        for candidate in result.candidates
+        if candidate.status == "rejected"
+        and candidate.reason is not None
+        and "projected shared memory 444416" in candidate.reason
+    ]
+    assert rejected
+    assert all(candidate.plan is None for candidate in rejected)
+    assert evaluations == 1
 
 
 def test_make_tile_maps_clips_partial_output_tiles():

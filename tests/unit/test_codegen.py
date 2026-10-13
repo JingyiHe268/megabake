@@ -147,7 +147,7 @@ def test_emit_cute_reuses_g0_scratch_for_duplicate_body_variants(tmp_path):
     ]
     assert generated.source.count("HopperWgmmaGemmPersistentKernel(") == 1
     assert generated.source.count("SmemAllocator().allocate(_g0_body_") == 1
-    assert generated.launch.shared_memory_bytes == 230_400
+    assert generated.launch.shared_memory_bytes == 214_016
 
 
 def test_emit_cute_keeps_g0_variants_with_different_configurations(tmp_path):
@@ -170,6 +170,11 @@ def test_emit_cute_keeps_g0_variants_with_different_configurations(tmp_path):
         make_phase_schedule(selection, derive_dependencies(selection))
     )
     first, second = plan.phases
+    first_body = replace(
+        first.body,
+        tiles=replace(first.body.tiles, cta_shape=(64, 64)),
+        scratch=replace(first.body.scratch, size_bytes=230_400),
+    )
     second_body = replace(
         second.body,
         name=first.body.name,
@@ -178,7 +183,7 @@ def test_emit_cute_keeps_g0_variants_with_different_configurations(tmp_path):
     )
     plan = replace(
         plan,
-        phases=(first, replace(second, body=second_body)),
+        phases=(replace(first, body=first_body), replace(second, body=second_body)),
         selection=replace(
             plan.selection,
             target=replace(
