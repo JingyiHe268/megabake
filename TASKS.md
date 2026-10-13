@@ -277,12 +277,12 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Implement in:** `runtime.py`, using [mixed_body_probe.py](experiments/g0_2026_10_09/mixed_body_probe.py).
 
-- [ ] Extract the cooperative worker loop and its release/acquire barrier into reusable device functions.
-- [ ] Preserve CTA synchronization around arrival and release. Drain required asynchronous work before publishing completion or reusing scratch.
-- [ ] Define per-invocation state ownership and the epoch lifecycle. Prevent stale completion values from satisfying a later phase.
-- [ ] Retain the proved eager-call epoch path initially. Check capacity and overflow before launch, and keep concurrent invocations isolated.
-- [ ] Account for initial state setup and any recurring reset. Required recurring GPU work must stay inside the workload kernel.
-- [ ] Keep CUDA Graph capture unsupported until replay can advance synchronization state correctly. Add an explicit admission check.
+- [x] Extract the cooperative worker loop and its release/acquire barrier into reusable device functions.
+- [x] Preserve CTA synchronization around arrival and release. Drain required asynchronous work before publishing completion or reusing scratch.
+- [x] Define per-invocation state ownership and the epoch lifecycle. Prevent stale completion values from satisfying a later phase.
+- [x] Retain the proved eager-call epoch path initially. Check capacity and overflow before launch, and keep concurrent invocations isolated.
+- [x] Account for initial state setup and any recurring reset. Required recurring GPU work must stay inside the workload kernel.
+- [x] Keep CUDA Graph capture unsupported until replay can advance synchronization state correctly. Add an explicit admission check.
 
 **Output:** a runtime that executes any admitted phase plan using the existing cooperative mechanism.
 

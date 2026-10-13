@@ -16,6 +16,7 @@ from .regions import dump_region_graph, form_regions
 from .bodies import BodyConfig, SelectionPolicy, TargetFacts, get_candidates
 from .plan import BodySelectionPlan, make_tile_maps, select_bodies
 from .memory import assign_storage, verify_plan
+from .runtime import execute_phase_plan, admit_runtime
 from .schedule import (
     DependencyPlan,
     derive_dependencies,
@@ -44,6 +45,8 @@ __all__ = [
     "select_bodies",
     "assign_storage",
     "verify_plan",
+    "admit_runtime",
+    "execute_phase_plan",
     "KernelPlan",
     "DependencyPlan",
     "derive_dependencies",
