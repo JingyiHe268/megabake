@@ -260,12 +260,12 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Implement in:** `memory.py`, with `assign_storage(plan)`, and `KernelPlan` in `plan.py`.
 
-- [ ] Assign a distinct global workspace slice to each materialized intermediate. Retain source aliases in boundary bindings.
-- [ ] Use aligned allocation sizes required by the selected bodies. Adapt Mirage's simple global allocation approach.
-- [ ] Allocate worker scratch for the required body mixture. Specify barrier offsets, descriptors, and phase initialization.
-- [ ] Keep outputs and state bindings separate from temporary storage. Preserve the required boundary layout for each output.
-- [ ] Attach bodies, tiles, dependencies, phases, storage, bindings, and launch requirements to `KernelPlan`.
-- [ ] Implement `verify_plan(plan)` for coverage, ownership, extent, alignment, dependencies, and collective participation.
+- [x] Assign a distinct global workspace slice to each materialized intermediate. Retain source aliases in boundary bindings.
+- [x] Use aligned allocation sizes required by the selected bodies. Adapt Mirage's simple global allocation approach.
+- [x] Allocate worker scratch for the required body mixture. Specify barrier offsets, descriptors, and phase initialization.
+- [x] Keep outputs and state bindings separate from temporary storage. Preserve the required boundary layout for each output.
+- [x] Attach bodies, tiles, dependencies, phases, storage, bindings, and launch requirements to `KernelPlan`.
+- [x] Implement `verify_plan(plan)` for coverage, ownership, extent, alignment, dependencies, and collective participation.
 
 **Output:** a complete `KernelPlan` whose addresses and work are defined, with physical runtime pointers still unbound.
 

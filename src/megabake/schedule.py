@@ -97,6 +97,8 @@ class PhaseSchedule:
     phases: tuple[ScheduledPhase, ...]
     worker_count: int
     prerequisite_sets: tuple[PrerequisiteSet, ...]
+    selection: BodySelectionPlan | None = None
+    dependency_plan: DependencyPlan | None = None
 
     @property
     def region_ids(self) -> tuple[str, ...]:
@@ -211,6 +213,14 @@ def make_phase_schedule(
         selected = selected_by_region[region_id]
         tile_map = tile_maps[region_id]
         work_items = tile_map.work_items
+        barrier = (
+            PhaseBarrier(
+                f"phase:{phase_index}:grid",
+                tuple(range(worker_count)),
+            )
+            if phase_index + 1 < len(order)
+            else None
+        )
         phases.append(
             ScheduledPhase(
                 index=phase_index,
@@ -228,16 +238,17 @@ def make_phase_schedule(
                     for conversion in selection.conversions
                     if conversion.source_region_id == region_id
                 ),
-                barrier=PhaseBarrier(
-                    f"phase:{phase_index}:grid",
-                    tuple(range(worker_count)),
-                )
-                if phase_index + 1 < len(order)
-                else None,
+                barrier=barrier,
             )
         )
 
-    return PhaseSchedule(tuple(phases), worker_count, dependencies.prerequisite_sets)
+    return PhaseSchedule(
+        tuple(phases),
+        worker_count,
+        dependencies.prerequisite_sets,
+        selection,
+        dependencies,
+    )
 
 
 def simulate_phase_schedule(schedule: PhaseSchedule) -> ScheduleSimulation:

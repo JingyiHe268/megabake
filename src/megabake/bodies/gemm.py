@@ -1623,6 +1623,11 @@ def _g0_config(
                 "B": "staged TMA input tile",
                 "C": "staged epilogue tile",
             },
+            descriptors={
+                "A": "TMA input descriptor",
+                "B": "TMA input descriptor",
+                "C": "TMA output descriptor",
+            },
             drain_rule=(
                 "run returns only after input producer tail, WGMMA wait, "
                 "and TMA store producer tail"

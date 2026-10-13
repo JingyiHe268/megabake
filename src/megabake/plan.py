@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from itertools import product
 from math import prod
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from .bodies.catalog import get_candidates
 from .bodies.interface import (
@@ -17,6 +17,10 @@ from .bodies.interface import (
 )
 from .graph import ComputeGraph
 from .lowering import TensorProgram
+
+if TYPE_CHECKING:
+    from .memory import LaunchRequirements, StoragePlan
+    from .schedule import DependencyPlan, ScheduledPhase
 
 
 class InvalidTileMap(ValueError):
@@ -246,6 +250,28 @@ class TileMap:
     @property
     def work_items(self) -> tuple[WorkItem, ...]:
         return tuple(access.work_item for access in self.accesses)
+
+
+@dataclass(frozen=True)
+class KernelPlan:
+    selection: BodySelectionPlan
+    dependencies: DependencyPlan
+    phases: tuple[ScheduledPhase, ...]
+    tile_maps: tuple[TileMap, ...]
+    storage: StoragePlan
+    launch: LaunchRequirements
+
+    @property
+    def bodies(self) -> tuple[BodyConfig, ...]:
+        return tuple(phase.body for phase in self.phases)
+
+    @property
+    def target(self) -> TargetFacts | None:
+        return self.selection.target
+
+    @property
+    def graph(self) -> ComputeGraph | None:
+        return self.selection.graph
 
 
 def select_bodies(

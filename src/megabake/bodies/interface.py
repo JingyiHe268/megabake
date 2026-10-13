@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 
@@ -113,6 +113,7 @@ class PipelineContract:
     async_operations: tuple[str, ...]
     shared_memory_layouts: Mapping[str, str]
     drain_rule: str
+    descriptors: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
