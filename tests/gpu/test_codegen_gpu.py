@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import importlib.util
 import sys
 
@@ -27,6 +28,7 @@ from megabake.frontend import prepare_fx_graph
 from megabake.graph import import_fx
 from megabake.lowering import canonicalize_semantics
 from megabake.regions import form_regions
+from megabake.plan import ConversionBody, CuTeLayout
 
 
 pytestmark = pytest.mark.skipif(
@@ -93,8 +95,9 @@ def _run_generic(generated, source):
             tensors.append(source)
         else:
             tensors.append(
-                torch.empty(
+                torch.empty_strided(
                     argument.layout.shape,
+                    argument.layout.strides,
                     dtype=getattr(torch, argument.layout.dtype.removeprefix("torch.")),
                     device="cuda",
                 )
@@ -136,7 +139,75 @@ def test_generated_cooperative_module_compiles_and_matches_reference(tmp_path):
     torch.testing.assert_close(output.cpu(), torch.relu(source) + torch.relu(source))
 
 
-def test_generated_g0_adapter_matches_existing_g0_executable(tmp_path):
+def test_generated_layout_conversion_compiles_and_matches_reference(tmp_path):
+    class Model(torch.nn.Module):
+        def forward(self, value):
+            return value.relu().sum(dim=-1)
+
+    source = torch.randn(2, 3)
+    plan = _plan(Model(), source, allow_tuned=False)
+    producer = next(
+        selected
+        for selected in plan.selection.selections
+        if selected.program.family == "elementwise"
+    )
+    consumer = next(
+        selected
+        for selected in plan.selection.selections
+        if selected.program.family == "reduction"
+    )
+    value_id = producer.outputs[0]
+    source_layout = CuTeLayout.from_contract(
+        producer.body.layouts.outputs[value_id]
+    )
+    target_layout = replace(source_layout, strides=(1, 3))
+    load = consumer.program.loads[0]
+    consumer_program = replace(
+        consumer.program,
+        loads=(replace(load, strides=target_layout.strides),),
+    )
+    consumer_body = replace(
+        consumer.body,
+        layouts=replace(
+            consumer.body.layouts,
+            inputs={
+                value_id: replace(
+                    consumer.body.layouts.inputs[value_id],
+                    strides=target_layout.strides,
+                )
+            },
+        ),
+    )
+    conversion = ConversionBody(
+        value_id,
+        producer.region_id,
+        consumer.region_id,
+        source_layout,
+        target_layout,
+        24,
+        (producer.region_id,),
+    )
+    converted_selection = replace(
+        plan.selection,
+        selections=(
+            producer,
+            replace(consumer, program=consumer_program, body=consumer_body),
+        ),
+        conversions=(conversion,),
+    )
+    converted_plan = assign_storage(
+        make_phase_schedule(
+            converted_selection, derive_dependencies(converted_selection)
+        )
+    )
+
+    generated = emit_cute(converted_plan, tmp_path)
+    output = _run_generic(generated, source.cuda())
+
+    torch.testing.assert_close(output.cpu(), source.relu().sum(dim=-1))
+
+
+def test_generated_g0_kernel_matches_existing_g0_executable(tmp_path):
     class Model(torch.nn.Module):
         def forward(self, source, weight):
             return source @ weight.T
@@ -146,6 +217,10 @@ def test_generated_g0_adapter_matches_existing_g0_executable(tmp_path):
     plan = _plan(Model(), source, weight)
     generated = emit_cute(plan, tmp_path)
     assert generated.launch.phases[0].provider == "g0_range"
+    assert generated.launch.cooperative
+    assert generated.source.count("@cute.kernel") == 1
+    assert ".prepare(" in generated.source
+    assert ".run(" in generated.source
 
     module = _load(generated)
     gpu_source = source.cuda()
@@ -156,10 +231,25 @@ def test_generated_g0_adapter_matches_existing_g0_executable(tmp_path):
     tensor_a, tensor_b, tensor_c = cute_gemm_tensors(
         gpu_source, gpu_weight, output
     )
-    compiled = cute.compile(
-        module.launch, tensor_a, tensor_b, tensor_c, max_clusters, stream
+    ready = torch.full(
+        (generated.launch.grid_size + 1,),
+        -1,
+        dtype=torch.int32,
+        device="cuda",
     )
-    compiled(tensor_a, tensor_b, tensor_c, stream)
+    views = [
+        _view(ready),
+        cutlass.Int32(generated.launch.grid_size),
+        cutlass.Int32(0),
+        *(_view(tensor) for tensor in (gpu_source, gpu_weight, output, gpu_weight.t())),
+        tensor_a,
+        tensor_b,
+        tensor_c,
+    ]
+    compiled = cute.compile(
+        module.launch, *views, max_clusters, stream
+    )
+    compiled(*views, stream)
     torch.cuda.synchronize()
     generated_output = output.clone()
 
@@ -175,3 +265,100 @@ def test_generated_g0_adapter_matches_existing_g0_executable(tmp_path):
     torch.cuda.synchronize()
 
     torch.testing.assert_close(generated_output, output, rtol=0, atol=0)
+
+
+def _run_mixed(generated, source, weight, output_shape):
+    module = _load(generated)
+    gpu_source = source.cuda()
+    gpu_weight = weight.cuda()
+    workspace = torch.empty((4, 1536), device="cuda", dtype=torch.bfloat16)
+    output = torch.empty(output_shape, device="cuda", dtype=torch.bfloat16)
+    ready = torch.full(
+        (generated.launch.grid_size + 1,),
+        -1,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    work_iterator = torch.arange(
+        generated.launch.work_iterators[0].length,
+        device="cuda",
+        dtype=torch.int64,
+    ) * generated.launch.work_iterators[0].step
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    max_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(1)
+    tensor_a, tensor_b, tensor_c = cute_gemm_tensors(
+        gpu_source, gpu_weight, workspace
+    )
+    views = [
+        _view(ready),
+        cutlass.Int32(generated.launch.grid_size),
+        cutlass.Int32(0),
+        _view(work_iterator),
+        *(
+            _view(tensor)
+            for tensor in (
+                workspace,
+                gpu_source,
+                gpu_weight,
+                output,
+                gpu_weight.t(),
+            )
+        ),
+        tensor_a,
+        tensor_b,
+        tensor_c,
+    ]
+    compiled = cute.compile(module.launch, *views, max_clusters, stream)
+    compiled(*views, stream)
+    torch.cuda.synchronize()
+    return output
+
+
+def test_generated_mixed_g0_and_generic_kernel_matches_reference(tmp_path):
+    class Model(torch.nn.Module):
+        def forward(self, source, weight):
+            return torch.relu(source @ weight.T)
+
+    source = torch.randn(4, 576, dtype=torch.bfloat16)
+    weight = torch.randn(1536, 576, dtype=torch.bfloat16)
+    plan = _plan(Model(), source, weight)
+    generated = emit_cute(plan, tmp_path)
+
+    assert [phase.provider for phase in generated.launch.phases] == [
+        "g0_range",
+        "generic",
+    ]
+    assert generated.launch.threads_per_block == 256
+    assert generated.source.count("@cute.kernel") == 1
+    assert "grid_barrier(ready, workers, epoch + 0)" in generated.source
+    assert generated.launch.phases[0].barrier is not None
+
+    output = _run_mixed(generated, source, weight, (4, 1536))
+
+    torch.testing.assert_close(output.cpu(), torch.relu(source @ weight.T))
+
+
+def test_generated_mixed_g0_and_reduction_kernel_matches_reference(tmp_path):
+    class Model(torch.nn.Module):
+        def forward(self, source, weight):
+            return (source @ weight.T).sum(dim=-1)
+
+    source = torch.randn(4, 576, dtype=torch.bfloat16)
+    weight = torch.randn(1536, 576, dtype=torch.bfloat16)
+    plan = _plan(Model(), source, weight)
+    generated = emit_cute(plan, tmp_path)
+
+    assert [phase.provider for phase in generated.launch.phases] == [
+        "g0_range",
+        "generic",
+    ]
+    assert generated.launch.threads_per_block == 256
+    assert generated.launch.work_iterators[0].step == 1
+
+    output = _run_mixed(generated, source, weight, (4,))
+    torch.testing.assert_close(
+        output.cpu(),
+        (source @ weight.T).sum(dim=-1),
+        rtol=0.03,
+        atol=8,
+    )

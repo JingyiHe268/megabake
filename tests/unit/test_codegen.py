@@ -10,6 +10,7 @@ from megabake import (
     assign_storage,
     derive_dependencies,
     emit_cute,
+    KernelPlan,
     make_phase_schedule,
     select_bodies,
 )
@@ -71,6 +72,129 @@ def test_emit_cute_deduplicates_equivalent_bodies_and_saves_diagnostics(tmp_path
     assert {"device_body", "phase_barrier", "enclosing_kernel", "host_launch_wrapper"} <= kinds
     assert all(generated.launch.work_iterators)
     assert all(iterator.dtype == "torch.int64" for iterator in generated.launch.work_iterators)
+
+    source_lines = generated.source.splitlines()
+    for symbol, expected in (
+        ("_body_0", "linear_index"),
+        ("megabake_kernel", "cooperative_worker_loop("),
+        ("launch", ".launch("),
+    ):
+        entry = next(
+            entry for entry in generated.source_map if entry.symbol == symbol
+        )
+        mapped_source = "\n".join(
+            source_lines[entry.line_start - 1 : entry.line_end]
+        )
+        assert expected in mapped_source
+
+
+def test_emit_cute_puts_g0_inside_one_cooperative_kernel(tmp_path):
+    class Model(torch.nn.Module):
+        def forward(self, source, weight):
+            return source @ weight.T
+
+    source = torch.randn(4, 576, dtype=torch.bfloat16)
+    weight = torch.randn(1536, 576, dtype=torch.bfloat16)
+    prepared = prepare_fx_graph(
+        torch.export.export(Model(), (source, weight)).graph_module,
+        (source, weight),
+    )
+    graph = form_regions(
+        canonicalize_semantics(import_fx(prepared.graph, prepared.context))
+    )
+    selection = select_bodies(graph, _target(), SelectionPolicy(allow_tuned=True))
+    plan = assign_storage(
+        make_phase_schedule(selection, derive_dependencies(selection))
+    )
+
+    generated = emit_cute(plan, tmp_path)
+
+    ast.parse(generated.source)
+    assert generated.launch.cooperative
+    assert generated.launch.kernel_name == "megabake_kernel"
+    assert generated.source.count("@cute.kernel") == 1
+    assert ".prepare(" in generated.source
+    assert ".run(" in generated.source
+    assert "launch = body" not in generated.source
+
+
+def test_emit_cute_reuses_g0_scratch_for_duplicate_body_variants(tmp_path):
+    class Model(torch.nn.Module):
+        def forward(self, source, weight, other_weight):
+            return source @ weight.T, source @ other_weight.T
+
+    source = torch.randn(4, 576, dtype=torch.bfloat16)
+    weight = torch.randn(1536, 576, dtype=torch.bfloat16)
+    other_weight = torch.randn(1536, 576, dtype=torch.bfloat16)
+    prepared = prepare_fx_graph(
+        torch.export.export(Model(), (source, weight, other_weight)).graph_module,
+        (source, weight, other_weight),
+    )
+    graph = form_regions(
+        canonicalize_semantics(import_fx(prepared.graph, prepared.context))
+    )
+    selection = select_bodies(graph, _target(), SelectionPolicy(allow_tuned=True))
+    plan = assign_storage(
+        make_phase_schedule(selection, derive_dependencies(selection))
+    )
+
+    generated = emit_cute(plan, tmp_path)
+
+    ast.parse(generated.source)
+    assert [phase.provider for phase in generated.launch.phases] == [
+        "g0_range",
+        "g0_range",
+    ]
+    assert generated.source.count("HopperWgmmaGemmPersistentKernel(") == 1
+    assert generated.source.count("SmemAllocator().allocate(_g0_body_") == 1
+    assert generated.launch.shared_memory_bytes == 230_400
+
+
+def test_emit_cute_keeps_g0_variants_with_different_configurations(tmp_path):
+    class Model(torch.nn.Module):
+        def forward(self, source, weight, other_weight):
+            return source @ weight.T, source @ other_weight.T
+
+    source = torch.randn(4, 576, dtype=torch.bfloat16)
+    weight = torch.randn(1536, 576, dtype=torch.bfloat16)
+    other_weight = torch.randn(1536, 576, dtype=torch.bfloat16)
+    prepared = prepare_fx_graph(
+        torch.export.export(Model(), (source, weight, other_weight)).graph_module,
+        (source, weight, other_weight),
+    )
+    graph = form_regions(
+        canonicalize_semantics(import_fx(prepared.graph, prepared.context))
+    )
+    selection = select_bodies(graph, _target(), SelectionPolicy(allow_tuned=True))
+    plan = assign_storage(
+        make_phase_schedule(selection, derive_dependencies(selection))
+    )
+    first, second = plan.phases
+    second_body = replace(
+        second.body,
+        name=first.body.name,
+        tiles=replace(second.body.tiles, cta_shape=(64, 128)),
+        scratch=replace(second.body.scratch, size_bytes=214_016),
+    )
+    plan = replace(
+        plan,
+        phases=(first, replace(second, body=second_body)),
+        selection=replace(
+            plan.selection,
+            target=replace(
+                plan.selection.target,
+                max_shared_memory_per_cta=1_000_000,
+            ),
+        ),
+    )
+
+    generated = emit_cute(plan, tmp_path)
+
+    assert generated.source.count("HopperWgmmaGemmPersistentKernel(") == 2
+    assert generated.source.count("SmemAllocator().allocate(_g0_body_") == 2
+    assert "(64, 64)" in generated.source
+    assert "(64, 128)" in generated.source
+    assert generated.launch.shared_memory_bytes == 444_416
 
 
 def test_emit_cute_emits_explicit_layout_conversion(tmp_path):

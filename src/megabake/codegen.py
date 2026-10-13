@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import textwrap
 from typing import Any
+from collections.abc import Mapping
 
 from .bodies.gemm import HopperWgmmaGemmPersistentKernel
 from .bodies.generic import (
@@ -147,18 +148,7 @@ def emit_cute(
     if plan.launch.architecture != "sm90a":
         raise UnsupportedCodegen("codegen currently supports sm90a plans only")
 
-    if (
-        len(plan.phases) == 1
-        and plan.phases[0].body.provider == "g0_range"
-    ):
-        source, launch, source_map = _emit_g0_module(plan)
-    else:
-        if any(phase.body.provider != "generic" for phase in plan.phases):
-            raise UnsupportedCodegen(
-                "mixed plans require a composable device-body entrypoint; "
-                "g0_range is supported only as a single-phase adapter"
-            )
-        source, launch, source_map = _emit_generic_module(plan)
+    source, launch, source_map = _emit_generic_module(plan)
 
     module_name = (
         f"megabake_{hashlib.sha256((source + repr(launch)).encode()).hexdigest()[:16]}"
@@ -197,6 +187,17 @@ def _emit_generic_module(
     selected = {
         selection.region_id: selection for selection in plan.selection.selections
     }
+    has_g0 = any(phase.body.provider == "g0_range" for phase in plan.phases)
+    normalized = (
+        {
+            region_id: _normalize_generic_selection(
+                selection, plan.launch.threads_per_block
+            )
+            for region_id, selection in selected.items()
+        }
+        if has_g0
+        else selected
+    )
     tensor_arguments = tuple(
         TensorArgument(
             f"tensor_{index}",
@@ -213,13 +214,126 @@ def _emit_generic_module(
     phase_records: list[PhaseEmission] = []
     variants: dict[tuple[str, str, str], tuple[str, int, Any]] = {}
     body_definitions: list[str] = []
+    g0_definitions: list[str] = []
     conversion_definitions: list[str] = []
     phase_runners: list[str] = []
     phase_publishers: list[str] = []
+    g0_tensor_arguments: list[TensorArgument] = []
+    g0_prepared: list[tuple[str, str, str, str, str, str, str]] = []
+    g0_scratch: list[str] = []
+    g0_scratch_by_body: dict[str, str] = {}
+    scratch_elements: dict[int, int] = {}
+    g0_shared_bytes = 0
 
     for phase in plan.phases:
-        selection = selected[phase.region_id]
+        selection = normalized[phase.region_id]
+        if phase.body.provider == "g0_range":
+            variant_key = (
+                phase.body.provider,
+                phase.body.tiles.cta_shape[:2],
+                phase.body.tiles.cluster_shape[:2],
+                phase.body.scratch.size_bytes,
+            )
+            if variant_key not in variants:
+                variant_id = len(variants)
+                body_symbol = f"_g0_body_{variant_id}"
+                variants[variant_key] = (body_symbol, variant_id, phase.body)
+                tile = phase.body.tiles.cta_shape[:2]
+                cluster = phase.body.tiles.cluster_shape[:2]
+                g0_definitions.append(
+                    f"{body_symbol} = HopperWgmmaGemmPersistentKernel(\n"
+                    "    cutlass.Float32,\n"
+                    f"    {tile!r},\n"
+                    f"    {cluster!r},\n"
+                    "    1,\n"
+                    "    True,\n"
+                    ")"
+                )
+                g0_shared_bytes += phase.body.scratch.size_bytes
+            body_symbol, variant_id, _ = variants[variant_key]
+
+            g0_names = []
+            for value_id in (*selection.inputs, selection.outputs[0]):
+                argument_name = f"g0_tensor_{len(g0_tensor_arguments)}"
+                layout = (
+                    phase.body.layouts.inputs.get(value_id)
+                    if value_id in selection.inputs
+                    else phase.body.layouts.outputs[value_id]
+                )
+                g0_tensor_arguments.append(
+                    TensorArgument(
+                        argument_name,
+                        value_id,
+                        value_id,
+                        "g0_input" if value_id in selection.inputs else "g0_output",
+                        layout,
+                        None,
+                        (phase.region_id,),
+                    )
+                )
+                g0_names.append(argument_name)
+
+            tensor_bindings = f"_g0_bindings_{phase.index}"
+            epilogue = f"_g0_epilogue_{phase.index}"
+            work_iterator = f"_g0_work_iterator_{phase.index}"
+            scratch = g0_scratch_by_body.get(body_symbol)
+            if scratch is None:
+                scratch = f"_g0_scratch_{len(g0_scratch)}"
+                g0_scratch_by_body[body_symbol] = scratch
+                g0_scratch.append(
+                    f"    {scratch} = cutlass.utils.SmemAllocator().allocate"
+                    f"({body_symbol}.shared_storage)"
+                )
+            g0_prepared.append(
+                (
+                    body_symbol,
+                    g0_names[0],
+                    g0_names[1],
+                    g0_names[2],
+                    tensor_bindings,
+                    epilogue,
+                    work_iterator,
+                )
+            )
+            runner_lines = [
+                f"        {body_symbol}.run(\n"
+                f"            {work_iterator},\n"
+                f"            {tensor_bindings},\n"
+                f"            {scratch},\n"
+                f"            {epilogue},\n"
+                "        )"
+            ]
+            phase_runners.append(
+                f"    @cute.jit\n"
+                f"    def _run_phase_{phase.index}():\n"
+                + "\n".join(runner_lines)
+                + "\n"
+            )
+            phase_records.append(
+                PhaseEmission(
+                    phase.index,
+                    phase.region_id,
+                    f"{body_symbol}.run",
+                    variant_id,
+                    phase.body.provider,
+                    phase.body.name,
+                    len(phase.work_items),
+                    len(phase.work_items),
+                    (),
+                    phase.barrier.id if phase.barrier else None,
+                )
+            )
+            if phase.barrier is not None:
+                phase_publishers.append(
+                    f"    @cute.jit\n"
+                    f"    def _publish_phase_{phase.index}(epoch: cutlass.Int32):\n"
+                    f"        grid_barrier(ready, workers, epoch + {phase.index})\n"
+                )
+            continue
+
         generated = _generate_device_body(selection)
+        if generated.__dataclass_fields__.get("scratch_elements") is not None:
+            scratch_elements[phase.index] = generated.scratch_elements
         variant_key = (phase.body.provider, phase.body.name, generated.source)
         if variant_key not in variants:
             variant_id = len(variants)
@@ -285,7 +399,7 @@ def _emit_generic_module(
         conversion_symbols: list[str] = []
         for conversion_index, conversion in enumerate(phase.conversion_bodies):
             conversion_symbol = f"_conversion_{phase.index}_{conversion_index}"
-            target_selection = selected[conversion.target_region_id]
+            target_selection = normalized[conversion.target_region_id]
             conversion_generated = _generate_conversion_body(
                 conversion, target_selection.body, target_selection
             )
@@ -302,6 +416,21 @@ def _emit_generic_module(
             else:
                 conversion_symbol = variants[conversion_key][0]
             conversion_symbols.append(conversion_symbol)
+            conversion_iterator_name = (
+                f"work_iterator_{phase.index}_conversion_{conversion_index}"
+            )
+            work_iterators.append(
+                WorkIteratorBinding(
+                    conversion_iterator_name,
+                    phase.index,
+                    phase.region_id,
+                    "torch.int64",
+                    conversion_generated.tile_count,
+                    0,
+                    conversion_generated.threads_per_cta,
+                    conversion_generated.work_iterator_encoding,
+                )
+            )
             source_tensor = _tensor_name(
                 tensor_arguments,
                 conversion.value_id,
@@ -317,8 +446,8 @@ def _emit_generic_module(
             )
             runner_lines.append(
                 f"        {conversion_symbol}(\n"
-                f"            (None, {source_tensor}),\n"
-                f"            (None, {target_tensor}),\n"
+                f"            {conversion_iterator_name},\n"
+                f"            ({source_tensor}, {target_tensor},),\n"
                 "            None,\n"
                 "            None,\n"
                 "        )"
@@ -351,14 +480,40 @@ def _emit_generic_module(
             )
         )
 
-    shared_source = _shared_scratch_source(plan)
-    scratch_prelude = _scratch_prelude(plan)
+    shared_source = _shared_scratch_source(plan, scratch_elements)
+    scratch_prelude = _scratch_prelude(plan, scratch_elements)
+    shared_memory_bytes = (
+        g0_shared_bytes + _generic_scratch_bytes(plan, scratch_elements)
+        if has_g0
+        else plan.launch.dynamic_shared_memory_bytes
+    )
+    target = plan.selection.target
+    if target is not None and shared_memory_bytes > target.max_shared_memory_per_cta:
+        raise UnsupportedCodegen(
+            f"generated kernel requires {shared_memory_bytes} shared-memory bytes"
+        )
+    g0_kernel_values = tuple(
+        argument
+        for prepared in g0_prepared
+        for argument in prepared[4:]
+    )
+    prepare_lines = [
+        f"    {bindings}, {epilogue}, {work_iterator} = {body_symbol}.prepare(\n"
+        f"        {tensor_a},\n"
+        f"        {tensor_b},\n"
+        f"        {tensor_c},\n"
+        "        max_active_clusters,\n"
+        "    )\n"
+        for body_symbol, tensor_a, tensor_b, tensor_c, bindings, epilogue, work_iterator in g0_prepared
+    ]
+    launch_smem = "" if has_g0 else f"        smem={shared_memory_bytes},\n"
     kernel_arguments = [
         "ready: cute.Tensor",
         "workers: cutlass.Int32",
         "epoch: cutlass.Int32",
         *(iterator.name + ": cute.Tensor" for iterator in work_iterators),
         *(argument.name + ": cute.Tensor" for argument in tensor_arguments),
+        *g0_kernel_values,
     ]
     launch_arguments = [
         "ready: cute.Tensor",
@@ -366,13 +521,19 @@ def _emit_generic_module(
         "epoch: cutlass.Int32",
         *(iterator.name + ": cute.Tensor" for iterator in work_iterators),
         *(argument.name + ": cute.Tensor" for argument in tensor_arguments),
+        *(argument.name + ": cute.Tensor" for argument in g0_tensor_arguments),
         "stream: cuda.CUstream",
     ]
+    if has_g0:
+        launch_arguments.insert(-1, "max_active_clusters: cutlass.Constexpr")
     source = f'''import cutlass
 import cutlass.cute as cute
 from cuda.bindings import driver as cuda
 
 from megabake.runtime import cooperative_worker_loop, grid_barrier
+from megabake.bodies.gemm import HopperWgmmaGemmPersistentKernel
+
+{"\n\n".join(g0_definitions)}
 
 
 {shared_source}
@@ -384,6 +545,7 @@ def megabake_kernel(
     _, _, _block = cute.arch.block_idx()
     _thread, _, _ = cute.arch.thread_idx()
 {scratch_prelude}
+{chr(10).join(g0_scratch)}
 {"".join(body_definitions)}
 {"".join(conversion_definitions)}
     @cute.jit
@@ -414,17 +576,17 @@ def megabake_kernel(
 def launch(
 {("," + chr(10)).join(f"    {argument}" for argument in launch_arguments)}
 ):
+{"".join(prepare_lines)}
     megabake_kernel(
         ready,
         workers,
         epoch,
-{("," + chr(10)).join(f"        {argument.name}" for argument in (*work_iterators, *tensor_arguments))}
+        {("," + chr(10)).join([f"        {argument.name}" for argument in (*work_iterators, *tensor_arguments)] + [f"        {argument}" for argument in g0_kernel_values])}
     ).launch(
         grid=[1, 1, workers],
         block=[{plan.launch.threads_per_block}, 1, 1],
         cooperative=True,
-        smem={plan.launch.dynamic_shared_memory_bytes},
-        stream=stream,
+{launch_smem}        stream=stream,
     )
 '''
     launch_metadata = LaunchMetadata(
@@ -433,87 +595,79 @@ def launch(
         plan.launch.grid_size,
         plan.launch.threads_per_block,
         True,
-        plan.launch.dynamic_shared_memory_bytes,
+        shared_memory_bytes,
         plan.launch.architecture,
         ("ready", "workers", "epoch")
         + tuple(argument.name for argument in (*work_iterators, *tensor_arguments))
+        + tuple(argument.name for argument in g0_tensor_arguments)
+        + (("max_active_clusters",) if has_g0 else ())
         + ("stream",),
         tuple(work_iterators),
-        tensor_arguments,
+        tuple((*tensor_arguments, *g0_tensor_arguments)),
         tuple(phase_records),
     )
     return source, launch_metadata, _source_map(source, plan, phase_records)
 
 
-def _emit_g0_module(
-    plan: KernelPlan,
-) -> tuple[str, LaunchMetadata, tuple[SourceMapEntry, ...]]:
-    phase = plan.phases[0]
-    tile = phase.body.tiles.cta_shape[:2]
-    cluster = phase.body.tiles.cluster_shape[:2]
-    source = f'''import cutlass
-import cutlass.cute as cute
-from cuda.bindings import driver as cuda
+def _normalize_generic_selection(
+    selection: SelectedBody, threads: int
+) -> SelectedBody:
+    body = selection.body
+    old_threads = body.participants.participating_threads
+    if body.provider == "g0_range" or old_threads == threads:
+        return selection
+    if threads % old_threads:
+        raise UnsupportedCodegen(
+            f"generic body uses {old_threads} threads; cannot share {threads}"
+        )
 
-from megabake.bodies.gemm import HopperWgmmaGemmPersistentKernel
-
-
-body = HopperWgmmaGemmPersistentKernel(
-    cutlass.Float32,
-    {tile!r},
-    {cluster!r},
-    1,
-    True,
-)
-
-
-launch = body
-'''
-    phase_record = PhaseEmission(
-        0,
-        phase.region_id,
-        "HopperWgmmaGemmPersistentKernel.range_kernel",
-        0,
-        phase.body.provider,
-        phase.body.name,
-        len(phase.work_items),
-        len(phase.work_items),
-        (),
-        None,
+    factor = threads // old_threads
+    participants = replace(
+        body.participants,
+        participating_threads=threads,
+        warp_roles=body.participants.warp_roles * factor,
     )
-    launch_metadata = LaunchMetadata(
-        "HopperWgmmaGemmPersistentKernel.range_kernel",
-        "launch",
-        plan.launch.grid_size,
-        plan.launch.threads_per_block,
-        False,
-        plan.launch.dynamic_shared_memory_bytes,
-        plan.launch.architecture,
-        ("tensor_a", "tensor_b", "tensor_c", "max_active_clusters", "stream"),
-        (),
-        (),
-        (phase_record,),
-        "provider_owned_g0",
+    family = selection.program.family
+    if family in {"elementwise", "copy", "contraction"}:
+        output_domains = tuple(
+            domain
+            for domain in selection.program.iteration_domains
+            if domain.axis not in selection.program.reduction_axes
+        )
+        tiles = replace(
+            body.tiles,
+            cta_shape=(threads,) + (1,) * max(len(output_domains) - 1, 0),
+        )
+    elif family == "reduction":
+        output_domains = tuple(
+            domain
+            for domain in selection.program.iteration_domains
+            if domain.axis not in selection.program.reduction_axes
+        )
+        accumulator_size = _DTYPE_BYTES[selection.program.accumulator_dtype or ""]
+        tiles = replace(
+            body.tiles,
+            cta_shape=(threads,) + (1,) * max(len(output_domains) - 1, 0),
+            reduction_tile=(threads,),
+        )
+        scratch = replace(
+            body.scratch,
+            size_bytes=max(
+                body.scratch.size_bytes,
+                (threads // 32) * accumulator_size,
+            ),
+        )
+        return replace(
+            selection,
+            body=replace(body, participants=participants, tiles=tiles, scratch=scratch),
+        )
+    else:
+        raise UnsupportedCodegen(f"cannot normalize generic body family {family}")
+
+    return replace(
+        selection,
+        body=replace(body, participants=participants, tiles=tiles),
     )
-    source_path = Path(inspect.getsourcefile(HopperWgmmaGemmPersistentKernel))
-    lines, line_start = inspect.getsourcelines(
-        HopperWgmmaGemmPersistentKernel.range_kernel
-    )
-    source_map = (
-        SourceMapEntry(
-            "HopperWgmmaGemmPersistentKernel.range_kernel",
-            "device_body",
-            line_start,
-            line_start + len(lines) - 1,
-            0,
-            phase.region_id,
-            phase.body.provider,
-            phase.body.name,
-            phase.body.semantic.source_op_ids,
-            str(source_path),
-        ),
-    )
-    return source, launch_metadata, source_map
 
 
 def _generate_device_body(selection: SelectedBody):
@@ -579,6 +733,7 @@ def _generate_conversion_body(
         ),
     )
     output_axes = tuple(domain.axis for domain in domains)
+    threads = base_body.participants.participating_threads
     config = replace(
         base_body,
         semantic=replace(
@@ -614,7 +769,7 @@ def _generate_conversion_body(
         ),
         tiles=replace(
             base_body.tiles,
-            cta_shape=(128,) + (1,) * max(len(output_axes) - 1, 0),
+            cta_shape=(threads,) + (1,) * max(len(output_axes) - 1, 0),
             work_partition="one output element per thread",
             reduction_tile=(),
         ),
@@ -672,13 +827,43 @@ def _nested_body_source(source: str, symbol: str) -> str:
     return textwrap.indent(body_source, "    ") + "\n"
 
 
-def _shared_scratch_source(plan: KernelPlan) -> str:
-    if not plan.launch.dynamic_shared_memory_bytes:
-        return ""
+def _generic_scratch_bytes(
+    plan: KernelPlan, scratch_elements: Mapping[int, int]
+) -> int:
+    sizes = []
+    for phase in plan.phases:
+        if phase.body.provider == "g0_range":
+            continue
+        offset = 0
+        for _ in phase.body.pipeline.barriers:
+            offset = _round_up(offset + 8, 8)
+        for _ in phase.body.pipeline.descriptors:
+            offset = _round_up(offset + 128, 128)
+        alignment = max(1, phase.body.scratch.alignment_bytes)
+        body_bytes = _phase_scratch_bytes(plan, phase, scratch_elements)
+        offset = _round_up(offset, alignment) + body_bytes
+        sizes.append(_round_up(offset, alignment))
+    return max(sizes, default=0)
+
+
+def _round_up(value: int, alignment: int) -> int:
+    return (value + alignment - 1) // alignment * alignment
+
+
+def _shared_scratch_source(
+    plan: KernelPlan, scratch_elements: Mapping[int, int]
+) -> str:
     worker = plan.storage.worker_scratch[0]
     phase_structs: list[str] = []
     scratch_phase_indices: list[int] = []
+    generic_phases = tuple(
+        phase for phase in plan.phases if phase.body.provider != "g0_range"
+    )
+    if not any(_phase_has_scratch_fields(phase) for phase in generic_phases):
+        return ""
     for phase_layout, phase in zip(worker.phases, plan.phases, strict=True):
+        if phase.body.provider == "g0_range":
+            continue
         fields: list[str] = []
         for index, name in enumerate(phase.body.pipeline.barriers):
             fields.append(
@@ -702,18 +887,22 @@ def _shared_scratch_source(plan: KernelPlan) -> str:
                     f"        cute.struct.MemRange[cutlass.UInt8, {size}], 128\n"
                     f"    ]"
                 )
-        if phase.body.scratch.size_bytes:
+        if phase.index in scratch_elements or phase.body.scratch.size_bytes:
+            body_scratch_elements = _phase_scratch_elements(
+                plan, phase, scratch_elements
+            )
+        else:
+            body_scratch_elements = 0
+        if body_scratch_elements:
             accumulator_dtype = next(
                 selection.program.accumulator_dtype
                 for selection in plan.selection.selections
                 if selection.region_id == phase.region_id
             )
-            element_size = _DTYPE_BYTES[accumulator_dtype]
-            elements = phase.body.scratch.size_bytes // element_size
             cutlass_type = _CUTLASS_TYPES[accumulator_dtype]
             fields.append(
                 f"    body: cute.struct.Align[\n"
-                f"        cute.struct.MemRange[{cutlass_type}, {elements}],\n"
+                f"        cute.struct.MemRange[{cutlass_type}, {body_scratch_elements}],\n"
                 f"        {phase.body.scratch.alignment_bytes}\n"
                 f"    ]"
             )
@@ -736,20 +925,29 @@ def _shared_scratch_source(plan: KernelPlan) -> str:
     )
 
 
-def _scratch_prelude(plan: KernelPlan) -> str:
-    if not plan.launch.dynamic_shared_memory_bytes:
+def _scratch_prelude(
+    plan: KernelPlan, scratch_elements: Mapping[int, int]
+) -> str:
+    generic_phases = tuple(
+        phase for phase in plan.phases if phase.body.provider != "g0_range"
+    )
+    if not any(_phase_has_scratch_fields(phase) for phase in generic_phases):
         return ""
     lines = [
         "    _worker_scratch = cutlass.utils.SmemAllocator().allocate(_WorkerScratch)"
     ]
     for phase in plan.phases:
+        if phase.body.provider == "g0_range":
+            continue
         if _phase_has_scratch_fields(phase):
-            elements = _phase_scratch_elements(plan, phase)
+            elements = _phase_scratch_elements(plan, phase, scratch_elements)
             lines.append(
                 f"    _scratch_{phase.index} = _worker_scratch.phase_{phase.index}.body"
                 f".get_tensor(cute.make_layout({elements}))"
             )
     for phase in plan.phases:
+        if phase.body.provider == "g0_range":
+            continue
         if _phase_has_scratch_fields(phase):
             for index in range(len(phase.body.pipeline.barriers)):
                 lines.extend(
@@ -762,13 +960,30 @@ def _scratch_prelude(plan: KernelPlan) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _phase_scratch_elements(plan: KernelPlan, phase: Any) -> int:
+def _phase_scratch_elements(
+    plan: KernelPlan, phase: Any, scratch_elements: Mapping[int, int]
+) -> int:
     accumulator_dtype = next(
         selection.program.accumulator_dtype
         for selection in plan.selection.selections
         if selection.region_id == phase.region_id
     )
-    return phase.body.scratch.size_bytes // _DTYPE_BYTES[accumulator_dtype]
+    return _phase_scratch_bytes(
+        plan, phase, scratch_elements
+    ) // _DTYPE_BYTES[accumulator_dtype]
+
+
+def _phase_scratch_bytes(
+    plan: KernelPlan, phase: Any, scratch_elements: Mapping[int, int]
+) -> int:
+    if phase.index in scratch_elements:
+        accumulator_dtype = next(
+            selection.program.accumulator_dtype
+            for selection in plan.selection.selections
+            if selection.region_id == phase.region_id
+        )
+        return scratch_elements[phase.index] * _DTYPE_BYTES[accumulator_dtype]
+    return phase.body.scratch.size_bytes
 
 
 def _phase_has_scratch_fields(phase: Any) -> bool:
@@ -820,20 +1035,40 @@ def _source_map(
     }
     entries: list[SourceMapEntry] = []
     for record in phase_records:
-        lines = _symbol_lines(source, record.body_symbol)
-        entries.append(
-            SourceMapEntry(
-                record.body_symbol,
-                "device_body",
-                lines[0],
-                lines[1],
-                record.index,
-                record.region_id,
-                record.provider,
-                record.body_name,
-                selected[record.region_id].source_op_ids,
+        if record.provider == "g0_range":
+            source_path = Path(inspect.getsourcefile(HopperWgmmaGemmPersistentKernel))
+            lines, line_start = inspect.getsourcelines(
+                HopperWgmmaGemmPersistentKernel.run
             )
-        )
+            entries.append(
+                SourceMapEntry(
+                    record.body_symbol,
+                    "device_body",
+                    line_start,
+                    line_start + len(lines) - 1,
+                    record.index,
+                    record.region_id,
+                    record.provider,
+                    record.body_name,
+                    selected[record.region_id].source_op_ids,
+                    str(source_path),
+                )
+            )
+        else:
+            lines = _symbol_lines(source, record.body_symbol)
+            entries.append(
+                SourceMapEntry(
+                    record.body_symbol,
+                    "device_body",
+                    lines[0],
+                    lines[1],
+                    record.index,
+                    record.region_id,
+                    record.provider,
+                    record.body_name,
+                    selected[record.region_id].source_op_ids,
+                )
+            )
         for symbol in record.conversion_symbols:
             lines = _symbol_lines(source, symbol)
             entries.append(
@@ -899,18 +1134,11 @@ def _source_map(
 
 
 def _symbol_lines(source: str, symbol: str) -> tuple[int, int]:
-    lines = source.splitlines()
-    for index, line in enumerate(lines):
-        stripped = line.lstrip()
-        if stripped.startswith(f"def {symbol}("):
-            indent = len(line) - len(stripped)
-            end = len(lines)
-            for following in range(index + 1, len(lines)):
-                candidate = lines[following]
-                if candidate.strip() and len(candidate) - len(candidate.lstrip()) <= indent:
-                    end = following
-                    break
-            return index + 1, end
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(
+            node, (ast.FunctionDef, ast.AsyncFunctionDef)
+        ) and node.name == symbol:
+            return node.lineno, node.end_lineno
     raise UnsupportedCodegen(f"generated symbol {symbol} is missing")
 
 

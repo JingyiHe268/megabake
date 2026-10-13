@@ -294,12 +294,12 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Implement in:** `codegen.py`, with `emit_cute(plan) -> generated module and launch metadata`.
 
-- [ ] Emit `@cute.jit` device helpers and one enclosing `@cute.kernel`. Declare shared scratch and tensor bindings from the plan.
-- [ ] Emit each phase's tile iterator and device-body call. Keep the tuned range loop inside the body.
-- [ ] Emit required barriers and state operations from the plan. Generate conversions and intermediate stores as explicit work.
-- [ ] Generate a host launch wrapper for that one kernel. Keep all required device computation in the emitted module.
-- [ ] Deduplicate identical body variants by program and configuration. Bind parameter tensors through runtime arguments.
-- [ ] Save the generated source and a source-to-plan map for diagnostics.
+- [x] Emit `@cute.jit` device helpers and one enclosing `@cute.kernel`. Declare shared scratch and tensor bindings from the plan.
+- [x] Emit each phase's tile iterator and device-body call. Keep the tuned range loop inside the body.
+- [x] Emit required barriers and state operations from the plan. Generate conversions and intermediate stores as explicit work.
+- [x] Generate a host launch wrapper for that one kernel. Keep all required device computation in the emitted module.
+- [x] Deduplicate identical body variants by program and configuration. Bind parameter tensors through runtime arguments.
+- [x] Save the generated source and a source-to-plan map for diagnostics.
 
 **Output:** an inspectable CuTe module for the planned graph.
 

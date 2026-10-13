@@ -303,20 +303,18 @@ class HopperWgmmaGemmPersistentKernel:
         )
 
     @cute.jit
-    def __call__(
+    def prepare(
         self,
         a: cute.Tensor,
         b: cute.Tensor,
         c: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
-        stream: cuda.CUstream,
     ):
-        """Execute the GEMM operation in steps:
+        """Prepare TMA operands and the persistent tile schedule.
         - Setup static attributes
         - Setup TMA load/store atoms and tensors
         - Compute grid size
         - Define shared storage for kernel
-        - Launch the kernel synchronously
 
         :param a: Input tensor A
         :type a: cute.Tensor
@@ -326,8 +324,6 @@ class HopperWgmmaGemmPersistentKernel:
         :type c: cute.Tensor
         :param max_active_clusters: Maximum number of active clusters
         :type max_active_clusters: cutlass.Constexpr
-        :param stream: CUDA stream for asynchronous execution
-        :type stream: cuda.CUstream
         """
 
         # setup static attributes before smem/grid/tma computation
@@ -407,7 +403,45 @@ class HopperWgmmaGemmPersistentKernel:
 
         self.shared_storage = SharedStorage
 
-        # Launch the kernel synchronously
+        return (
+            (
+                tma_atom_a,
+                tma_tensor_a,
+                tma_atom_b,
+                tma_tensor_b,
+                self.tiled_mma,
+                self.cta_layout_mnk,
+                self.a_smem_layout_staged,
+                self.b_smem_layout_staged,
+            ),
+            (tma_atom_c, tma_tensor_c, self.epi_smem_layout_staged),
+            tile_sched_params,
+        )
+
+    @cute.jit
+    def __call__(
+        self,
+        a: cute.Tensor,
+        b: cute.Tensor,
+        c: cute.Tensor,
+        max_active_clusters: cutlass.Constexpr,
+        stream: cuda.CUstream,
+    ):
+        tensor_bindings, epilogue, tile_sched_params = self.prepare(
+            a, b, c, max_active_clusters
+        )
+        (
+            tma_atom_a,
+            tma_tensor_a,
+            tma_atom_b,
+            tma_tensor_b,
+            tiled_mma,
+            cta_layout_mnk,
+            a_smem_layout_staged,
+            b_smem_layout_staged,
+        ) = tensor_bindings
+        tma_atom_c, tma_tensor_c, epi_smem_layout_staged = epilogue
+
         self.range_kernel(
             tma_atom_a,
             tma_tensor_a,
@@ -416,13 +450,15 @@ class HopperWgmmaGemmPersistentKernel:
             tma_atom_c,
             tma_tensor_c,
             tile_sched_params,
-            self.tiled_mma,
-            self.cta_layout_mnk,
-            self.a_smem_layout_staged,
-            self.b_smem_layout_staged,
-            self.epi_smem_layout_staged,
+            tiled_mma,
+            cta_layout_mnk,
+            a_smem_layout_staged,
+            b_smem_layout_staged,
+            epi_smem_layout_staged,
         ).launch(
-            grid=grid,
+            grid=utils.StaticPersistentTileScheduler.get_grid_shape(
+                tile_sched_params, max_active_clusters
+            ),
             block=[self.threads_per_cta, 1, 1],
             cluster=(*self.cluster_shape_mn, 1),
             min_blocks_per_mp=1,
