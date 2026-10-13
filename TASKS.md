@@ -311,13 +311,13 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Implement in:** `compiler.py`, with `compile_post_grad`, `compile_plan`, and `bind_callable`.
 
-- [ ] Wire steps 02–14 into the callback installed at step 01.
-- [ ] Compile the complete kernel. Query registers, shared memory, local memory, active blocks, and cooperative launch limits.
-- [ ] Choose a legal worker count from actual compiled resources. Keep worker-dependent iterators and scratch consistent with that count.
-- [ ] Recompile and repeat admission if a changed worker count changes a compile-time layout.
-- [ ] Allocate output and workspace buffers. Bind current inputs, parameters, state, descriptors, and the active CUDA stream on each call.
-- [ ] Return outputs through the saved PyTorch wrapper and reconstruction map. Preserve aliases and mutation handling.
-- [ ] Reject an invalid complete plan before device execution. Include the source operation and failed requirement in diagnostics.
+- [x] Wire steps 02–14 into the callback installed at step 01.
+- [x] Compile the complete kernel. Query registers, shared memory, local memory, active blocks, and cooperative launch limits.
+- [x] Choose a legal worker count from actual compiled resources. Keep worker-dependent iterators and scratch consistent with that count.
+- [x] Recompile and repeat admission if a changed worker count changes a compile-time layout.
+- [x] Allocate output and workspace buffers. Bind current inputs, parameters, state, descriptors, and the active CUDA stream on each call.
+- [x] Return outputs through the saved PyTorch wrapper and reconstruction map. Preserve aliases and mutation handling.
+- [x] Reject an invalid complete plan before device execution. Include the source operation and failed requirement in diagnostics.
 
 **Output:** the first complete path from `torch.compile` input to one generated CuTe workload kernel.
 

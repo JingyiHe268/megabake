@@ -17,6 +17,15 @@ from .bodies import BodyConfig, SelectionPolicy, TargetFacts, get_candidates
 from .plan import BodySelectionPlan, KernelPlan, make_tile_maps, select_bodies
 from .memory import assign_storage, verify_plan
 from .codegen import emit_cute
+from .compiler import (
+    CallableTrace,
+    CompiledKernel,
+    CompiledResources,
+    CompilerError,
+    compile_plan,
+    compile_post_grad,
+    bind_callable,
+)
 from .runtime import execute_phase_plan, admit_runtime
 from .schedule import (
     DependencyPlan,
@@ -47,6 +56,13 @@ __all__ = [
     "assign_storage",
     "verify_plan",
     "emit_cute",
+    "compile_plan",
+    "compile_post_grad",
+    "bind_callable",
+    "CompiledKernel",
+    "CompiledResources",
+    "CompilerError",
+    "CallableTrace",
     "admit_runtime",
     "execute_phase_plan",
     "KernelPlan",

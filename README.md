@@ -24,15 +24,15 @@ The compilation path is:
 4. Generate baseline CuTe bodies from supported tensor primitives and add valid tuned candidates. Plan their execution in one persistent kernel where legal.
 5. Check the complete invocation and measure it against an equivalent `torch.compile` baseline.
 
-The design preserves the tuned pipeline inside each body. It starts with ordered phases and refines tile readiness where measurements justify it. The Task 01 frontend accepts `--mode prefill|decode` and records that policy; mode-specific decode scheduling is not implemented yet.
+The design preserves the tuned pipeline inside each body. It starts with ordered phases and refines tile readiness where measurements justify it. The frontend accepts `--mode prefill|decode` and records that policy; mode-specific decode scheduling is not implemented yet. On an SM90 CUDA device, `make_backend()` compiles supported post-grad graphs into one cooperative CuTe workload kernel and rebinds current inputs and parameters on every call. Pass `compile_kernel=False` to retain the FX reference path for CPU-only capture work.
 
 A complete-model request includes all requested outputs and state updates. Named region matchers enable optimizations. Unfamiliar combinations of supported primitives use generic lowering. Unknown operator semantics or an illegal composition produce an explicit failure. The proposed `fallback=inductor` option can delegate the whole invocation and report that result as external fallback. Strict megakernel compilation defaults to `fallback=error`. These paths are not implemented yet.
 
-The production compiler remains to be built. The current checkout contains a capture/reference path and recorded G0 body/runtime probes. Follow TASKS.md to connect a thin frontend to that device work. Require a measured MLP benefit before expanding to broader model coverage.
+The first frontend-to-kernel compiler path is implemented for supported SM90 workloads. Complete-model coverage, stateful decode, fallback delegation, and measured optimization work remain open in later TASKS.md steps.
 
 ## Current frontend
 
-Task 01 provides a Dynamo backend that runs the pinned AOT, pre-grad, and post-grad FX transformations, retains the result as an FX `GraphModule`, and returns only a reference forward for that graph. It does not invoke Inductor lowering or code generation. It preserves the PyTorch wrappers around arguments, outputs, aliases, and mutations, and separates its capture cache from future plan reuse.
+The Dynamo backend runs the pinned AOT, pre-grad, and post-grad FX transformations, retains the result as an FX `GraphModule`, and compiles it on SM90 when the complete plan is supported. It does not invoke Inductor lowering or code generation. It preserves the PyTorch wrappers around arguments, outputs, aliases, and mutations, and separates its capture cache from compiled-plan reuse.
 
 ```python
 import torch
@@ -44,7 +44,7 @@ with torch.no_grad():
     output = compiled(example_input)
 ```
 
-The development CLI also exercises the reference path:
+The development CLI also exercises the capture path. CPU commands use the reference forward; CUDA commands follow the same backend policy and require a supported graph:
 
 ```bash
 python src/main.py demo --device cpu

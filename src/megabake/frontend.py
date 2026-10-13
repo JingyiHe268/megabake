@@ -94,6 +94,7 @@ class PreparedFX:
     graph: Any
     context: CaptureContext
     forward: Callable[..., Any]
+    example_inputs: tuple[Any, ...] = ()
 
 
 def _torch_version() -> tuple[int, int]:
@@ -268,18 +269,45 @@ def _validate_options(options: Mapping[str, Any]) -> dict[str, Any]:
     dump_dir = options.get("dump_dir")
     if dump_dir is not None and not isinstance(dump_dir, (str, Path)):
         raise TypeError("dump_dir must be a path or None")
+    compile_kernel = options.get("compile_kernel", None)
+    if compile_kernel not in {None, True, False}:
+        raise TypeError("compile_kernel must be True, False, or None for automatic")
     return {
         "mode": mode,
         "fallback": fallback,
         "cache": options.get("cache", True),
         "model_name": model_name,
         "dump_dir": dump_dir,
+        "compile_kernel": compile_kernel,
     }
 
 
 def _safe_model_name(model_name: str) -> str:
     safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "__", model_name).strip("._")
     return safe_name or "model"
+
+
+def _infer_parameter_bindings(
+    graph: Any,
+    example_inputs: Sequence[Any],
+    input_kinds: Mapping[str, str] | None,
+    parameter_names: set[str] | None,
+) -> tuple[Mapping[str, str] | None, set[str] | None]:
+    placeholder_names = [
+        node.name for node in graph.graph.nodes if node.op == "placeholder"
+    ]
+    inferred_kinds = dict(input_kinds or {})
+    inferred_parameters = set(parameter_names or ())
+    if parameter_names is None:
+        for name, value in zip(placeholder_names, example_inputs, strict=False):
+            if isinstance(value, torch.nn.Parameter):
+                inferred_parameters.add(name)
+    if input_kinds is None:
+        for name in placeholder_names:
+            inferred_kinds[name] = (
+                "parameter" if name in inferred_parameters else "runtime"
+            )
+    return inferred_kinds, inferred_parameters
 
 
 def _reject_symbolic_shapes(graph: Any) -> None:
@@ -420,7 +448,12 @@ def _prepare_fx_graph(
         output_spec = context.runtime_output_tree_spec or context.output_tree_spec
         return pytree.tree_unflatten(output, output_spec)
 
-    return PreparedFX(graph=final_graphs[-1], context=context, forward=fx_forward)
+    return PreparedFX(
+        graph=final_graphs[-1],
+        context=context,
+        forward=fx_forward,
+        example_inputs=tuple(example_inputs),
+    )
 
 
 def make_backend(**options: Any) -> Callable[..., Any]:
@@ -466,6 +499,9 @@ def make_backend(**options: Any) -> Callable[..., Any]:
             for value in example_inputs
         ):
             raise RuntimeError("MegaBake Task 01 supports inference only")
+        input_kinds, parameter_names = _infer_parameter_bindings(
+            graph, example_inputs, input_kinds, parameter_names
+        )
         prepared = prepare(
             graph,
             example_inputs,
@@ -473,9 +509,31 @@ def make_backend(**options: Any) -> Callable[..., Any]:
             parameter_names=parameter_names,
         )
         backend.megabake_last_prepared = prepared
-        forward = prepared.forward
+        compile_kernel = validated_options["compile_kernel"]
+        should_compile = compile_kernel is True or (
+            compile_kernel is None and _can_auto_compile(example_inputs)
+        )
+        compiled = None
+        if should_compile:
+            from .compiler import compile_post_grad
+
+            compiled = compile_post_grad(
+                prepared,
+                output_dir=(
+                    Path(validated_options["dump_dir"]) / "generated"
+                    if validated_options["dump_dir"] is not None
+                    else None
+                ),
+            )
+            forward = compiled
+            prepared.context.requirements["execution"] = "megakernel"
+        else:
+            forward = prepared.forward
         forward.megabake_contexts = contexts
         forward.megabake_cache = cache
+        if compiled is not None:
+            backend.megabake_last_compiled = compiled.megabake_compiled
+            backend.megabake_last_trace = forward.megabake_trace
         return forward
 
     backend.megabake_cache = cache
@@ -484,6 +542,19 @@ def make_backend(**options: Any) -> Callable[..., Any]:
     backend.megabake_prepare = prepare
     backend.__name__ = "megabake_backend"
     return backend
+
+
+def _can_auto_compile(example_inputs: Sequence[Any]) -> bool:
+    tensors = [
+        value for value in example_inputs if isinstance(value, torch.Tensor)
+    ]
+    if not tensors or any(tensor.device.type != "cuda" for tensor in tensors):
+        return False
+    try:
+        capability = torch.cuda.get_device_capability(tensors[0].device)
+    except Exception:
+        return False
+    return capability == (9, 0)
 
 
 def prepare_fx_graph(
