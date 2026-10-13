@@ -25,9 +25,23 @@ from .frontend import CaptureContext, PreparedFX
 from .graph import ComputeGraph, import_fx
 from .lowering import canonicalize_semantics
 from .memory import verify_plan
-from .plan import KernelPlan, PlanMeasurement, SearchBudget, search_plans
+from .plan import (
+    KernelPlan,
+    PlanMeasurement,
+    PlanSearchResult,
+    SearchBudget,
+    search_plans,
+)
+from .schedule import EventSchedule, make_region_event_schedule
 from .regions import form_regions
-from .runtime import RuntimeAdmission, admit_runtime, execute_phase_plan
+from .runtime import (
+    EventRuntimeAdmission,
+    RuntimeAdmission,
+    admit_event_runtime,
+    admit_runtime,
+    execute_event_plan,
+    execute_phase_plan,
+)
 
 
 class UnsupportedCompiler(RuntimeError):
@@ -51,7 +65,8 @@ class CompiledKernel:
     generated: GeneratedCuTeModule
     compiled: Any
     resources: CompiledResources
-    admission: RuntimeAdmission
+    admission: RuntimeAdmission | EventRuntimeAdmission
+    event_schedule: EventSchedule | None
     input_order: tuple[str, ...]
     parameter_names: frozenset[str]
     parameter_tensors: Mapping[str, torch.Tensor]
@@ -76,7 +91,13 @@ def compile_post_grad(
     policy: SelectionPolicy | None = None,
     output_dir: Path | str | None = None,
     search_budget: SearchBudget | int | None = None,
+    scheduler: str = "phase",
 ) -> Callable[..., Any]:
+    compile_started = time.perf_counter()
+    if scheduler not in {"phase", "region-events", "auto"}:
+        raise ValueError(
+            "scheduler must be 'phase', 'region-events', or 'auto'"
+        )
     graph, selected_target = _post_grad_graph(prepared, target)
     if isinstance(search_budget, int):
         if search_budget < 1:
@@ -84,18 +105,62 @@ def compile_post_grad(
         budget = SearchBudget(max_plans=search_budget)
     else:
         budget = search_budget or SearchBudget()
-    if budget.evaluator is None:
-        with torch.no_grad():
-            reference = prepared.forward(*prepared.example_inputs)
-        budget = SearchBudget(
-            budget.max_plans,
-            budget.max_compilations,
-            budget.timing_samples,
-            budget.deadline_seconds,
-            _make_plan_evaluator(prepared, reference, output_dir),
+    with torch.no_grad():
+        reference = prepared.forward(*prepared.example_inputs)
+    if scheduler == "auto":
+        phase_result = _search_scheduler(
+            graph,
+            selected_target,
+            policy,
+            budget,
+            prepared,
+            reference,
+            output_dir,
+            "phase",
         )
-
-    result = search_plans(graph, selected_target, policy, budget)
+        event_result = _search_scheduler(
+            graph,
+            selected_target,
+            policy,
+            budget,
+            prepared,
+            reference,
+            output_dir,
+            "region-events",
+        )
+        choices = (phase_result, event_result)
+        chosen = min(
+            (result for result in choices if result.selected is not None),
+            key=_selected_median,
+            default=phase_result,
+        )
+        result = PlanSearchResult(
+            chosen.selected,
+            chosen.selected_compiled,
+            tuple(
+                candidate
+                for labeled in choices
+                for candidate in labeled.candidates
+            ),
+            tuple(
+                rejection
+                for labeled in choices
+                for rejection in labeled.rejections
+            ),
+            any(labeled.budget_exhausted for labeled in choices),
+            chosen.selected_description,
+        )
+    else:
+        result = _search_scheduler(
+            graph,
+            selected_target,
+            policy,
+            budget,
+            prepared,
+            reference,
+            output_dir,
+            scheduler,
+        )
     if result.selected is None or result.selected_compiled is None:
         reasons = "; ".join(
             f"{candidate.description}: {candidate.reason or candidate.status}"
@@ -114,7 +179,11 @@ def compile_post_grad(
     compiled = result.selected_compiled
     result = replace(result, selected=compiled.plan)
     compiled = replace(compiled, search=result)
-    return bind_callable(compiled, prepared.context)
+    if compiled.event_schedule is not None:
+        compiled.ready.zero_()
+    forward = bind_callable(compiled, prepared.context)
+    forward.megabake_compile_us = (time.perf_counter() - compile_started) * 1_000_000
+    return forward
 
 
 def compile_plan(
@@ -122,7 +191,10 @@ def compile_plan(
     example_inputs: Sequence[Any],
     *,
     output_dir: Path | str | None = None,
+    scheduler: str = "phase",
 ) -> CompiledKernel:
+    if scheduler not in {"phase", "region-events"}:
+        raise ValueError("compile_plan scheduler must be 'phase' or 'region-events'")
     _reject_invalid_plan(plan)
     if plan.graph is None:
         raise CompilerError(
@@ -145,12 +217,45 @@ def compile_plan(
     with torch.cuda.device(device):
         artifact_dir = Path(output_dir) if output_dir is not None else Path("artifacts/generated")
         input_tensors = _input_tensors(plan.graph, example_inputs)
+        event_schedule = (
+            make_region_event_schedule(
+                plan.selection,
+                plan.dependencies,
+                worker_count=plan.launch.grid_size,
+            )
+            if scheduler == "region-events"
+            else None
+        )
         current_plan = plan
         seen_workers = {current_plan.launch.grid_size}
         for _ in range(4):
-            generated = emit_cute(current_plan, artifact_dir)
+            if (
+                event_schedule is not None
+                and event_schedule.worker_count != current_plan.launch.grid_size
+            ):
+                event_schedule = make_region_event_schedule(
+                    current_plan.selection,
+                    current_plan.dependencies,
+                    worker_count=current_plan.launch.grid_size,
+                )
+            generated = emit_cute(
+                current_plan, artifact_dir, event_schedule=event_schedule
+            )
             module = _load_generated_module(generated)
-            state = _RuntimeState.create(current_plan, generated, input_tensors)
+            state = _RuntimeState.create(
+                current_plan,
+                generated,
+                input_tensors,
+                ready=(
+                    torch.zeros(
+                        len(event_schedule.events),
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                    if event_schedule is not None
+                    else None
+                ),
+            )
             compiled = cute.compile(module.launch, *state.compile_arguments)
             resources = _query_resources(
                 compiled,
@@ -199,7 +304,11 @@ def compile_plan(
                 ),
             )
             try:
-                admission = admit_runtime(current_plan)
+                admission = (
+                    admit_event_runtime(event_schedule)
+                    if event_schedule is not None
+                    else admit_runtime(current_plan)
+                )
             except Exception as error:
                 raise CompilerError(
                     CompilerDiagnostic(
@@ -227,6 +336,7 @@ def compile_plan(
                 compiled,
                 resources,
                 admission,
+                event_schedule,
                 input_order,
                 parameter_names,
                 parameter_tensors,
@@ -278,7 +388,9 @@ def bind_callable(
     state: _RuntimeState | None = None
     next_epoch = 0
     epoch_stride = (
-        max(
+        1
+        if compiled_kernel.event_schedule is not None
+        else max(
             (phase.index for phase in compiled_kernel.plan.phases if phase.barrier is not None),
             default=-1,
         )
@@ -350,14 +462,25 @@ def bind_callable(
                 arguments = state.arguments(epoch, cuda.CUstream(stream.cuda_stream))
                 compiled_kernel.compiled(*arguments)
 
-            invocation = execute_phase_plan(
-                compiled_kernel.plan,
-                kernel,
-                active_stream,
-                admission=compiled_kernel.admission,
-                ready=state.ready,
-                epoch=next_epoch,
-            )
+            if compiled_kernel.event_schedule is None:
+                invocation = execute_phase_plan(
+                    compiled_kernel.plan,
+                    kernel,
+                    active_stream,
+                    admission=compiled_kernel.admission,
+                    ready=state.ready,
+                    epoch=next_epoch,
+                )
+            else:
+                invocation = execute_event_plan(
+                    compiled_kernel.event_schedule,
+                    kernel,
+                    active_stream,
+                    admission=compiled_kernel.admission,
+                    events=state.ready,
+                    epoch=next_epoch,
+                    validate_counters=False,
+                )
             outputs = tuple(
                 state.tensor_for_value(value_id) for value_id in graph.outputs
             )
@@ -376,7 +499,10 @@ def bind_callable(
             )
             next_epoch += epoch_stride
             if next_epoch > 2**31 - 1 - epoch_stride:
-                state.reset_ready()
+                if compiled_kernel.event_schedule is None:
+                    state.reset_ready()
+                else:
+                    state.ready.zero_()
                 next_epoch = 0
             return pytree.tree_unflatten(
                 outputs,
@@ -412,11 +538,15 @@ def _make_plan_evaluator(
     prepared: PreparedFX,
     reference: Any,
     output_dir: Path | str | None,
+    scheduler: str = "phase",
 ):
     def evaluate(plan: KernelPlan, budget: SearchBudget) -> PlanMeasurement:
         try:
             compiled = compile_plan(
-                plan, prepared.example_inputs, output_dir=output_dir
+                plan,
+                prepared.example_inputs,
+                output_dir=output_dir,
+                scheduler=scheduler,
             )
             executable = bind_callable(compiled, prepared.context)
             with torch.no_grad():
@@ -450,6 +580,50 @@ def _make_plan_evaluator(
             return PlanMeasurement(error=f"{type(error).__name__}: {error}")
 
     return evaluate
+
+
+def _search_scheduler(
+    graph: ComputeGraph,
+    target: TargetFacts,
+    policy: Any | None,
+    budget: SearchBudget,
+    prepared: PreparedFX,
+    reference: Any,
+    output_dir: Path | str | None,
+    scheduler: str,
+):
+    evaluator = (
+        budget.evaluator
+        if scheduler == "phase" and budget.evaluator is not None
+        else _make_plan_evaluator(prepared, reference, output_dir, scheduler)
+    )
+    scheduler_budget = replace(
+        budget,
+        evaluator=evaluator,
+    )
+    result = search_plans(graph, target, policy, scheduler_budget)
+    prefix = f"scheduler={scheduler}; "
+    return replace(
+        result,
+        candidates=tuple(
+            replace(candidate, description=prefix + candidate.description)
+            for candidate in result.candidates
+        ),
+        selected_description=(
+            None
+            if result.selected_description is None
+            else prefix + result.selected_description
+        ),
+    )
+
+
+def _selected_median(result: Any) -> float:
+    for candidate in result.candidates:
+        if candidate.plan is result.selected and candidate.measurement is not None:
+            median_value = candidate.measurement.median_complete_call_us
+            if median_value is not None:
+                return median_value
+    return float("inf")
 
 
 def _complete_call_samples(

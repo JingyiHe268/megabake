@@ -19,6 +19,16 @@ def test_make_backend_rejects_invalid_mode():
         make_backend(mode="training")
 
 
+def test_make_backend_rejects_invalid_scheduler():
+    with pytest.raises(ValueError, match="scheduler must be"):
+        make_backend(scheduler="tile-events")
+
+
+def test_make_backend_defaults_to_measured_scheduler_selection():
+    backend = make_backend()
+    assert backend.megabake_options["scheduler"] == "auto"
+
+
 def test_make_backend_rejects_training_inputs():
     model = Model().eval()
     value = torch.randn(2, 4, requires_grad=True)

@@ -404,15 +404,17 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Implement in:** the body or schedule component identified by the measurements.
 
-- [ ] Measure equivalent eager, CUDA Graph reference, `torch.compile`, and MegaBake invocations. Match inputs, outputs, precision, and GPU resources.
-- [ ] Record warm GPU and complete host-call latency. Separate compilation, setup, packing, and first-call costs.
-- [ ] Attribute losses to body throughput, traffic, padding, restart, conversions, waits, or occupancy.
-- [ ] Change the component responsible for the dominant loss. Repeat the complete MLP comparison.
-- [ ] Record G1 pass or hold for each regime. Require an improvement beyond measurement noise before broad model expansion.
+- [x] Measure equivalent eager, CUDA Graph reference, `torch.compile`, and MegaBake invocations. Match inputs, outputs, precision, and GPU resources.
+- [x] Record warm GPU and complete host-call latency. Separate compilation, setup, packing, and first-call costs.
+- [x] Attribute losses to body throughput, traffic, padding, restart, conversions, waits, or occupancy.
+- [x] Change the component responsible for the dominant loss. Repeat the complete MLP comparison.
+- [x] Record G1 pass or hold for each regime. Require an improvement beyond measurement noise before broad model expansion.
 
 **Output:** a useful compiler-generated MLP on each passing target, with its remaining failures visible.
 
 **Check:** include the resource cost of the full body mixture. Complete G0 integration and G1 evidence before proceeding to wider coverage.
+
+**Evidence:** [Task 20 measured scheduler evidence](artifacts/task20/README.md). Automatic phase/event selection improves the measured complete MLP by 15.4% at batch 4 and 25.2% at batch 256, but G1 remains on hold because CUDA Graph replay is still substantially faster.
 
 ## 21. Cache compiled plans while retaining live bindings
 

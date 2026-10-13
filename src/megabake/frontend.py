@@ -272,6 +272,11 @@ def _validate_options(options: Mapping[str, Any]) -> dict[str, Any]:
     compile_kernel = options.get("compile_kernel", None)
     if compile_kernel not in {None, True, False}:
         raise TypeError("compile_kernel must be True, False, or None for automatic")
+    scheduler = options.get("scheduler", "auto")
+    if scheduler not in {"phase", "region-events", "auto"}:
+        raise ValueError(
+            "scheduler must be 'phase', 'region-events', or 'auto'"
+        )
     return {
         "mode": mode,
         "fallback": fallback,
@@ -279,6 +284,7 @@ def _validate_options(options: Mapping[str, Any]) -> dict[str, Any]:
         "model_name": model_name,
         "dump_dir": dump_dir,
         "compile_kernel": compile_kernel,
+        "scheduler": scheduler,
     }
 
 
@@ -524,6 +530,7 @@ def make_backend(**options: Any) -> Callable[..., Any]:
                     if validated_options["dump_dir"] is not None
                     else None
                 ),
+                scheduler=validated_options["scheduler"],
             )
             forward = compiled
             prepared.context.requirements["execution"] = "megakernel"
@@ -533,6 +540,7 @@ def make_backend(**options: Any) -> Callable[..., Any]:
         forward.megabake_cache = cache
         if compiled is not None:
             backend.megabake_last_compiled = compiled.megabake_compiled
+            backend.megabake_last_compile_us = forward.megabake_compile_us
             backend.megabake_last_trace = forward.megabake_trace
         return forward
 

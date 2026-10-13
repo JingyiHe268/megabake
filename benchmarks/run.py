@@ -30,11 +30,42 @@ def _first_call(function, *arguments):
     }
 
 
+def _capture_cuda_graph(function, *arguments):
+    started = time.perf_counter()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            function(*arguments)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = function(*arguments)
+    return graph, result, {"capture_us": (time.perf_counter() - started) * 1_000_000}
+
+
+def _relative_l2(actual, expected):
+    actual_values = tuple(actual)
+    expected_values = tuple(expected)
+    if len(actual_values) != len(expected_values):
+        return float("inf")
+    numerator = 0.0
+    denominator = 0.0
+    for actual_value, expected_value in zip(actual_values, expected_values):
+        difference = actual_value.float() - expected_value.float()
+        numerator += difference.pow(2).sum().item()
+        denominator += expected_value.float().pow(2).sum().item()
+    return (numerator / denominator) ** 0.5 if denominator else float("inf")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, default=Path("artifacts/task16/mlp.json"))
     parser.add_argument("--traces", type=Path, default=Path("artifacts/task16/traces"))
     parser.add_argument("--batches", type=int, nargs="+", default=[1, 256])
+    parser.add_argument(
+        "--scheduler", choices=("auto", "phase", "region-events"), default="auto"
+    )
     arguments = parser.parse_args()
 
     torch.manual_seed(16)
@@ -56,6 +87,10 @@ def main() -> None:
         )
         inputs = (source, *weights)
         reference, eager_first = _first_call(mlp, *inputs)
+        graph, graph_result, graph_setup = _capture_cuda_graph(mlp, *inputs)
+        graph.replay()
+        graph_error = _relative_l2(graph_result, reference)
+        _, graph_first_replay = _first_call(lambda: graph.replay())
         inductor = torch.compile(
             mlp,
             fullgraph=True,
@@ -63,10 +98,14 @@ def main() -> None:
             mode="max-autotune-no-cudagraphs",
         )
         inductor_result, inductor_first = _first_call(inductor, *inputs)
-        backend = make_backend()
+        backend_setup_started = time.perf_counter()
+        backend = make_backend(scheduler=arguments.scheduler)
+        backend_setup_us = (time.perf_counter() - backend_setup_started) * 1_000_000
+        wrapper_setup_started = time.perf_counter()
         compiled = torch.compile(
             mlp, backend=backend, fullgraph=True, dynamic=False
         )
+        wrapper_setup_us = (time.perf_counter() - wrapper_setup_started) * 1_000_000
         result, megabake_first = _first_call(compiled, *inputs)
         error = (
             (result.float() - reference.float()).norm() / reference.float().norm()
@@ -79,15 +118,29 @@ def main() -> None:
             raise RuntimeError(f"MLP relative error {error}")
         if inductor_error >= 0.01:
             raise RuntimeError(f"Inductor MLP relative error {inductor_error}")
+        if graph_error >= 0.01:
+            raise RuntimeError(f"CUDA Graph MLP relative error {graph_error}")
 
         record = {
             "batch_size": batch_size,
             "relative_l2_error": error,
             "inductor_relative_l2_error": inductor_error,
+            "cuda_graph_relative_l2_error": graph_error,
+            "cuda_graph_setup": graph_setup,
+            "cuda_graph_first_replay": graph_first_replay,
             "eager_first_call": eager_first,
             "inductor_first_call": inductor_first,
             "megabake_first_call": megabake_first,
+            "megabake_cost_breakdown": {
+                "backend_setup_us": backend_setup_us,
+                "dynamo_wrapper_setup_us": wrapper_setup_us,
+                "megabake_compilation_us": getattr(
+                    backend, "megabake_last_compile_us", None
+                ),
+                "first_call_host_us": megabake_first["host_us"],
+            },
             "eager": event_samples(lambda: mlp(*inputs)),
+            "cuda_graph": event_samples(lambda: graph.replay()),
             "inductor": event_samples(lambda: inductor(*inputs)),
             "megabake": event_samples(lambda: compiled(*inputs)),
         }
@@ -96,6 +149,7 @@ def main() -> None:
             record["plan_search"] = search.report()
         functions = {
             "eager": lambda: mlp(*inputs),
+            "cuda_graph": lambda: graph.replay(),
             "inductor": lambda: inductor(*inputs),
             "megabake": lambda: compiled(*inputs),
         }
@@ -120,6 +174,7 @@ def main() -> None:
                         {
                             "batch_size": record["batch_size"],
                             "eager": record["eager"],
+                            "cuda_graph": record["cuda_graph"],
                             "inductor": record["inductor"],
                             "eager_first_call": record["eager_first_call"],
                             "inductor_first_call": record["inductor_first_call"],
@@ -137,6 +192,9 @@ def main() -> None:
                 {
                     "batch_size": batch_size,
                     "eager_complete_us": record["eager"]["complete_call_us"],
+                    "cuda_graph_complete_us": record["cuda_graph"][
+                        "complete_call_us"
+                    ],
                     "inductor_complete_us": record["inductor"]["complete_call_us"],
                     "megabake_complete_us": record["megabake"]["complete_call_us"],
                     "megabake_kernel_duration_us": record["megabake"][
