@@ -227,11 +227,11 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Implement in:** `plan.py`, with `select_bodies(graph, target, policy)` and `make_tile_maps(selection)`.
 
-- [ ] Start with one valid measured configuration per supported region. Keep rejected candidates and reasons in the plan report.
-- [ ] Map output tiles to logical tensor coordinates. Derive complete input domains, including contraction reduction dimensions.
-- [ ] Map logical coordinates to physical layouts through CuTe. Adapt relevant Mirage stride, copy, and swizzle checks.
-- [ ] Insert an explicit conversion body when adjacent layouts need data movement. Include its cost and dependencies.
-- [ ] Store participants and resource requirements with each chosen body.
+- [x] Start with one valid measured configuration per supported region. Keep rejected candidates and reasons in the plan report.
+- [x] Map output tiles to logical tensor coordinates. Derive complete input domains, including contraction reduction dimensions.
+- [x] Map logical coordinates to physical layouts through CuTe. Adapt relevant Mirage stride, copy, and swizzle checks.
+- [x] Insert an explicit conversion body when adjacent layouts need data movement. Include its cost and dependencies.
+- [x] Store participants and resource requirements with each chosen body.
 
 **Output:** selected bodies with concrete access maps and physical layout requirements.
 

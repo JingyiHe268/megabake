@@ -14,6 +14,7 @@ from .lowering import (
 )
 from .regions import dump_region_graph, form_regions
 from .bodies import BodyConfig, SelectionPolicy, TargetFacts, get_candidates
+from .plan import BodySelectionPlan, make_tile_maps, select_bodies
 
 __all__ = [
     "CaptureCache",
@@ -31,6 +32,9 @@ __all__ = [
     "SelectionPolicy",
     "TargetFacts",
     "get_candidates",
+    "BodySelectionPlan",
+    "make_tile_maps",
+    "select_bodies",
     "make_backend",
     "prepare_fx_graph",
 ]
