@@ -76,7 +76,7 @@ def cooperative_worker_loop(
     for phase_index, run_phase, drain, publish in phases:
         run_phase()
         drain()
-        publish(epoch_base + phase_index)
+        publish(epoch_base)
 
 
 class PhaseKernel(Protocol):
@@ -142,26 +142,33 @@ def execute_phase_plan(
     plan: KernelPlan,
     kernel: PhaseKernel,
     stream: torch.cuda.Stream | None = None,
+    *,
+    admission: RuntimeAdmission | None = None,
+    ready: torch.Tensor | None = None,
+    epoch: int | None = None,
 ) -> RuntimeInvocation:
     active_stream = stream or torch.cuda.current_stream()
     device = active_stream.device
     with torch.cuda.device(device):
-        admission = admit_runtime(plan)
+        selected_admission = admission or admit_runtime(plan)
     invocation_id = uuid.uuid4()
 
     if _stream_is_capturing(active_stream):
         raise InvalidRuntime("CUDA Graph capture is not supported for phase plans")
     with torch.cuda.stream(active_stream):
-        ready = torch.full(
+        selected_ready = ready if ready is not None else torch.full(
             (plan.launch.grid_size + 1,),
             -1,
             dtype=torch.int32,
             device=device,
         )
-        kernel(ready, 0, active_stream)
+        selected_epoch = 0 if epoch is None else epoch
+        kernel(selected_ready, selected_epoch, active_stream)
         active_stream.synchronize()
 
-    return RuntimeInvocation(invocation_id, 0, admission.barrier_count)
+    return RuntimeInvocation(
+        invocation_id, selected_epoch, selected_admission.barrier_count
+    )
 
 
 def _architecture_number(architecture: str) -> str:

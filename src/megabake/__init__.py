@@ -14,7 +14,8 @@ from .lowering import (
 )
 from .regions import dump_region_graph, form_regions
 from .bodies import BodyConfig, SelectionPolicy, TargetFacts, get_candidates
-from .plan import BodySelectionPlan, KernelPlan, make_tile_maps, select_bodies
+from .plan import BodySelectionPlan, KernelPlan
+from .planner import make_tile_maps, select_bodies
 from .memory import assign_storage, verify_plan
 from .codegen import emit_cute
 from .compiler import (

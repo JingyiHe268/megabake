@@ -14,8 +14,8 @@ from .plan import (
     ResourceRequirements,
     SelectedBody,
     TileMap,
-    make_tile_maps,
 )
+from .planner import make_tile_maps
 
 
 class InvalidSchedule(ValueError):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from importlib.util import module_from_spec, spec_from_file_location
+import threading
 import sys
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -23,7 +24,7 @@ from .graph import ComputeGraph, import_fx
 from .lowering import canonicalize_semantics
 from .memory import assign_storage, verify_plan
 from .plan import KernelPlan
-from .plan import select_bodies
+from .planner import select_bodies
 from .regions import form_regions
 from .runtime import RuntimeAdmission, admit_runtime, execute_phase_plan
 from .schedule import derive_dependencies, make_phase_schedule
@@ -54,6 +55,8 @@ class CompiledKernel:
     input_order: tuple[str, ...]
     parameter_names: frozenset[str]
     parameter_tensors: Mapping[str, torch.Tensor]
+    ready: torch.Tensor
+    work_iterators: Mapping[str, torch.Tensor]
 
 
 @dataclass(frozen=True)
@@ -183,6 +186,7 @@ def compile_plan(
                 if isinstance(value, torch.nn.Parameter)
             }
             parameter_names = frozenset(parameter_tensors)
+            torch.cuda.synchronize(device)
             return CompiledKernel(
                 current_plan,
                 generated,
@@ -192,6 +196,8 @@ def compile_plan(
                 input_order,
                 parameter_names,
                 parameter_tensors,
+                state.ready,
+                state.work_iterators,
             )
 
     raise CompilerError(
@@ -234,8 +240,20 @@ def bind_callable(
         index for index in range(len(context.input_order)) if index not in parameter_positions
     ]
     trace: list[CallableTrace] = []
+    runtime_lock = threading.Lock()
+    state: _RuntimeState | None = None
+    next_epoch = 0
+    epoch_stride = (
+        max(
+            (phase.index for phase in compiled_kernel.plan.phases if phase.barrier is not None),
+            default=-1,
+        )
+        + 1
+    )
+    epoch_stride = max(epoch_stride, 1)
 
     def forward(*args: Any, **kwargs: Any) -> Any:
+        nonlocal state, next_epoch
         if kwargs:
             raise CompilerError(
                 CompilerDiagnostic(
@@ -275,35 +293,61 @@ def bind_callable(
                 )
             )
 
-        input_tensors = _input_tensors(graph, full_inputs)
-        active_stream = torch.cuda.current_stream(
-            next(iter(input_tensors.values())).device
-        )
-
-        state = _RuntimeState.create(
-            compiled_kernel.plan, compiled_kernel.generated, input_tensors
-        )
-
-        def kernel(ready: torch.Tensor, epoch: int, stream: torch.cuda.Stream) -> None:
-            arguments = state.arguments(epoch, cuda.CUstream(stream.cuda_stream))
-            compiled_kernel.compiled(*arguments)
-
-        invocation = execute_phase_plan(compiled_kernel.plan, kernel, active_stream)
-        outputs = tuple(state.tensor_for_value(value_id) for value_id in graph.outputs)
-        trace.append(
-            CallableTrace(
-                invocation.invocation_id,
-                invocation.epoch,
-                active_stream,
-                tuple(tensor.data_ptr() for tensor in input_tensors.values()),
-                tuple(
-                    output.data_ptr()
-                    for output in outputs
-                    if isinstance(output, torch.Tensor)
-                ),
+        with runtime_lock:
+            input_tensors = _input_tensors(graph, full_inputs)
+            active_stream = torch.cuda.current_stream(
+                next(iter(input_tensors.values())).device
             )
-        )
-        return pytree.tree_unflatten(outputs, context.runtime_output_tree_spec or context.output_tree_spec)
+
+            if state is None:
+                state = _RuntimeState.create(
+                    compiled_kernel.plan,
+                    compiled_kernel.generated,
+                    input_tensors,
+                    ready=compiled_kernel.ready,
+                    work_iterators=compiled_kernel.work_iterators,
+                )
+            else:
+                state.rebind(input_tensors)
+
+            def kernel(
+                ready: torch.Tensor, epoch: int, stream: torch.cuda.Stream
+            ) -> None:
+                arguments = state.arguments(epoch, cuda.CUstream(stream.cuda_stream))
+                compiled_kernel.compiled(*arguments)
+
+            invocation = execute_phase_plan(
+                compiled_kernel.plan,
+                kernel,
+                active_stream,
+                admission=compiled_kernel.admission,
+                ready=state.ready,
+                epoch=next_epoch,
+            )
+            outputs = tuple(
+                state.tensor_for_value(value_id) for value_id in graph.outputs
+            )
+            trace.append(
+                CallableTrace(
+                    invocation.invocation_id,
+                    invocation.epoch,
+                    active_stream,
+                    tuple(tensor.data_ptr() for tensor in input_tensors.values()),
+                    tuple(
+                        output.data_ptr()
+                        for output in outputs
+                        if isinstance(output, torch.Tensor)
+                    ),
+                )
+            )
+            next_epoch += epoch_stride
+            if next_epoch > 2**31 - 1 - epoch_stride:
+                state.reset_ready()
+                next_epoch = 0
+            return pytree.tree_unflatten(
+                outputs,
+                context.runtime_output_tree_spec or context.output_tree_spec,
+            )
 
     forward.megabake_compiled = compiled_kernel
     forward.megabake_trace = trace
@@ -598,11 +642,11 @@ class _RuntimeState:
         generated: GeneratedCuTeModule,
         input_tensors: Mapping[str, torch.Tensor],
         ready: torch.Tensor,
-        work_iterators: tuple[torch.Tensor, ...],
+        work_iterators: Mapping[str, torch.Tensor],
         workspace: Mapping[str, torch.Tensor],
         outputs: Mapping[str, torch.Tensor],
         values: Mapping[str, torch.Tensor],
-        g0_tensors: tuple[torch.Tensor, ...],
+        g0_tensors: tuple[tuple[torch.Tensor, ...], ...],
     ):
         self.plan = plan
         self.generated = generated
@@ -613,6 +657,19 @@ class _RuntimeState:
         self.outputs = outputs
         self.values = values
         self.g0_tensors = g0_tensors
+        self._normal_view_cache: dict[str, tuple[tuple[Any, ...], Any]] = {}
+        self._work_iterator_view_cache: dict[
+            str, tuple[tuple[Any, ...], Any]
+        ] = {}
+        self._g0_view_cache: dict[
+            int, tuple[tuple[tuple[Any, ...], ...], tuple[Any, ...]]
+        ] = {}
+        self._ready_view: tuple[torch.Tensor, Any] | None = None
+        self._max_active_clusters = (
+            cutlass.utils.HardwareInfo().get_max_active_clusters(1)
+            if "max_active_clusters" in generated.launch.arguments
+            else None
+        )
 
     @classmethod
     def create(
@@ -621,6 +678,7 @@ class _RuntimeState:
         generated: GeneratedCuTeModule,
         input_tensors: Mapping[str, torch.Tensor],
         ready: torch.Tensor | None = None,
+        work_iterators: Mapping[str, torch.Tensor] | None = None,
     ) -> _RuntimeState:
         if plan.graph is None:
             raise CompilerError(
@@ -638,16 +696,54 @@ class _RuntimeState:
                 dtype=torch.int32,
                 device=device,
             )
-        work_iterators = tuple(
-            torch.arange(iterator.length, device=device, dtype=torch.int64)
-            * iterator.step
-            for iterator in generated.launch.work_iterators
-        )
+        if work_iterators is None:
+            work_iterators = {
+                iterator.name: torch.arange(
+                    0,
+                    iterator.length * iterator.step,
+                    iterator.step,
+                    device=device,
+                    dtype=torch.int64,
+                )
+                for iterator in generated.launch.work_iterators
+            }
         workspace: dict[str, torch.Tensor] = {}
         for assignment in plan.storage.workspace:
             if assignment.storage_id in workspace:
                 continue
             workspace[assignment.storage_id] = _allocate(assignment.layout, device)
+        state = cls(
+            plan,
+            generated,
+            input_tensors,
+            ready,
+            work_iterators,
+            workspace,
+            {},
+            {},
+            (),
+        )
+        state._refresh_values(input_tensors)
+        return state
+
+    def rebind(self, input_tensors: Mapping[str, torch.Tensor]) -> None:
+        self._refresh_values(input_tensors)
+
+    def reset_ready(self) -> None:
+        self.ready.fill_(-1)
+
+    def _refresh_values(self, input_tensors: Mapping[str, torch.Tensor]) -> None:
+        plan = self.plan
+        if plan.graph is None:
+            raise CompilerError(
+                CompilerDiagnostic(
+                    "runtime-binding",
+                    "plan is missing its source graph",
+                    requirement="source graph",
+                )
+            )
+        device = next(iter(input_tensors.values())).device
+        workspace = self.workspace
         values: dict[str, torch.Tensor] = {}
         for binding in plan.storage.bindings:
             if binding.storage_id in workspace:
@@ -683,30 +779,24 @@ class _RuntimeState:
                     )
                 )
         g0_tensors = tuple(
-            tensor
-            for phase in plan.phases
-            if phase.body.provider == "g0_range"
-            for selected in plan.selection.selections
-            if selected.region_id == phase.region_id
-            for tensor in (
+            (
                 *(
-                    _g0_source_tensor(load.value_id, plan.graph, input_tensors)
+                    _g0_source_tensor(load.value_id, plan.graph, input_tensors, values)
                     for load in selected.program.loads
                 ),
                 values[selected.program.store.value_id],
             )
+            for phase in plan.phases
+            if phase.body.provider == "g0_range"
+            for selected in plan.selection.selections
+            if selected.region_id == phase.region_id
         )
-        return cls(
-            plan,
-            generated,
-            input_tensors,
-            ready,
-            work_iterators,
-            workspace,
-            {value_id: values[value_id] for value_id in plan.graph.outputs},
-            values,
-            g0_tensors,
-        )
+        self.input_tensors = input_tensors
+        self.values = values
+        self.outputs = {
+            value_id: values[value_id] for value_id in plan.graph.outputs
+        }
+        self.g0_tensors = g0_tensors
 
     def tensor_for_value(self, value_id: str) -> torch.Tensor:
         return self.values[value_id]
@@ -720,31 +810,47 @@ class _RuntimeState:
         self, epoch: int, stream: cuda.CUstream, *, include_constants: bool = False
     ) -> tuple[Any, ...]:
         normal_views = {
-            argument.name: _cute_view(self.values[argument.value_id])
+            argument.name: self._cached_view(
+                self._normal_view_cache,
+                argument.name,
+                self.values[argument.value_id],
+            )
             for argument in self.generated.launch.tensors
             if not argument.kind.startswith("g0_")
         }
-        g0_views = cute_gemm_tensors(*self.g0_tensors) if self.g0_tensors else ()
+        g0_views = tuple(
+            view
+            for group_index, tensors in enumerate(self.g0_tensors)
+            for view in self._cached_gemm_tensors(group_index, tensors)
+        )
         g0_names = [
             argument.name
             for argument in self.generated.launch.tensors
             if argument.kind.startswith("g0_")
         ]
         g0_by_name = dict(zip(g0_names, g0_views, strict=True))
-        max_active_clusters = None
-        if "max_active_clusters" in self.generated.launch.arguments:
-            max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(1)
+        max_active_clusters = self._max_active_clusters
         arguments = []
         for name in self.generated.launch.arguments:
             if name == "ready":
-                arguments.append(_cute_view(self.ready))
+                if (
+                    self._ready_view is None
+                    or self._ready_view[0] is not self.ready
+                ):
+                    self._ready_view = (self.ready, _cute_view(self.ready))
+                arguments.append(self._ready_view[1])
             elif name == "workers":
                 arguments.append(cutlass.Int32(self.plan.launch.grid_size))
             elif name == "epoch":
                 arguments.append(cutlass.Int32(epoch))
             elif name.startswith("work_iterator_"):
-                iterator_index = int(name.rsplit("_", 1)[1]) - 1
-                arguments.append(_cute_view(self.work_iterators[iterator_index]))
+                arguments.append(
+                    self._cached_view(
+                        self._work_iterator_view_cache,
+                        name,
+                        self.work_iterators[name],
+                    )
+                )
             elif name in normal_views:
                 arguments.append(normal_views[name])
             elif name in g0_by_name:
@@ -763,6 +869,35 @@ class _RuntimeState:
                     )
                 )
         return tuple(arguments)
+
+    @staticmethod
+    def _cached_view(
+        cache: dict[Any, tuple[tuple[Any, ...], Any]], key: Any, tensor: torch.Tensor
+    ) -> Any:
+        entry = cache.get(key)
+        identity = _tensor_identity(tensor)
+        if entry is None or entry[0] != identity:
+            entry = (identity, _cute_view(tensor))
+            cache[key] = entry
+        return entry[1]
+
+    def _cached_gemm_tensors(
+        self, group_index: int, tensors: tuple[torch.Tensor, ...]
+    ) -> tuple[Any, ...]:
+        entry = self._g0_view_cache.get(group_index)
+        identities = tuple(_tensor_identity(tensor) for tensor in tensors)
+        if (
+            entry is None
+            or len(entry[0]) != len(tensors)
+            or any(old != new for old, new in zip(entry[0], identities))
+        ):
+            entry = (identities, cute_gemm_tensors(*tensors))
+            self._g0_view_cache[group_index] = entry
+        return entry[1]
+
+
+def _tensor_identity(tensor: torch.Tensor) -> tuple[Any, ...]:
+    return (tensor.data_ptr(), tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype)
 
 
 def _allocate(layout: Any, device: torch.device) -> torch.Tensor:
@@ -808,19 +943,8 @@ def _g0_source_tensor(
     value_id: str,
     graph: ComputeGraph,
     input_tensors: Mapping[str, torch.Tensor],
-    seen: set[str] | None = None,
+    value_tensors: Mapping[str, torch.Tensor],
 ) -> torch.Tensor:
-    seen = seen or set()
-    if value_id in seen:
-        raise CompilerError(
-            CompilerDiagnostic(
-                "runtime-binding",
-                f"GEMM input {value_id} has a cyclic alias",
-                (value_id,),
-                requirement="acyclic boundary alias",
-            )
-        )
-    seen.add(value_id)
     if value_id in input_tensors:
         return input_tensors[value_id].detach()
     value = graph.values.get(value_id)
@@ -836,10 +960,46 @@ def _g0_source_tensor(
     for alias in value.storage_relation.aliases:
         if alias in input_tensors:
             return input_tensors[alias].detach()
-        return _g0_source_tensor(alias, graph, input_tensors, seen)
+        return _g0_source_tensor(alias, graph, input_tensors, value_tensors)
+    return _g0_value_source_tensor(value_id, graph, value_tensors)
+
+
+def _g0_value_source_tensor(
+    value_id: str,
+    graph: ComputeGraph,
+    value_tensors: Mapping[str, torch.Tensor],
+    seen: set[str] | None = None,
+) -> torch.Tensor:
+    seen = seen or set()
+    if value_id in seen:
+        raise CompilerError(
+            CompilerDiagnostic(
+                "runtime-binding",
+                f"GEMM input {value_id} has a cyclic alias",
+                (value_id,),
+                requirement="acyclic boundary alias",
+            )
+        )
+    seen.add(value_id)
+    if value_id in value_tensors:
+        return value_tensors[value_id].detach()
+    value = graph.values.get(value_id)
+    if value is None:
+        raise CompilerError(
+            CompilerDiagnostic(
+                "runtime-binding",
+                f"GEMM input {value_id} is missing",
+                (value_id,),
+                requirement="GEMM input binding",
+            )
+        )
+    for alias in value.storage_relation.aliases:
+        if alias in value_tensors:
+            return value_tensors[alias].detach()
+        return _g0_value_source_tensor(alias, graph, value_tensors, seen)
     storage_id = value.storage_relation.storage_id
-    if storage_id in input_tensors:
-        return input_tensors[storage_id].detach()
+    if storage_id in value_tensors:
+        return value_tensors[storage_id].detach()
     raise CompilerError(
         CompilerDiagnostic(
             "runtime-binding",

@@ -329,15 +329,17 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Implement in:** the existing importers and providers; add a complete MLP fixture under `tests`.
 
-- [ ] Capture gate/up projections, SiLU, multiplication, and down projection as one invocation.
-- [ ] Add only the missing primitive import rules. Keep all casts and externally visible intermediate outputs.
-- [ ] Compile the graph through normal region selection and planning. Use the initial phase schedule.
-- [ ] Compare small-M and larger-M cases with the native graph. Trace all recurring work.
-- [ ] Record a first complete-call performance report using the existing MLP baseline harness.
+- [x] Capture gate/up projections, SiLU, multiplication, and down projection as one invocation.
+- [x] Add only the missing primitive import rules. Keep all casts and externally visible intermediate outputs.
+- [x] Compile the graph through normal region selection and planning. Use the initial phase schedule.
+- [x] Compare small-M and larger-M cases with the native graph. Trace all recurring work.
+- [x] Record a first complete-call performance report using the existing MLP baseline harness.
 
 **Output:** an automatically compiled complete MLP, with correctness and initial latency results.
 
 **Check:** changing model weights must change outputs without stale bindings. A correct slow result remains a performance gap for steps 17–20.
+
+**Evidence:** [MegaBake complete-call report](artifacts/task16/mlp.json), [native/Inductor baseline](artifacts/task16/mlp_baseline.json), and [recurring-work traces](artifacts/task16/traces). The report records exact correctness, steady-state one-CUDA-kernel execution, complete-call and kernel-only timing, and the remaining phase/body performance gap for steps 17–20.
 
 ## 17. Add legal local fusion and tuned region candidates
 

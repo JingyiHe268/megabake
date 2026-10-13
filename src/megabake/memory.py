@@ -10,8 +10,8 @@ from .plan import (
     CuTeLayout,
     KernelPlan,
     TileMap,
-    _DTYPE_BYTES,
 )
+from .planner import _DTYPE_BYTES, make_tile_maps
 from .schedule import PhaseSchedule, ScheduledPhase
 
 
@@ -272,8 +272,6 @@ def verify_plan(plan: KernelPlan) -> None:
 
 
 def _tile_maps(selection: BodySelectionPlan) -> tuple[TileMap, ...]:
-    from .plan import make_tile_maps
-
     return make_tile_maps(selection)
 
 

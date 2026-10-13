@@ -5,7 +5,7 @@ from dataclasses import replace
 import torch
 import pytest
 
-import megabake.plan as plan_module
+import megabake.planner as planner_module
 from megabake import make_tile_maps, select_bodies
 from megabake.bodies import TargetFacts
 from megabake.frontend import prepare_fx_graph
@@ -139,7 +139,7 @@ def test_make_tile_maps_inserts_layout_conversion_with_cost_and_dependency(
         def forward(self, value):
             return value.relu().sum(dim=-1)
 
-    real_get_candidates = plan_module.get_candidates
+    real_get_candidates = planner_module.get_candidates
 
     def changed_input_layout(region, target, policy):
         result = real_get_candidates(region, target, policy)
@@ -158,7 +158,7 @@ def test_make_tile_maps_inserts_layout_conversion_with_cost_and_dependency(
         )
         return replace(result, configurations=(replace(config, layouts=layouts),))
 
-    monkeypatch.setattr(plan_module, "get_candidates", changed_input_layout)
+    monkeypatch.setattr(planner_module, "get_candidates", changed_input_layout)
     selection = select_bodies(_graph(Model(), torch.randn(2, 3)), _target())
     relu = next(
         selected
