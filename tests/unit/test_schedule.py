@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import torch
 
 from megabake import (
+    admit_event_runtime,
     derive_dependencies,
+    make_event_schedule,
     make_phase_schedule,
     select_bodies,
+    simulate_event_schedule,
     simulate_phase_schedule,
 )
 from megabake.bodies import TargetFacts
@@ -13,7 +18,7 @@ from megabake.frontend import prepare_fx_graph
 from megabake.graph import import_fx
 from megabake.lowering import canonicalize_semantics
 from megabake.regions import form_regions
-from megabake.schedule import DependencyKind
+from megabake.schedule import DependencyKind, DependencyPlan, RegionDependency
 
 
 def _target() -> TargetFacts:
@@ -119,3 +124,133 @@ def test_dependencies_include_all_reduction_input_tiles():
     assert simulation.work_item_counts[schedule.phases[0].region_id] == 4
     assert simulation.work_item_counts[schedule.phases[-1].region_id] == 2
     assert simulation.idle_worker_counts[schedule.phases[-1].region_id] == 2
+
+
+def test_event_schedule_interleaves_fork_join_without_a_phase_barrier():
+    class Model(torch.nn.Module):
+        def forward(self, value):
+            left = torch.relu(value)
+            right = torch.neg(value)
+            return left + right
+
+    value = torch.randn(2, 3)
+    selection, dependencies, _ = _scheduled(Model(), value)
+    schedule = make_event_schedule(
+        selection, dependencies, worker_count=2
+    )
+    join = next(
+        task
+        for task in schedule.tasks
+        if task.region_id == selection.selections[-1].region_id
+    )
+
+    assert [task.order for task in schedule.tasks] == [0, 1, 2]
+    assert all(
+        [
+            schedule.task_for(task_id).order
+            for task_id in worker.task_ids
+        ]
+        == sorted(schedule.task_for(task_id).order for task_id in worker.task_ids)
+        for worker in schedule.workers
+    )
+    assert len(join.wait_event_ids) == 2
+    assert all(event.trigger_count == 1 for event in schedule.events)
+    assert schedule.events
+
+    simulation = simulate_event_schedule(schedule)
+    assert simulation.finish_time == 2
+    assert simulation.phase_finish_time == 3
+    assert simulation.speedup_ticks == 1
+    assert simulation.outputs_match_phase
+    assert simulation.worker_idle_ticks == {0: 0, 1: 1}
+
+    delayed_producer = next(
+        task.id
+        for task in schedule.tasks
+        if task.region_id != join.region_id and task.worker_id == 1
+    )
+    delayed = simulate_event_schedule(schedule, {delayed_producer: 2})
+    assert delayed.finish_time == 4
+    assert delayed.phase_finish_time == 5
+    assert delayed.speedup_ticks == 1
+    assert delayed.worker_idle_ticks == {0: 2, 1: 1}
+    assert delayed.outputs_match_phase
+
+
+def test_event_schedule_groups_exact_reduction_prerequisites():
+    class Model(torch.nn.Module):
+        def forward(self, source, first_weight, second_weight):
+            hidden = source @ first_weight.T
+            return hidden @ second_weight.T
+
+    source = torch.randn(128, 128, dtype=torch.bfloat16)
+    first_weight = torch.randn(256, 128, dtype=torch.bfloat16)
+    second_weight = torch.randn(128, 256, dtype=torch.bfloat16)
+    selection, dependencies, _ = _scheduled(
+        Model(), source, first_weight, second_weight
+    )
+    schedule = make_event_schedule(selection, dependencies)
+
+    assert len(schedule.events) == 2
+    assert sorted(event.trigger_count for event in schedule.events) == [2, 2]
+    assert all(
+        not prerequisite.conservative
+        for event in schedule.events
+        for prerequisite in event.prerequisites
+    )
+    assert len(schedule.prerequisites) == 2
+
+    simulation = simulate_event_schedule(schedule)
+    assert len(simulation.completed_task_ids) == len(schedule.tasks)
+    assert simulation.outputs_match_phase
+    assert admit_event_runtime(schedule).event_count == 2
+
+
+def test_event_schedule_keeps_conservative_state_effects_explicit():
+    class Model(torch.nn.Module):
+        def forward(self, source, first_weight, second_weight):
+            hidden = source @ first_weight.T
+            return hidden @ second_weight.T
+
+    source = torch.randn(128, 128, dtype=torch.bfloat16)
+    first_weight = torch.randn(256, 128, dtype=torch.bfloat16)
+    second_weight = torch.randn(128, 256, dtype=torch.bfloat16)
+    selection, dependencies, _ = _scheduled(
+        Model(), source, first_weight, second_weight
+    )
+    producer = dependencies.dependencies[0].producer_region_id
+    consumer = dependencies.dependencies[0].consumer_region_id
+    state_effect = RegionDependency(
+        producer_region_id=producer,
+        consumer_region_id=consumer,
+        value_id="state",
+        kind=DependencyKind.WRITE_AFTER_READ,
+        producer_tiles=(),
+        consumer_tiles=(),
+        conservative=True,
+        reason="test state effect",
+    )
+    state_dependencies = replace(
+        dependencies,
+        dependencies=(*dependencies.dependencies, state_effect),
+    )
+    assert isinstance(state_dependencies, DependencyPlan)
+    schedule = make_event_schedule(selection, state_dependencies)
+    state_event = next(
+        event
+        for event in schedule.events
+        if any(
+            dependency is state_effect
+            for prerequisite in event.prerequisites
+            for dependency in prerequisite.dependencies
+        )
+    )
+
+    assert state_event.trigger_count == 4
+    assert state_event.consumer_task_ids == tuple(
+        sorted(task.id for task in schedule.tasks if task.region_id == consumer)
+    )
+    assert any(prerequisite.conservative for prerequisite in state_event.prerequisites)
+    simulation = simulate_event_schedule(schedule)
+    assert simulation.outputs_match_phase
+    assert len(simulation.completed_task_ids) == len(schedule.tasks)

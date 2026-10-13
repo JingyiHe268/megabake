@@ -35,11 +35,20 @@ from .compiler import (
     compile_post_grad,
     bind_callable,
 )
-from .runtime import execute_phase_plan, admit_runtime
+from .runtime import (
+    admit_event_runtime,
+    execute_event_plan,
+    execute_phase_plan,
+    admit_runtime,
+)
 from .schedule import (
     DependencyPlan,
+    EventSchedule,
+    EventScheduleSimulation,
     derive_dependencies,
+    make_event_schedule,
     make_phase_schedule,
+    simulate_event_schedule,
     simulate_phase_schedule,
 )
 
@@ -74,6 +83,8 @@ __all__ = [
     "CallableTrace",
     "admit_runtime",
     "execute_phase_plan",
+    "admit_event_runtime",
+    "execute_event_plan",
     "KernelPlan",
     "PlanCandidate",
     "PlanMeasurement",
@@ -81,8 +92,12 @@ __all__ = [
     "SearchBudget",
     "search_plans",
     "DependencyPlan",
+    "EventSchedule",
+    "EventScheduleSimulation",
     "derive_dependencies",
+    "make_event_schedule",
     "make_phase_schedule",
+    "simulate_event_schedule",
     "simulate_phase_schedule",
     "make_backend",
     "prepare_fx_graph",

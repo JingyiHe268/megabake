@@ -31,6 +31,7 @@ from .lowering import (
 )
 from .memory import verify_plan
 from .plan import ConversionBody, KernelPlan, SelectedBody
+from .schedule import EventSchedule
 
 
 class UnsupportedCodegen(ValueError):
@@ -142,13 +143,16 @@ _DTYPE_BYTES = {
 
 
 def emit_cute(
-    plan: KernelPlan, output_dir: Path | str | None = Path("artifacts/generated")
+    plan: KernelPlan,
+    output_dir: Path | str | None = Path("artifacts/generated"),
+    *,
+    event_schedule: EventSchedule | None = None,
 ) -> GeneratedCuTeModule:
     verify_plan(plan)
     if plan.launch.architecture != "sm90a":
         raise UnsupportedCodegen("codegen currently supports sm90a plans only")
 
-    source, launch, source_map = _emit_generic_module(plan)
+    source, launch, source_map = _emit_generic_module(plan, event_schedule)
 
     module_name = (
         f"megabake_{hashlib.sha256((source + repr(launch)).encode()).hexdigest()[:16]}"
@@ -183,6 +187,7 @@ def emit_cute(
 
 def _emit_generic_module(
     plan: KernelPlan,
+    event_schedule: EventSchedule | None = None,
 ) -> tuple[str, LaunchMetadata, tuple[SourceMapEntry, ...]]:
     selected = {
         selection.region_id: selection for selection in plan.selection.selections
@@ -480,6 +485,53 @@ def _emit_generic_module(
             )
         )
 
+    if event_schedule is not None:
+        event_by_region: dict[str, int] = {}
+        for event in event_schedule.events:
+            producer_regions = {
+                event_schedule.task_for(task_id).region_id
+                for task_id in event.producer_task_ids
+            }
+            if len(producer_regions) != 1:
+                raise UnsupportedCodegen("event producers must share one region")
+            event_by_region[producer_regions.pop()] = event.id
+        phase_publishers.clear()
+        for phase in plan.phases:
+            wait_lines: list[str] = []
+            for producer_region_id in phase.dependencies:
+                if producer_region_id not in event_by_region:
+                    raise UnsupportedCodegen(
+                        f"region {phase.region_id} waits on an unmapped event"
+                    )
+                event_id = event_by_region[producer_region_id]
+                wait_lines.extend(
+                    (
+                        "        wait_for_event(",
+                        "            ready,",
+                        f"            cutlass.Int32({event_id}),",
+                        f"            cutlass.Int32({plan.launch.grid_size}),",
+                        "            epoch,",
+                        "        )",
+                    )
+                )
+            if wait_lines:
+                phase_publishers.append(
+                    f"    @cute.jit\n"
+                    f"    def _wait_phase_{phase.index}(epoch: cutlass.Int32):\n"
+                    + "\n".join(wait_lines)
+                    + "\n"
+                )
+            if phase.region_id in event_by_region:
+                event_id = event_by_region[phase.region_id]
+                phase_publishers.append(
+                    f"    @cute.jit\n"
+                    f"    def _publish_phase_{phase.index}():\n"
+                    f"        publish_event(ready, cutlass.Int32({event_id}))\n"
+                )
+        phase_records = [
+            replace(record, barrier=None) for record in phase_records
+        ]
+
     shared_source = _shared_scratch_source(plan, scratch_elements)
     scratch_prelude = _scratch_prelude(plan, scratch_elements)
     shared_memory_bytes = (
@@ -507,6 +559,11 @@ def _emit_generic_module(
         for body_symbol, tensor_a, tensor_b, tensor_c, bindings, epilogue, work_iterator in g0_prepared
     ]
     launch_smem = "" if has_g0 else f"        smem={shared_memory_bytes},\n"
+    runtime_import = (
+        "from megabake.runtime import cooperative_event_worker_loop, publish_event, wait_for_event"
+        if event_schedule is not None
+        else "from megabake.runtime import cooperative_worker_loop, grid_barrier"
+    )
     kernel_arguments = [
         "ready: cute.Tensor",
         "workers: cutlass.Int32",
@@ -530,7 +587,7 @@ def _emit_generic_module(
 import cutlass.cute as cute
 from cuda.bindings import driver as cuda
 
-from megabake.runtime import cooperative_worker_loop, grid_barrier
+{runtime_import}
 from megabake.bodies.gemm import HopperWgmmaGemmPersistentKernel
 
 {"\n\n".join(g0_definitions)}
@@ -562,14 +619,7 @@ def megabake_kernel(
 
 {"".join(phase_runners)}
 {"".join(phase_publishers)}
-    cooperative_worker_loop(
-        ready,
-        workers,
-        epoch,
-        (
-{("," + chr(10)).join([f"            ({phase.index}, _run_phase_{phase.index}, _no_op, {f'_publish_phase_{phase.index}' if phase.barrier is not None else '_ignore_epoch'})" for phase in plan.phases] + [f"            ({len(plan.phases)}, _run_terminal, _no_op, _ignore_epoch)"])}
-        ),
-    )
+{_event_worker_loop(plan, event_schedule)}
 
 
 @cute.jit
@@ -605,8 +655,52 @@ def launch(
         tuple(work_iterators),
         tuple((*tensor_arguments, *g0_tensor_arguments)),
         tuple(phase_records),
+        launch_policy=(
+            "megabake_cooperative_events"
+            if event_schedule is not None
+            else "megabake_cooperative"
+        ),
     )
     return source, launch_metadata, _source_map(source, plan, phase_records)
+
+
+def _event_worker_loop(
+    plan: KernelPlan, event_schedule: EventSchedule | None
+) -> str:
+    if event_schedule is None:
+        return f'''    cooperative_worker_loop(
+        ready,
+        workers,
+        epoch,
+        (
+{("," + chr(10)).join([f"            ({phase.index}, _run_phase_{phase.index}, _no_op, {f'_publish_phase_{phase.index}' if phase.barrier is not None else '_ignore_epoch'})" for phase in plan.phases] + [f"            ({len(plan.phases)}, _run_terminal, _no_op, _ignore_epoch)"])}
+        ),
+    )
+'''
+    event_regions = {
+        event_schedule.task_for(task_id).region_id
+        for event in event_schedule.events
+        for task_id in event.producer_task_ids
+    }
+    entries = tuple(
+        (
+            f"_wait_phase_{phase.index}" if phase.dependencies else "_ignore_epoch",
+            f"_run_phase_{phase.index}",
+            f"_publish_phase_{phase.index}"
+            if phase.region_id in event_regions
+            else "_no_op",
+        )
+        for phase in plan.phases
+    )
+    return f'''    cooperative_event_worker_loop(
+        ready,
+        workers,
+        epoch,
+        (
+{("," + chr(10)).join(f"            ({entry[0]}, {entry[1]}, {entry[2]})" for entry in entries)}
+        ),
+    )
+'''
 
 
 def _normalize_generic_selection(

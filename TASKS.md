@@ -384,17 +384,19 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Implement in:** `schedule.py` and `runtime.py`. Skip this implementation when measurements show no need.
 
-- [ ] Derive exact producer membership for each consumer tile. Include reduction fan-in, aliases, and state effects.
-- [ ] Group identical prerequisite sets. Adapt MPK's regular GCD/LCM grouping only where its preconditions hold.
-- [ ] Retain general dependency lists before compressing descriptors. Compare compressed events with concrete access overlap.
-- [ ] Assign tasks in a common topological order. Include each worker's task order in the progress analysis.
-- [ ] Emit release/acquire publication and waits for all producers. Include CTA participation and asynchronous completion rules.
-- [ ] Let bodies consume ready ranges without forcing a pipeline restart at every tile.
-- [ ] Extend host simulation to require every task to finish. Compare outputs and timing with the phase plan.
+- [x] Derive exact producer membership for each consumer tile. Include reduction fan-in, aliases, and state effects.
+- [x] Group identical prerequisite sets. Adapt MPK's regular GCD/LCM grouping only where its preconditions hold.
+- [x] Retain general dependency lists before compressing descriptors. Compare compressed events with concrete access overlap.
+- [x] Assign tasks in a common topological order. Include each worker's task order in the progress analysis.
+- [x] Emit release/acquire publication and waits for all producers. Include CTA participation and asynchronous completion rules.
+- [x] Let bodies consume ready ranges without forcing a pipeline restart at every tile.
+- [x] Extend host simulation to require every task to finish. Compare outputs and timing with the phase plan.
 
 **Output:** an alternative event schedule for the same Compute Graph and body interface.
 
 **Check:** test forks, joins, residuals, uneven tails, delayed producers, and idle workers. Keep a phase schedule when event compression cannot represent the graph.
+
+**Evidence:** [Task 19 host and GPU event schedule evidence](artifacts/task19/README.md). The scheduler and runtime primitives cover exact reduction fan-in, shared prerequisite events, conservative state effects, delayed producers, and idle workers. A temporary backend wiring measurement showed a batch-4 complete-call regression, so compiler and public backend execution remain phase-only.
 
 ## 20. Close the first region performance gap
 
