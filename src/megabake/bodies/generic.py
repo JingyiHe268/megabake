@@ -683,7 +683,7 @@ def _emit_expression(
             expression.dtype,
         )
         return _TypedExpression(
-            f"cute.where({condition.code}, {true_value.code}, {false_value.code})",
+            f"({true_value.code}) if ({condition.code}) else ({false_value.code})",
             expression.dtype,
         )
     if isinstance(expression, Cast):
@@ -699,7 +699,7 @@ def _emit_expression(
 def _unary_code(operator: str, operand: _TypedExpression) -> str:
     if operator == "relu":
         zero = f"{_cutlass_type(operand.dtype)}(0)"
-        return f"cute.where(({operand.code}) > {zero}, ({operand.code}), {zero})"
+        return f"({operand.code}) if (({operand.code}) > {zero}) else {zero}"
     if operator == "neg":
         return f"(-({operand.code}))"
     functions = {

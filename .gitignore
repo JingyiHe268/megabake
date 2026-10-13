@@ -12,3 +12,5 @@ fx_traces/*
 !/fx_traces/.gitkeep
 experiments/*
 !/experiments/.gitkeep
+/artifacts/*
+!/artifacts/.gitkeep
