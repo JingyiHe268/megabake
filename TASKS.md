@@ -583,15 +583,17 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Implement in:** existing compiler components; add a complete-block fixture.
 
-- [ ] Capture the full block through the normal backend in both modes.
-- [ ] Compile every source operation and requested output. Include cache work when the captured block requires it.
-- [ ] Verify the combined dependencies, scratch lifetimes, participation, and compiled launch resources.
-- [ ] Compare outputs and state with the native block over changed inputs and repeated calls.
-- [ ] Measure the complete block against equivalent baselines. Return to the responsible body or scheduling step for any dominant loss.
+- [x] Capture the full block through the normal backend in both modes.
+- [x] Compile every source operation and requested output. Include cache work when the captured block requires it.
+- [x] Verify the combined dependencies, scratch lifetimes, participation, and compiled launch resources.
+- [x] Compare outputs and state with the native block over changed inputs and repeated calls.
+- [x] Measure the complete block against equivalent baselines. Return to the responsible body or scheduling step for any dominant loss.
 
 **Output:** a complete prefill block and a complete stateful decode block as generated megakernels.
 
 **Check:** complete G3 for each declared regime. Include body transitions, synchronization, and recurring wrapper work in the result.
+
+**Evidence:** the complete-block fixture combines two RMSNorms, Q/K/V and output projections, query/key RoPE, grouped-query attention, residuals, and the gated MLP. CPU tests form and verify complete phase/storage plans in both modes; the SM90 regression compiles both through the normal backend, checks changed inputs, three advancing decode calls to capacity, state contents, plan participation, resources, and one recurring kernel launch. `benchmarks/run.py --workload transformer-block` records eager, Inductor, and MegaBake complete-call timing plus kernel traces, state error, launch limits, and compiled resources. The eager `kv_attention` reference now supports grouped query heads. The SM90 regression and benchmark were not executed on this GPU-less host.
 
 ## 30. Bound workspace and repeated-layer code
 

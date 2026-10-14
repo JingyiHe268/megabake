@@ -30,11 +30,18 @@ The design preserves the tuned pipeline inside each body. It starts with ordered
 
 A complete-model request includes all requested outputs and state updates. Named region matchers enable optimizations. Unfamiliar combinations of supported primitives use generic lowering. Unknown operator semantics or an illegal composition produce an explicit failure. The proposed `fallback=inductor` option can delegate the whole invocation and report that result as external fallback. Strict megakernel compilation defaults to `fallback=error`. These paths are not implemented yet.
 
-The first frontend-to-kernel compiler path is implemented for supported SM90 workloads. Complete-model coverage, broader stateful cache formats, fallback delegation, and measured optimization work remain open in later TASKS.md steps.
+The first frontend-to-kernel compiler path is implemented for supported SM90 workloads, including complete transformer blocks in prefill and grouped-query stateful decode modes. Complete-model coverage, broader Hugging Face cache formats, and measured optimization work remain open in later TASKS.md steps.
 
 ## Current performance
 
 The compiled MLP is correct and runs as one kernel, but it is 12.5x to 15x slower than CUDA Graph replay. [PERFORMANCE_REPORT.md](PERFORMANCE_REPORT.md) gives the measurements, causes, and ordered fixes. Most of that gap is per-call Python binding, not the kernel and not compilation. `benchmarks/isolated.py` times each mode's final kernels with launch and device execution only; use it to judge the kernel.
+
+On an SM90 device, measure a complete block in either mode:
+
+```bash
+.venv/bin/python benchmarks/run.py --workload transformer-block --mode prefill
+.venv/bin/python benchmarks/run.py --workload transformer-block --mode decode --sequence 1
+```
 
 ## Current frontend
 

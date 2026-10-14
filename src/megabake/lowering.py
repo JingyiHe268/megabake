@@ -234,6 +234,10 @@ def kv_attention(
     query = source.permute(0, 2, 1, 3)
     keys = key_cache[:, :end].permute(0, 2, 1, 3)
     values = value_cache[:, :end].permute(0, 2, 1, 3)
+    if query.shape[1] != keys.shape[1]:
+        group_size = query.shape[1] // keys.shape[1]
+        keys = keys.repeat_interleave(group_size, dim=1)
+        values = values.repeat_interleave(group_size, dim=1)
     scores = (query @ keys.transpose(-2, -1)).float() * source.shape[-1] ** -0.5
     probabilities = torch.softmax(scores, dim=-1).to(source.dtype)
     output = probabilities @ values
