@@ -146,6 +146,47 @@ class TensorProgram:
     accumulator_dtype: str | None
     store: TensorStore
     predicates: tuple[AxisPredicate, ...]
+    state_accesses: tuple[KVCacheAccess, ...] = ()
+
+
+@dataclass(frozen=True)
+class KVCacheLayout:
+    shape: tuple[int, ...]
+    strides: tuple[int, ...]
+    dtype: str
+
+
+@dataclass(frozen=True)
+class KVCacheAccess:
+    key_cache_value_id: str
+    value_cache_value_id: str
+    valid_length_value_id: str
+    key_cache_load_id: str
+    value_cache_load_id: str
+    new_key_load_id: str
+    new_value_load_id: str
+    valid_length_load_id: str
+    capacity: int
+    query_length: int
+    key_layout: KVCacheLayout
+    value_layout: KVCacheLayout
+    storage_identity: tuple[str, str]
+    read_range: tuple[int | str, int | str] = (0, "valid_length")
+    write_range: tuple[int | str, int | str] = (
+        "valid_length",
+        "valid_length + query_length",
+    )
+    source_order: tuple[str, ...] = (
+        "read_valid_length",
+        "read_cache_prefix",
+        "read_new_key_value",
+        "write_key_cache",
+        "write_value_cache",
+        "write_valid_length",
+    )
+    capacity_guard: str = "0 <= valid_length and valid_length + query_length <= capacity"
+    storage_class: str = "bounded_contiguous"
+    valid_length_specialized: bool = False
 
 
 @dataclass(frozen=True)
@@ -164,6 +205,64 @@ class UnsupportedLowering(ValueError):
 LoweringRule = Callable[
     [torch.fx.Node, Op, ComputeGraph], TensorProgram | CanonicalProgram
 ]
+
+
+@torch.library.custom_op(
+    "megabake::kv_attention",
+    mutates_args=("key_cache", "value_cache", "valid_length"),
+)
+def kv_attention(
+    source: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    valid_length: torch.Tensor,
+) -> torch.Tensor:
+    if source.shape[1] != 1:
+        raise RuntimeError("megabake kv_attention supports one-token decode only")
+    start = int(valid_length.item())
+    end = start + source.shape[1]
+    if start < 0 or end > key_cache.shape[1]:
+        raise RuntimeError(
+            f"KV cache length {start} plus {source.shape[1]} exceeds capacity "
+            f"{key_cache.shape[1]}"
+        )
+    key_cache[:, start:end].copy_(key)
+    value_cache[:, start:end].copy_(value)
+    valid_length.fill_(end)
+    query = source.permute(0, 2, 1, 3)
+    keys = key_cache[:, :end].permute(0, 2, 1, 3)
+    values = value_cache[:, :end].permute(0, 2, 1, 3)
+    scores = (query @ keys.transpose(-2, -1)).float() * source.shape[-1] ** -0.5
+    probabilities = torch.softmax(scores, dim=-1).to(source.dtype)
+    output = probabilities @ values
+    return output.permute(0, 2, 1, 3).reshape(
+        source.shape[0] * source.shape[2], source.shape[1], source.shape[3]
+    )
+
+
+@kv_attention.register_fake
+def _kv_attention_fake(
+    source: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    valid_length: torch.Tensor,
+) -> torch.Tensor:
+    return torch.empty(
+        (
+            source.shape[0] * source.shape[2],
+            source.shape[1],
+            source.shape[3],
+        ),
+        dtype=source.dtype,
+        device=source.device,
+    )
+
+
+KV_ATTENTION_OP = torch.ops.megabake.kv_attention.default
 
 
 def _node_value(node: torch.fx.Node, graph: ComputeGraph) -> Value:
@@ -1327,7 +1426,130 @@ def _gather_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorP
     )
 
 
+def _kv_attention_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorProgram:
+    del node
+    if len(op.operands) != 6:
+        raise UnsupportedLowering("KV attention expects source, K, V, two caches, and length")
+    source, new_key, new_value, key_cache, value_cache, valid_length = (
+        graph.values[value_id] for value_id in op.operands
+    )
+    output = _result_value(op, graph)
+    if any(
+        value.shape is None or value.strides is None or value.dtype is None
+        for value in (source, new_key, new_value, key_cache, value_cache, valid_length)
+    ):
+        raise UnsupportedLowering("KV attention operands lack static tensor metadata")
+
+    batch, query_length, query_heads, head_dim = source.shape
+    _, new_length, kv_heads, _ = new_key.shape
+    _, capacity, cache_kv_heads, _ = key_cache.shape
+    group_size = query_heads // kv_heads
+    contiguous_cache = (
+        capacity * kv_heads * head_dim,
+        kv_heads * head_dim,
+        head_dim,
+        1,
+    )
+    if (
+        query_length != 1
+        or new_length != query_length
+        or new_key.shape != new_value.shape
+        or key_cache.shape != value_cache.shape
+        or cache_kv_heads != kv_heads
+        or query_heads % kv_heads
+        or group_size <= 0
+        or key_cache.strides != contiguous_cache
+        or value_cache.strides != contiguous_cache
+        or valid_length.shape != (1,)
+        or valid_length.dtype != "torch.int32"
+        or output.shape != (batch * query_heads, query_length, head_dim)
+        or source.dtype != "torch.bfloat16"
+        or new_key.dtype != "torch.bfloat16"
+        or key_cache.dtype != "torch.bfloat16"
+    ):
+        raise UnsupportedLowering(
+            "KV attention supports one-token decode over two contiguous BF16 caches"
+        )
+
+    batch_head = AxisAffine((AxisTerm("bh", divisor=query_heads),))
+    query_head = AxisAffine((AxisTerm("bh", modulus=query_heads),))
+    kv_head = AxisAffine(
+        (AxisTerm("bh", divisor=query_heads, modulus=group_size),)
+    )
+    loads = (
+        IndexedLoad(
+            "attention:q", source.id, (batch_head, "s", query_head, "d"),
+            source.strides, source.dtype, source.shape,
+        ),
+        IndexedLoad(
+            "attention:new_k", new_key.id, (batch_head, 0, kv_head, "d"),
+            new_key.strides, new_key.dtype, new_key.shape,
+        ),
+        IndexedLoad(
+            "attention:new_v", new_value.id, (batch_head, 0, kv_head, "d"),
+            new_value.strides, new_value.dtype, new_value.shape,
+        ),
+        IndexedLoad(
+            "attention:k", key_cache.id, (batch_head, "k", kv_head, "d"),
+            key_cache.strides, key_cache.dtype, key_cache.shape,
+        ),
+        IndexedLoad(
+            "attention:v", value_cache.id, (batch_head, "k", kv_head, "d"),
+            value_cache.strides, value_cache.dtype, value_cache.shape,
+        ),
+        IndexedLoad(
+            "attention:valid_length", valid_length.id, (0,),
+            valid_length.strides, valid_length.dtype, valid_length.shape,
+        ),
+    )
+    zero = Constant(0.0, "torch.float32")
+    state_access = KVCacheAccess(
+        key_cache_value_id=key_cache.id,
+        value_cache_value_id=value_cache.id,
+        valid_length_value_id=valid_length.id,
+        key_cache_load_id="attention:k",
+        value_cache_load_id="attention:v",
+        new_key_load_id="attention:new_k",
+        new_value_load_id="attention:new_v",
+        valid_length_load_id="attention:valid_length",
+        capacity=capacity,
+        query_length=query_length,
+        key_layout=KVCacheLayout(key_cache.shape, key_cache.strides, key_cache.dtype),
+        value_layout=KVCacheLayout(
+            value_cache.shape, value_cache.strides, value_cache.dtype
+        ),
+        storage_identity=(key_cache.id, value_cache.id),
+    )
+    return TensorProgram(
+        family="attention",
+        source_target="megabake.kv_attention",
+        decomposition="stateful decode attention with bounded contiguous KV cache",
+        iteration_domains=(
+            IterationDomain("bh", batch * query_heads),
+            IterationDomain("s", query_length),
+            IterationDomain("d", head_dim),
+            IterationDomain("k", capacity),
+        ),
+        reduction_axes=("k",),
+        loads=loads,
+        init=zero,
+        combine=zero,
+        post=zero,
+        accumulator_dtype="torch.float32",
+        store=TensorStore(
+            output.id, output.shape, output.dtype, output.strides, True
+        ),
+        predicates=(
+            AxisPredicate("bh", batch * query_heads),
+            AxisPredicate("s", query_length),
+            AxisPredicate("d", head_dim),
+        ),
+        state_accesses=(state_access,),
+    )
+
+
 LOWERERS: dict[Any, LoweringRule] = {
+    KV_ATTENTION_OP: _kv_attention_program,
     torch.ops.aten.add.Tensor: lambda node, op, graph: _binary_program(node, op, graph, "add"),
     torch.ops.aten.add.Scalar: lambda node, op, graph: _binary_program(node, op, graph, "add"),
     torch.ops.aten.sub.Tensor: lambda node, op, graph: _binary_program(node, op, graph, "sub"),
@@ -1523,12 +1745,57 @@ def _verify_tensor_program(program: TensorProgram, op: Op, graph: ComputeGraph) 
                     for axis in loads_by_id[load_id].axes
                 ):
                     raise UnsupportedLowering("post expression depends on a reduction coordinate")
+    elif program.family == "attention":
+        if program.reduction_axes != ("k",) or program.init is None:
+            raise UnsupportedLowering("attention lacks its reduction state")
+        _verify_state_accesses(program, op, graph, load_ids)
     elif program.reduction_axes or program.init is not None or program.post is not None:
         raise UnsupportedLowering("elementwise program unexpectedly has reduction state")
     if program.family not in {"reduction", "contraction"} and _expression_has_accumulator(
         program.combine
     ):
         raise UnsupportedLowering("elementwise combine expression uses the accumulator")
+
+
+def _verify_state_accesses(
+    program: TensorProgram, op: Op, graph: ComputeGraph, load_ids: set[str]
+) -> None:
+    if len(program.state_accesses) > 1:
+        raise UnsupportedLowering("an attention program may own at most one KV cache")
+    loads_by_id = {load.id: load for load in program.loads}
+    for access in program.state_accesses:
+        required_load_ids = {
+            access.key_cache_load_id,
+            access.value_cache_load_id,
+            access.new_key_load_id,
+            access.new_value_load_id,
+            access.valid_length_load_id,
+        }
+        if not required_load_ids <= load_ids:
+            raise UnsupportedLowering("KV state access names an unknown load")
+        value_ids = {
+            access.key_cache_value_id,
+            access.value_cache_value_id,
+            access.valid_length_value_id,
+        }
+        if not value_ids <= set(op.operands):
+            raise UnsupportedLowering("KV state access names a non-operand value")
+        key = graph.values[access.key_cache_value_id]
+        value = graph.values[access.value_cache_value_id]
+        if (
+            access.capacity <= 0
+            or access.query_length <= 0
+            or access.capacity < access.query_length
+            or key.shape != access.key_layout.shape
+            or key.strides != access.key_layout.strides
+            or value.shape != access.value_layout.shape
+            or value.strides != access.value_layout.strides
+            or access.storage_class != "bounded_contiguous"
+            or access.valid_length_specialized
+        ):
+            raise UnsupportedLowering("KV state access has an invalid ownership contract")
+        if loads_by_id[access.valid_length_load_id].value_id != access.valid_length_value_id:
+            raise UnsupportedLowering("KV valid-length load is bound to the wrong value")
 
 
 def _verify_canonical_program(
@@ -1583,7 +1850,8 @@ def lower_semantics(graph: ComputeGraph) -> ComputeGraph:
         node = graph.source_nodes[source_id]
         target = node.target
         rule = LOWERERS.get(target) or LOWERERS.get(str(target))
-        unsupported_effects = bool(
+        stateful_attention = target == KV_ATTENTION_OP
+        unsupported_effects = not stateful_attention and bool(
             operation.effects.get("unknown")
             or operation.effects.get("mutates_inputs")
             or operation.effects.get("may_mutate_inputs")

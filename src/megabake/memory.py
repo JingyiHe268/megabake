@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 
 from .bodies.interface import TargetFacts
 from .graph import ComputeGraph
+from .lowering import KVCacheAccess
 from .plan import (
     BodySelectionPlan,
     CuTeLayout,
@@ -68,10 +69,29 @@ class WorkerScratch:
 
 
 @dataclass(frozen=True)
+class StateStorageAssignment:
+    key_cache_value_id: str
+    value_cache_value_id: str
+    valid_length_value_id: str
+    storage_identity: tuple[str, str]
+    capacity: int
+    query_length: int
+    key_layout: CuTeLayout
+    value_layout: CuTeLayout
+    read_regions: tuple[str, ...]
+    write_regions: tuple[str, ...]
+    read_range: tuple[int | str, int | str]
+    write_range: tuple[int | str, int | str]
+    source_order: tuple[str, ...]
+    lifetime: str = "boundary_state"
+
+
+@dataclass(frozen=True)
 class StoragePlan:
     workspace: tuple[GlobalStorageAssignment, ...]
     bindings: tuple[TensorBinding, ...]
     worker_scratch: tuple[WorkerScratch, ...]
+    state: tuple[StateStorageAssignment, ...] = ()
     allocation_provenance: str = (
         "adapted from Mirage plan_dtensor_memory "
         "f9eb70c254acefc9f3667b2a973d0dcf25471fce; "
@@ -194,7 +214,12 @@ def assign_storage(plan: PhaseSchedule) -> KernelPlan:
     bindings.extend(_boundary_bindings(selection, tile_maps))
     bindings = _deduplicate_bindings(bindings)
     worker_scratch = _worker_scratch(plan)
-    storage = StoragePlan(tuple(workspace), tuple(bindings), worker_scratch)
+    storage = StoragePlan(
+        tuple(workspace),
+        tuple(bindings),
+        worker_scratch,
+        _state_assignments(selection),
+    )
     launch = _launch_requirements(plan, selection.target, storage)
     return KernelPlan(
         selection=selection,
@@ -269,6 +294,7 @@ def verify_plan(plan: KernelPlan) -> None:
     _verify_worker_scratch(plan)
     _verify_launch(plan)
     _verify_collective_participation(plan)
+    _verify_state_storage(plan)
 
 
 def _tile_maps(selection: BodySelectionPlan) -> tuple[TileMap, ...]:
@@ -401,6 +427,87 @@ def _state_value_ids(graph: ComputeGraph) -> frozenset[str]:
             value_id for value_id in operation.operands if value_id in graph.inputs
         )
     return frozenset(state_ids)
+
+
+def _state_assignments(
+    selection: BodySelectionPlan,
+) -> tuple[StateStorageAssignment, ...]:
+    graph = selection.graph
+    if graph is None:
+        raise InvalidStorage("body selection is missing its source graph")
+    assignments: dict[tuple[str, str], StateStorageAssignment] = {}
+    for selected in selection.selections:
+        for access in selected.program.state_accesses:
+            key = access.storage_identity
+            existing = assignments.get(key)
+            read_regions = tuple(
+                dict.fromkeys(
+                    (*(existing.read_regions if existing else ()), selected.region_id)
+                )
+            )
+            write_regions = tuple(
+                dict.fromkeys(
+                    (*(existing.write_regions if existing else ()), selected.region_id)
+                )
+            )
+            assignments[key] = StateStorageAssignment(
+                key_cache_value_id=access.key_cache_value_id,
+                value_cache_value_id=access.value_cache_value_id,
+                valid_length_value_id=access.valid_length_value_id,
+                storage_identity=access.storage_identity,
+                capacity=access.capacity,
+                query_length=access.query_length,
+                key_layout=_state_layout(graph, access.key_cache_value_id),
+                value_layout=_state_layout(graph, access.value_cache_value_id),
+                read_regions=read_regions,
+                write_regions=write_regions,
+                read_range=access.read_range,
+                write_range=access.write_range,
+                source_order=access.source_order,
+            )
+    return tuple(assignments.values())
+
+
+def _state_layout(graph: ComputeGraph, value_id: str) -> CuTeLayout:
+    value = graph.values[value_id]
+    if value.shape is None or value.strides is None or value.dtype is None:
+        raise InvalidStorage(f"state value {value_id} lacks a layout")
+    return CuTeLayout(
+        value.dtype,
+        value.shape,
+        value.strides,
+        max(16, _DTYPE_BYTES.get(value.dtype, 1)),
+    )
+
+
+def _verify_state_storage(plan: KernelPlan) -> None:
+    workspace_ids = {assignment.storage_id for assignment in plan.storage.workspace}
+    for state in plan.storage.state:
+        if (
+            state.lifetime != "boundary_state"
+            or state.capacity <= 0
+            or state.query_length <= 0
+            or state.capacity < state.query_length
+            or not state.read_regions
+            or not state.write_regions
+            or set(state.storage_identity) & workspace_ids
+        ):
+            raise InvalidStorage(f"KV state {state.storage_identity} has an invalid plan")
+        for value_id in (
+            state.key_cache_value_id,
+            state.value_cache_value_id,
+            state.valid_length_value_id,
+        ):
+            binding = next(
+                (
+                    binding
+                    for binding in plan.storage.bindings
+                    if binding.value_id == value_id
+                ),
+                None,
+            )
+            if binding is None or binding.kind != "state":
+                raise InvalidStorage(f"KV state value {value_id} is not a state binding")
 
 
 def _make_boundary_binding(

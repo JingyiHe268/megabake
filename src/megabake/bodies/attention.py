@@ -130,6 +130,9 @@ class AttentionBodyProvider:
         if mask.get("kind") == "additive_tensor":
             if "attention:mask" not in loads:
                 return reject("additive mask is not bound")
+        elif mask.get("kind") == "stateful_causal":
+            if not program.state_accesses:
+                return reject("stateful causal mask has no KV state contract")
         elif mask.get("kind") == "typed_where":
             if (
                 mask.get("causal_offset") is None
@@ -141,18 +144,24 @@ class AttentionBodyProvider:
             return reject("unsupported attention mask hook")
 
         cache_effects = facts.get("cache_effects", {})
+        stateful = bool(program.state_accesses)
         if (
             not isinstance(cache_effects, Mapping)
-            or cache_effects.get("appends") != ()
-            or cache_effects.get("updates") != ()
-            or cache_effects.get("policy") != "read_only"
+            or cache_effects.get("policy") != ("stateful" if stateful else "read_only")
+            or (stateful and cache_effects.get("updates") == ())
+            or (not stateful and cache_effects.get("appends") != ())
+            or (not stateful and cache_effects.get("updates") != ())
         ):
-            return reject("provider supports read-only KV caches only")
+            return reject("provider supports read-only or bounded stateful KV caches only")
+        if stateful and q_load.source_shape[1] != 1:
+            return reject("stateful KV attention supports one-token decode only")
 
         if target.architecture != "sm90a" or not target.supports_wgmma:
             return reject("provider targets WGMMA-capable sm90a only")
         body_name = (
-            "attention_decode_rows"
+            "attention_stateful_decode_rows"
+            if stateful
+            else "attention_decode_rows"
             if q_load.source_shape[1] == 1
             else "attention_prefill_rows"
         )
@@ -183,6 +192,7 @@ def attention_candidates(
 
 def _attention_config(region: Region, program: Any, name: str) -> BodyConfig:
     facts = region.semantic_facts
+    stateful = region.semantic_facts.get("kv_state") is not None
     threads = 128
     warp_roles = ("32 independent query-row score, softmax, and value pipelines",) * 4
     layouts = {
@@ -222,8 +232,16 @@ def _attention_config(region: Region, program: Any, name: str) -> BodyConfig:
                 "head_grouping": facts["head_grouping"],
                 "scale": facts["scale"],
                 "numerical_policy": facts["numerical_policy"],
+                "cache_effects": facts["cache_effects"],
+                "kv_state": facts.get("kv_state"),
             },
-            access_restrictions=("KV state is read-only",),
+            access_restrictions=(
+                (
+                    "KV state is bounded, contiguous, and updated in source order"
+                    if stateful
+                    else "KV state is read-only"
+                ),
+            ),
         ),
         layouts=LayoutContract(layouts, {program.store.value_id: layouts[program.store.value_id]}),
         tiles=TileContract(
@@ -258,7 +276,11 @@ def _attention_config(region: Region, program: Any, name: str) -> BodyConfig:
             reuse_rule="no scratch is owned",
         ),
         completion=CompletionContract(
-            outputs_ready="assigned rows are stored when run returns",
+            outputs_ready=(
+                "assigned rows and all KV state writes are stored when run returns"
+                if stateful
+                else "assigned rows are stored when run returns"
+            ),
             output_tiles_ready="each assigned output element is ready after its store",
             async_work_complete="run performs no asynchronous work",
             scratch_reusable="scratch is reusable when run returns",
@@ -266,9 +288,18 @@ def _attention_config(region: Region, program: Any, name: str) -> BodyConfig:
             warp_roles_on_return="unchanged",
         ),
         evidence=ResourceEvidence(
-            measured=True,
-            source="CuTe row pipeline adapted from Mirage multitoken Hopper attention",
-            revision="mirage@f9eb70c254acefc9f3667b2a973d0dcf25471fce; task-26",
+            measured=not stateful,
+            source=(
+                "stateful decode extension of the CuTe row pipeline adapted from "
+                "Mirage multitoken Hopper attention"
+                if stateful
+                else "CuTe row pipeline adapted from Mirage multitoken Hopper attention"
+            ),
+            revision=(
+                "mirage@f9eb70c254acefc9f3667b2a973d0dcf25471fce; task-28"
+                if stateful
+                else "mirage@f9eb70c254acefc9f3667b2a973d0dcf25471fce; task-26"
+            ),
             resources={
                 "threads": threads,
                 "shared_bytes": 0,
@@ -311,6 +342,120 @@ def emit_attention_body(program: Any, config: BodyConfig) -> GeneratedAttentionB
     kv_length = key_load.source_shape[1]
     if not isinstance(query_length, int) or not isinstance(kv_length, int):
         raise UnsupportedAttentionBody("attention sequence lengths must be static")
+
+    if program.state_accesses:
+        state = program.state_accesses[0]
+        required_state_loads = (
+            "attention:new_k",
+            "attention:new_v",
+            "attention:valid_length",
+        )
+        if not set(required_state_loads) <= set(loads):
+            raise UnsupportedAttentionBody("stateful attention lacks K/V and length bindings")
+        if query_length != 1 or state.query_length != 1:
+            raise UnsupportedAttentionBody("stateful attention supports one-token decode only")
+        threads = config.participants.participating_threads
+        row_count = batch * query_heads
+        tile_count = (row_count + threads - 1) // threads
+        scale = facts.get("scale")
+        if not isinstance(scale, (int, float)):
+            raise UnsupportedAttentionBody("attention scale must be static")
+        binding_type = ", ".join("cute.Tensor" for _ in range(len(program.loads) + 1))
+        source = f'''import cutlass
+import cutlass.cute as cute
+
+
+@cute.kernel
+def run(
+    work_iterator: cute.Tensor,
+    tensor_bindings: tuple[{binding_type}],
+    scratch: cute.Tensor,
+    epilogue,
+):
+    block, _, _ = cute.arch.block_idx()
+    thread, _, _ = cute.arch.thread_idx()
+    workers, _, _ = cute.arch.grid_dim()
+    row_count = {row_count}
+    current_length = tensor_bindings[{loads['attention:valid_length']}][0].to(cutlass.Int32)
+    for tile in cutlass.range(block, cute.size(work_iterator), workers):
+        row = work_iterator[tile] + thread
+        if row < row_count:
+            bh = row
+            s = 0
+            b = bh // {query_heads}
+            h = bh % {query_heads}
+            kv_head = h // {group_size}
+            maximum = cutlass.Float32(-1.0e30)
+            total = cutlass.Float32(0.0)
+            for key in cutlass.range({kv_length}):
+                score = cutlass.Float32(0.0)
+                if key <= current_length:
+                    for d in cutlass.range({head_dim}):
+                        if key < current_length:
+                            key_value = tensor_bindings[{loads['attention:k']}][b, key, kv_head, d]
+                        else:
+                            key_value = tensor_bindings[{loads['attention:new_k']}][b, 0, kv_head, d]
+                        score = score + tensor_bindings[{loads['attention:q']}][b, s, h, d].to(cutlass.Float32) * key_value.to(cutlass.Float32)
+                    score = score.to(cutlass.BFloat16).to(cutlass.Float32)
+                    score = (score * cutlass.Float32({scale!r})).to(cutlass.BFloat16)
+                    score = score.to(cutlass.Float32)
+                else:
+                    score = cutlass.Float32(-1.0e30)
+                maximum = maximum if maximum >= score else score
+            for key in cutlass.range({kv_length}):
+                score = cutlass.Float32(0.0)
+                if key <= current_length:
+                    for d in cutlass.range({head_dim}):
+                        if key < current_length:
+                            key_value = tensor_bindings[{loads['attention:k']}][b, key, kv_head, d]
+                        else:
+                            key_value = tensor_bindings[{loads['attention:new_k']}][b, 0, kv_head, d]
+                        score = score + tensor_bindings[{loads['attention:q']}][b, s, h, d].to(cutlass.Float32) * key_value.to(cutlass.Float32)
+                    score = score.to(cutlass.BFloat16).to(cutlass.Float32)
+                    score = (score * cutlass.Float32({scale!r})).to(cutlass.BFloat16)
+                    score = score.to(cutlass.Float32)
+                    probability = cute.exp(score - maximum)
+                else:
+                    probability = cutlass.Float32(0.0)
+                total = total + probability
+            denominator = total
+            if total <= cutlass.Float32(0.0):
+                denominator = cutlass.Float32(1.0)
+            for d in cutlass.range({head_dim}):
+                value = cutlass.Float32(0.0)
+                for key in cutlass.range({kv_length}):
+                    score = cutlass.Float32(0.0)
+                    if key <= current_length:
+                        for dd in cutlass.range({head_dim}):
+                            if key < current_length:
+                                key_value = tensor_bindings[{loads['attention:k']}][b, key, kv_head, dd]
+                            else:
+                                key_value = tensor_bindings[{loads['attention:new_k']}][b, 0, kv_head, dd]
+                            score = score + tensor_bindings[{loads['attention:q']}][b, s, h, dd].to(cutlass.Float32) * key_value.to(cutlass.Float32)
+                        score = score.to(cutlass.BFloat16).to(cutlass.Float32)
+                        score = (score * cutlass.Float32({scale!r})).to(cutlass.BFloat16)
+                        score = score.to(cutlass.Float32)
+                        probability = cute.exp(score - maximum)
+                        probability = (probability / denominator).to(cutlass.BFloat16).to(cutlass.Float32)
+                        if key < current_length:
+                            value_element = tensor_bindings[{loads['attention:v']}][b, key, kv_head, d]
+                        else:
+                            value_element = tensor_bindings[{loads['attention:new_v']}][b, 0, kv_head, d]
+                        value = value + probability * value_element.to(cutlass.Float32)
+                tensor_bindings[{len(program.loads)}][bh, s, d] = value.to(cutlass.BFloat16)
+            if h % {group_size} == 0:
+                for d in cutlass.range({head_dim}):
+                    tensor_bindings[{loads['attention:k']}][b, current_length, kv_head, d] = tensor_bindings[{loads['attention:new_k']}][b, 0, kv_head, d]
+                    tensor_bindings[{loads['attention:v']}][b, current_length, kv_head, d] = tensor_bindings[{loads['attention:new_v']}][b, 0, kv_head, d]
+            if block == 0 and thread == 0 and tile == 0:
+                tensor_bindings[{loads['attention:valid_length']}][0] = current_length + cutlass.Int32(1)
+'''
+        return GeneratedAttentionBody(
+            source=source,
+            threads_per_cta=threads,
+            tile_count=tile_count,
+            work_iterator_encoding="one stateful query-row block base per CTA tile",
+        )
 
     mask = facts.get("mask")
     if not isinstance(mask, Mapping):

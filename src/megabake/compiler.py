@@ -1468,6 +1468,7 @@ class _RuntimeState:
                     requirement="source graph",
                 )
             )
+        _validate_state_capacities(plan, input_tensors)
         device = next(iter(input_tensors.values())).device
         if ready is None:
             ready = torch.full(
@@ -1687,6 +1688,26 @@ class _RuntimeState:
 
 def _tensor_identity(tensor: torch.Tensor) -> tuple[Any, ...]:
     return (tensor.data_ptr(), tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype)
+
+
+def _validate_state_capacities(
+    plan: KernelPlan, input_tensors: Mapping[str, torch.Tensor]
+) -> None:
+    for state in plan.storage.state:
+        valid_length = input_tensors[state.valid_length_value_id]
+        length = int(valid_length.item())
+        if length < 0 or length + state.query_length > state.capacity:
+            raise CompilerError(
+                CompilerDiagnostic(
+                    "state-capacity",
+                    (
+                        f"KV valid length {length} plus {state.query_length} exceeds "
+                        f"capacity {state.capacity}"
+                    ),
+                    (state.valid_length_value_id,),
+                    requirement="bounded KV state",
+                )
+            )
 
 
 def _allocate(layout: Any, device: torch.device) -> torch.Tensor:

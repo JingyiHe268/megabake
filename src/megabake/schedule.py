@@ -26,6 +26,7 @@ class InvalidSchedule(ValueError):
 class DependencyKind(StrEnum):
     PRODUCER_TO_CONSUMER = "producer_to_consumer"
     LAYOUT_CONVERSION = "layout_conversion"
+    STATE_ACCESS = "state_access"
     WRITE_AFTER_READ = "write_after_read"
     WRITE_AFTER_WRITE = "write_after_write"
 
@@ -263,6 +264,7 @@ def derive_dependencies(selection: BodySelectionPlan) -> DependencyPlan:
         )
 
     dependencies.extend(_storage_order_dependencies(selection, tile_maps))
+    dependencies.extend(_state_access_dependencies(selection, tile_maps))
     plan = _dependency_plan(tuple(dependencies), selected_by_region)
     _topological_order(selection.selections, plan)
     return plan
@@ -1097,6 +1099,42 @@ def _storage_order_dependencies(
                         tile_maps[later.region_id],
                     )
                 )
+    return tuple(dependencies)
+
+
+def _state_access_dependencies(
+    selection: BodySelectionPlan, tile_maps: Mapping[str, TileMap]
+) -> tuple[RegionDependency, ...]:
+    dependencies: list[RegionDependency] = []
+    selections = selection.selections
+    for later_index, later in enumerate(selections[1:], start=1):
+        for earlier in selections[:later_index]:
+            earlier_states = earlier.program.state_accesses
+            later_states = later.program.state_accesses
+            shared = {
+                access.storage_identity
+                for access in earlier_states
+                if any(
+                    access.storage_identity == other.storage_identity
+                    for other in later_states
+                )
+            }
+            if not shared:
+                continue
+            dependencies.append(
+                RegionDependency(
+                    producer_region_id=earlier.region_id,
+                    consumer_region_id=later.region_id,
+                    value_id=",".join(
+                        sorted(value_id for identity in shared for value_id in identity)
+                    ),
+                    kind=DependencyKind.STATE_ACCESS,
+                    producer_tiles=_output_tiles(tile_maps[earlier.region_id]),
+                    consumer_tiles=_output_tiles(tile_maps[later.region_id]),
+                    conservative=True,
+                    reason="regions read and write the same bounded KV state",
+                )
+            )
     return tuple(dependencies)
 
 

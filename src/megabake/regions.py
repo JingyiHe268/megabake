@@ -144,6 +144,9 @@ def _live_outputs(operations: tuple[Op, ...], graph: ComputeGraph) -> tuple[str,
 def _fusion_candidates(graph: ComputeGraph) -> dict[str, tuple[RegionCandidate, ...]]:
     candidates: dict[str, list[RegionCandidate]] = {}
     for operation in graph.ops.values():
+        stateful = _stateful_attention_candidate(operation, graph)
+        if stateful is not None:
+            candidates.setdefault(operation.id, []).append(stateful)
         candidate = _scalar_fusion_candidate(operation, graph)
         if candidate is not None:
             candidates.setdefault(operation.id, []).append(candidate)
@@ -179,6 +182,88 @@ def _fusion_candidates(graph: ComputeGraph) -> dict[str, tuple[RegionCandidate, 
         tail_operation = candidate.source_op_ids[-1]
         candidates.setdefault(tail_operation, []).append(candidate)
     return {tail: tuple(values) for tail, values in candidates.items()}
+
+
+def _stateful_attention_candidate(
+    operation: Op, graph: ComputeGraph
+) -> RegionCandidate | None:
+    if not _matches_target(operation, "megabake.kv_attention.default"):
+        return None
+    program = operation.tensor_program
+    if (
+        not isinstance(program, TensorProgram)
+        or program.family != "attention"
+        or not program.state_accesses
+    ):
+        return None
+    state = program.state_accesses[0]
+    loads = {load.id: load for load in program.loads}
+    output_id = operation.results[0]
+    return RegionCandidate(
+        id=f"region:{operation.id.removeprefix('op:')}:kv_attention",
+        source_op_ids=(operation.id,),
+        external_inputs=operation.operands,
+        live_outputs=(output_id,),
+        tensor_program=program,
+        semantic_facts={
+            "family": "attention",
+            "algorithm": "stable_softmax",
+            "numerical_policy": {
+                "score_dtype": "torch.bfloat16",
+                "statistics_dtype": "torch.float32",
+                "probability_dtype": "torch.bfloat16",
+                "accumulator_dtype": "torch.float32",
+            },
+            "q_access": loads["attention:q"],
+            "k_access": loads["attention:k"],
+            "v_access": loads["attention:v"],
+            "head_grouping": {
+                "batch": loads["attention:q"].source_shape[0],
+                "query_heads": loads["attention:q"].source_shape[2],
+                "kv_heads": loads["attention:k"].source_shape[2],
+                "group_size": (
+                    loads["attention:q"].source_shape[2]
+                    // loads["attention:k"].source_shape[2]
+                ),
+                "head_dim": loads["attention:q"].source_shape[3],
+            },
+            "scale": loads["attention:q"].source_shape[3] ** -0.5,
+            "mask": {
+                "kind": "stateful_causal",
+                "causal_offset": 0,
+                "block_skip_proof": "runtime valid-length bound",
+            },
+            "score_expression": 0.0,
+            "requested_outputs": (output_id,),
+            "boundary_output": output_id if output_id in graph.outputs else None,
+            "cache_effects": {
+                "reads": (state.key_cache_value_id, state.value_cache_value_id),
+                "appends": (
+                    loads["attention:new_k"].value_id,
+                    loads["attention:new_v"].value_id,
+                ),
+                "updates": (
+                    state.key_cache_value_id,
+                    state.value_cache_value_id,
+                    state.valid_length_value_id,
+                ),
+                "policy": "stateful",
+            },
+            "kv_state": state,
+            "hook_restrictions": {
+                "score": "row-local dot product with source-order K/V selection",
+                "mask": "causal selection by runtime valid length",
+            },
+        },
+        cost_bytes=(
+            2
+            * loads["attention:q"].source_shape[0]
+            * state.query_length
+            * loads["attention:k"].source_shape[2]
+            * loads["attention:q"].source_shape[3]
+            * 2
+        ),
+    )
 
 
 def _scalar_fusion_candidate(tail: Op, graph: ComputeGraph) -> RegionCandidate | None:

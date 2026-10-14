@@ -565,15 +565,17 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Implement in:** `lowering.py`, `memory.py`, and the attention provider.
 
-- [ ] Start with a bounded contiguous cache. Define capacity, valid length, layout, storage identity, and update ranges.
-- [ ] Import cache reads and writes with source ordering. Bind current state through the PyTorch/Hugging Face wrapper.
-- [ ] Guard capacities. Keep runtime lengths dynamic within those guards unless their values are valid specialization assumptions.
-- [ ] Emit required writes and state updates inside the workload kernel. Retain every externally visible state result.
-- [ ] Add dependencies for overlapping reads and writes. Keep cache lifetime separate from temporary workspace lifetime.
+- [x] Start with a bounded contiguous cache. Define capacity, valid length, layout, storage identity, and update ranges.
+- [x] Import cache reads and writes with source ordering. Bind current state through the PyTorch/Hugging Face wrapper.
+- [x] Guard capacities. Keep runtime lengths dynamic within those guards unless their values are valid specialization assumptions.
+- [x] Emit required writes and state updates inside the workload kernel. Retain every externally visible state result.
+- [x] Add dependencies for overlapping reads and writes. Keep cache lifetime separate from temporary workspace lifetime.
 
 **Output:** stateful decode plans with explicit cache ownership and update work.
 
 **Check:** run prefill followed by at least two advancing decode calls. Compare full cache contents and outputs, including calls near capacity.
+
+**Evidence:** explicit `megabake::kv_attention` capture now retains a bounded contiguous cache contract with runtime int32 valid length, source-ordered reads/writes, capacity guards, boundary-state storage separate from workspace, and state-access dependencies. The attention body emits dynamic-prefix reads plus in-kernel K/V and length writes. CPU tests cover capture, lowering, decode-only policy, overlapping-state dependencies, wrapper binding, eager advancing state, and generated-source emission; the SM90 test covers prefill-initialized state followed by two decode calls to exact capacity. The SM90 test was not executed on this GPU-less host.
 
 ## 29. Compile a complete transformer block
 

@@ -26,11 +26,11 @@ The compilation path is:
 4. Generate baseline CuTe bodies from supported tensor primitives and add valid tuned candidates. Plan their execution in one persistent kernel where legal.
 5. Check the complete invocation and measure it against the strongest equivalent baseline: `torch.compile` and CUDA Graph replay.
 
-The design preserves the tuned pipeline inside each body. It starts with ordered phases and refines tile readiness where measurements justify it. The frontend accepts `--mode prefill|decode`, validates the captured state contract, and uses mode-specific bounded search priorities while actual dimensions select the body family. Stateful KV updates remain a later task. On an SM90 CUDA device, `make_backend()` compiles supported post-grad graphs into one cooperative CuTe workload kernel and rebinds current inputs and parameters on every call. Pass `compile_kernel=False` to retain the FX reference path for CPU-only capture work.
+The design preserves the tuned pipeline inside each body. It starts with ordered phases and refines tile readiness where measurements justify it. The frontend accepts `--mode prefill|decode`, validates the captured state contract, and uses mode-specific bounded search priorities while actual dimensions select the body family. Bounded contiguous one-token decode KV state is supported through an explicit cache contract; broader Hugging Face cache formats remain later work. On an SM90 CUDA device, `make_backend()` compiles supported post-grad graphs into one cooperative CuTe workload kernel and rebinds current inputs and parameters on every call. Pass `compile_kernel=False` to retain the FX reference path for CPU-only capture work.
 
 A complete-model request includes all requested outputs and state updates. Named region matchers enable optimizations. Unfamiliar combinations of supported primitives use generic lowering. Unknown operator semantics or an illegal composition produce an explicit failure. The proposed `fallback=inductor` option can delegate the whole invocation and report that result as external fallback. Strict megakernel compilation defaults to `fallback=error`. These paths are not implemented yet.
 
-The first frontend-to-kernel compiler path is implemented for supported SM90 workloads. Complete-model coverage, stateful decode, fallback delegation, and measured optimization work remain open in later TASKS.md steps.
+The first frontend-to-kernel compiler path is implemented for supported SM90 workloads. Complete-model coverage, broader stateful cache formats, fallback delegation, and measured optimization work remain open in later TASKS.md steps.
 
 ## Current performance
 

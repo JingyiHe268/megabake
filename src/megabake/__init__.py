@@ -10,6 +10,8 @@ from .graph import ComputeGraph, import_fx
 from .lowering import (
     canonicalize_semantics,
     dump_lowering_graph,
+    KVCacheAccess,
+    kv_attention,
     lower_semantics,
     semantic_coverage,
 )
@@ -62,6 +64,8 @@ __all__ = [
     "CaptureContext",
     "PreparedFX",
     "ComputeGraph",
+    "KVCacheAccess",
+    "kv_attention",
     "import_fx",
     "canonicalize_semantics",
     "dump_lowering_graph",
