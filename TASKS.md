@@ -442,15 +442,17 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Implement in:** `cache.py`, with `make_plan_key` and `get_or_compile`.
 
-- [ ] Key plans by graph, guards, shapes, strides, types, semantic constants, numerical policy, mode/state layout, and target resources.
-- [ ] Include body revisions and toolchain versions. Keep parameter addresses and contents as runtime bindings unless explicitly folded.
-- [ ] Store selected plans, compiled artifacts, resource requirements, and rejection diagnostics.
-- [ ] Rebuild descriptors for current bindings where needed. Invalidate packed or folded parameters on replacement or mutation.
-- [ ] Manage workspace lifetime across calls and streams. Prevent concurrent calls from sharing mutable execution state.
+- [x] Key plans by graph, guards, shapes, strides, types, semantic constants, numerical policy, mode/state layout, and target resources.
+- [x] Include body revisions and toolchain versions. Keep parameter addresses and contents as runtime bindings unless explicitly folded.
+- [x] Store selected plans, compiled artifacts, resource requirements, and rejection diagnostics.
+- [x] Rebuild descriptors for current bindings where needed. Invalidate packed or folded parameters on replacement or mutation.
+- [x] Manage workspace lifetime across calls and streams. Prevent concurrent calls from sharing mutable execution state.
 
 **Output:** repeated calls that reuse compilation without retaining example tensor addresses.
 
 **Check:** test cache hits, changed shapes, changed strides, parameter replacement, mutation, and overlapping calls with separate state.
+
+**Evidence:** `PlanCache` performs lookup before reference execution and candidate compilation, so a hit skips the search. Keys cover the canonical graph and capture contract, body revision manifest, scheduler, target, and toolchain. Cached artifacts retain no parameter tensors or ready buffers; each bound callable owns its workspace and event state. The SM90 test covers a true hit, parameter replacement, in-place mutation, and overlapping calls with separate state.
 
 ## 22. Implement explicit whole-invocation fallback
 

@@ -466,6 +466,11 @@ def make_backend(**options: Any) -> Callable[..., Any]:
     _check_torch_version()
     validated_options = _validate_options(options)
     cache = CaptureCache()
+    plan_cache = None
+    if validated_options["cache"]:
+        from .cache import PlanCache
+
+        plan_cache = PlanCache()
     contexts: list[CaptureContext] = []
 
     def prepare(
@@ -531,6 +536,7 @@ def make_backend(**options: Any) -> Callable[..., Any]:
                     else None
                 ),
                 scheduler=validated_options["scheduler"],
+                cache=plan_cache,
             )
             forward = compiled
             prepared.context.requirements["execution"] = "megakernel"
@@ -538,6 +544,7 @@ def make_backend(**options: Any) -> Callable[..., Any]:
             forward = prepared.forward
         forward.megabake_contexts = contexts
         forward.megabake_cache = cache
+        forward.megabake_plan_cache = plan_cache
         if compiled is not None:
             backend.megabake_last_compiled = compiled.megabake_compiled
             backend.megabake_last_compile_us = forward.megabake_compile_us
@@ -545,6 +552,7 @@ def make_backend(**options: Any) -> Callable[..., Any]:
         return forward
 
     backend.megabake_cache = cache
+    backend.megabake_plan_cache = plan_cache
     backend.megabake_contexts = contexts
     backend.megabake_options = MappingProxyType(validated_options)
     backend.megabake_prepare = prepare

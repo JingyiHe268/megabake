@@ -19,6 +19,7 @@ from torch.utils import _pytree as pytree
 
 from .bodies import SelectionPolicy, TargetFacts
 from .bodies.gemm import cute_gemm_tensors
+from .cache import PlanCache, make_plan_key
 from .codegen import GeneratedCuTeModule, emit_cute
 from .diagnostics import CompilerDiagnostic, CompilerError
 from .frontend import CaptureContext, PreparedFX
@@ -26,12 +27,14 @@ from .graph import ComputeGraph, import_fx
 from .lowering import canonicalize_semantics
 from .memory import verify_plan
 from .plan import (
+    BodySelectionPlan,
     KernelPlan,
     PlanMeasurement,
     PlanSearchResult,
     SearchBudget,
     search_plans,
 )
+from .planner import enumerate_body_selections
 from .schedule import EventSchedule, make_region_event_schedule
 from .regions import form_regions
 from .runtime import (
@@ -69,9 +72,8 @@ class CompiledKernel:
     event_schedule: EventSchedule | None
     input_order: tuple[str, ...]
     parameter_names: frozenset[str]
-    parameter_tensors: Mapping[str, torch.Tensor]
-    ready: torch.Tensor
     work_iterators: Mapping[str, torch.Tensor]
+    max_active_clusters: Any | None = None
     search: Any | None = None
 
 
@@ -92,6 +94,7 @@ def compile_post_grad(
     output_dir: Path | str | None = None,
     search_budget: SearchBudget | int | None = None,
     scheduler: str = "phase",
+    cache: PlanCache | None = None,
 ) -> Callable[..., Any]:
     compile_started = time.perf_counter()
     if scheduler not in {"phase", "region-events", "auto"}:
@@ -105,84 +108,124 @@ def compile_post_grad(
         budget = SearchBudget(max_plans=search_budget)
     else:
         budget = search_budget or SearchBudget()
-    with torch.no_grad():
-        reference = prepared.forward(*prepared.example_inputs)
-    if scheduler == "auto":
-        phase_result = _search_scheduler(
-            graph,
-            selected_target,
-            policy,
-            budget,
-            prepared,
-            reference,
-            output_dir,
-            "phase",
+
+    plan_key: str | None = None
+    if cache is not None:
+        selections = enumerate_body_selections(graph, selected_target, policy)
+        key_selection = (
+            selections[0]
+            if selections
+            else BodySelectionPlan((), (), (), (), graph, selected_target)
         )
-        event_result = _search_scheduler(
-            graph,
-            selected_target,
-            policy,
-            budget,
-            prepared,
-            reference,
-            output_dir,
-            "region-events",
-        )
-        choices = (phase_result, event_result)
-        chosen = min(
-            (result for result in choices if result.selected is not None),
-            key=_selected_median,
-            default=phase_result,
-        )
-        result = PlanSearchResult(
-            chosen.selected,
-            chosen.selected_compiled,
-            tuple(
-                candidate
-                for labeled in choices
-                for candidate in labeled.candidates
-            ),
-            tuple(
-                rejection
-                for labeled in choices
-                for rejection in labeled.rejections
-            ),
-            any(labeled.budget_exhausted for labeled in choices),
-            chosen.selected_description,
-        )
-    else:
-        result = _search_scheduler(
-            graph,
-            selected_target,
-            policy,
-            budget,
-            prepared,
-            reference,
-            output_dir,
-            scheduler,
-        )
-    if result.selected is None or result.selected_compiled is None:
-        reasons = "; ".join(
-            f"{candidate.description}: {candidate.reason or candidate.status}"
-            for candidate in result.candidates
-            if candidate.status != "measured"
-        )
-        raise CompilerError(
-            CompilerDiagnostic(
-                "plan-search",
-                reasons or "no measured complete plan was produced",
-                _source_op_ids_from_graph(graph),
-                tuple(region.id for region in graph.regions),
-                "one correct measured complete plan",
+        body_revisions = tuple(
+            dict.fromkeys(
+                (
+                    selected.body.provider,
+                    selected.body.evidence.revision,
+                    selected.body.semantic.numerical_policy,
+                )
+                for selection in selections
+                for selected in selection.selections
             )
         )
-    compiled = result.selected_compiled
-    result = replace(result, selected=compiled.plan)
-    compiled = replace(compiled, search=result)
-    if compiled.event_schedule is not None:
-        compiled.ready.zero_()
-    forward = bind_callable(compiled, prepared.context)
+        plan_key = make_plan_key(
+            key_selection,
+            prepared.context,
+            scheduler=scheduler,
+            body_revisions=body_revisions,
+        )
+
+    def compile_selected() -> CompiledKernel:
+        with torch.no_grad():
+            reference = prepared.forward(*prepared.example_inputs)
+        if scheduler == "auto":
+            phase_result = _search_scheduler(
+                graph,
+                selected_target,
+                policy,
+                budget,
+                prepared,
+                reference,
+                output_dir,
+                "phase",
+            )
+            event_result = _search_scheduler(
+                graph,
+                selected_target,
+                policy,
+                budget,
+                prepared,
+                reference,
+                output_dir,
+                "region-events",
+            )
+            choices = (phase_result, event_result)
+            chosen = min(
+                (result for result in choices if result.selected is not None),
+                key=_selected_median,
+                default=phase_result,
+            )
+            result = PlanSearchResult(
+                chosen.selected,
+                chosen.selected_compiled,
+                tuple(
+                    candidate
+                    for labeled in choices
+                    for candidate in labeled.candidates
+                ),
+                tuple(
+                    rejection
+                    for labeled in choices
+                    for rejection in labeled.rejections
+                ),
+                any(labeled.budget_exhausted for labeled in choices),
+                chosen.selected_description,
+            )
+        else:
+            result = _search_scheduler(
+                graph,
+                selected_target,
+                policy,
+                budget,
+                prepared,
+                reference,
+                output_dir,
+                scheduler,
+            )
+        if result.selected is None or result.selected_compiled is None:
+            reasons = "; ".join(
+                f"{candidate.description}: {candidate.reason or candidate.status}"
+                for candidate in result.candidates
+                if candidate.status != "measured"
+            )
+            raise CompilerError(
+                CompilerDiagnostic(
+                    "plan-search",
+                    reasons or "no measured complete plan was produced",
+                    _source_op_ids_from_graph(graph),
+                    tuple(region.id for region in graph.regions),
+                    "one correct measured complete plan",
+                )
+            )
+        result = replace(result, selected=result.selected_compiled.plan)
+        return replace(result.selected_compiled, search=result)
+
+    cache_hit = False
+    if cache is not None:
+        assert plan_key is not None
+        cache_result = cache.get_or_compile(plan_key, compile_selected)
+        compiled = cache_result.compiled
+        cache_hit = cache_result.hit
+    else:
+        compiled = compile_selected()
+    parameter_tensors = _current_parameter_tensors(
+        compiled, prepared.context, prepared.example_inputs
+    )
+    forward = bind_callable(
+        compiled, prepared.context, parameter_tensors=parameter_tensors
+    )
     forward.megabake_compile_us = (time.perf_counter() - compile_started) * 1_000_000
+    forward.megabake_cache_hit = cache_hit
     return forward
 
 
@@ -242,10 +285,12 @@ def compile_plan(
                 current_plan, artifact_dir, event_schedule=event_schedule
             )
             module = _load_generated_module(generated)
+            max_active_clusters = _max_active_clusters(generated)
             state = _RuntimeState.create(
                 current_plan,
                 generated,
                 input_tensors,
+                max_active_clusters=max_active_clusters,
                 ready=(
                     torch.zeros(
                         len(event_schedule.events),
@@ -323,12 +368,11 @@ def compile_plan(
                 current_plan.graph.values[value_id].binding_name or value_id
                 for value_id in current_plan.graph.inputs
             )
-            parameter_tensors = {
-                name: value
+            parameter_names = frozenset(
+                name
                 for name, value in zip(input_order, example_inputs, strict=True)
                 if isinstance(value, torch.nn.Parameter)
-            }
-            parameter_names = frozenset(parameter_tensors)
+            )
             torch.cuda.synchronize(device)
             return CompiledKernel(
                 current_plan,
@@ -339,9 +383,8 @@ def compile_plan(
                 event_schedule,
                 input_order,
                 parameter_names,
-                parameter_tensors,
-                state.ready,
                 state.work_iterators,
+                max_active_clusters,
             )
 
     raise CompilerError(
@@ -355,8 +398,57 @@ def compile_plan(
     )
 
 
+def _current_parameter_tensors(
+    compiled_kernel: CompiledKernel,
+    context: CaptureContext,
+    example_inputs: Sequence[Any],
+) -> dict[str, torch.Tensor]:
+    positions = {
+        spec.name: position for position, spec in enumerate(context.input_specs)
+    }
+    values: dict[str, torch.Tensor] = {}
+    for graph_name in compiled_kernel.input_order:
+        if graph_name not in compiled_kernel.parameter_names:
+            continue
+        candidates = (graph_name, graph_name.removeprefix("l_").removesuffix("_"))
+        position = next(
+            (positions[name] for name in candidates if name in positions), None
+        )
+        if position is None:
+            raise CompilerError(
+                CompilerDiagnostic(
+                    "callable-binding",
+                    f"cannot map parameter {graph_name!r} to a captured input",
+                    requirement="current parameter binding",
+                )
+            )
+        values[graph_name] = example_inputs[position]
+    return values
+
+
+def _initial_ready(
+    compiled_kernel: CompiledKernel, device: torch.device
+) -> torch.Tensor | None:
+    if compiled_kernel.event_schedule is None:
+        return None
+    return torch.zeros(
+        len(compiled_kernel.event_schedule.events),
+        dtype=torch.int32,
+        device=device,
+    )
+
+
+def _max_active_clusters(generated: GeneratedCuTeModule) -> Any | None:
+    if "max_active_clusters" not in generated.launch.arguments:
+        return None
+    return cutlass.utils.HardwareInfo().get_max_active_clusters(1)
+
+
 def bind_callable(
-    compiled_kernel: CompiledKernel, context: CaptureContext
+    compiled_kernel: CompiledKernel,
+    context: CaptureContext,
+    *,
+    parameter_tensors: Mapping[str, torch.Tensor] | None = None,
 ) -> Callable[..., Any]:
     if not context.input_order:
         raise CompilerError(
@@ -383,6 +475,7 @@ def bind_callable(
     runtime_positions = [
         index for index in range(len(context.input_order)) if index not in parameter_positions
     ]
+    current_parameters = dict(parameter_tensors or {})
     trace: list[CallableTrace] = []
     runtime_lock = threading.Lock()
     state: _RuntimeState | None = None
@@ -417,7 +510,7 @@ def bind_callable(
                 full_inputs[position] = value
             for position in parameter_positions:
                 name = context.input_order[position]
-                value = compiled_kernel.parameter_tensors.get(name)
+                value = current_parameters.get(name)
                 if value is None:
                     raise CompilerError(
                         CompilerDiagnostic(
@@ -446,11 +539,13 @@ def bind_callable(
             )
 
             if state is None:
+                ready = _initial_ready(compiled_kernel, active_stream.device)
                 state = _RuntimeState.create(
                     compiled_kernel.plan,
                     compiled_kernel.generated,
                     input_tensors,
-                    ready=compiled_kernel.ready,
+                    max_active_clusters=compiled_kernel.max_active_clusters,
+                    ready=ready,
                     work_iterators=compiled_kernel.work_iterators,
                 )
             else:
@@ -548,7 +643,13 @@ def _make_plan_evaluator(
                 output_dir=output_dir,
                 scheduler=scheduler,
             )
-            executable = bind_callable(compiled, prepared.context)
+            executable = bind_callable(
+                compiled,
+                prepared.context,
+                parameter_tensors=_current_parameter_tensors(
+                    compiled, prepared.context, prepared.example_inputs
+                ),
+            )
             with torch.no_grad():
                 actual = executable(*prepared.example_inputs)
             relative_error = _output_relative_l2(reference, actual)
@@ -661,7 +762,8 @@ def _isolated_kernel_samples(
         compiled_kernel.plan,
         compiled_kernel.generated,
         _input_tensors(graph, graph_inputs),
-        ready=compiled_kernel.ready,
+        max_active_clusters=compiled_kernel.max_active_clusters,
+        ready=_initial_ready(compiled_kernel, torch.cuda.current_stream().device),
         work_iterators=compiled_kernel.work_iterators,
     )
     if compiled_kernel.event_schedule is not None:
@@ -1047,6 +1149,7 @@ class _RuntimeState:
         input_tensors: Mapping[str, torch.Tensor],
         ready: torch.Tensor,
         work_iterators: Mapping[str, torch.Tensor],
+        max_active_clusters: Any | None,
         workspace: Mapping[str, torch.Tensor],
         outputs: Mapping[str, torch.Tensor],
         values: Mapping[str, torch.Tensor],
@@ -1069,11 +1172,7 @@ class _RuntimeState:
             int, tuple[tuple[tuple[Any, ...], ...], tuple[Any, ...]]
         ] = {}
         self._ready_view: tuple[torch.Tensor, Any] | None = None
-        self._max_active_clusters = (
-            cutlass.utils.HardwareInfo().get_max_active_clusters(1)
-            if "max_active_clusters" in generated.launch.arguments
-            else None
-        )
+        self._max_active_clusters = max_active_clusters
 
     @classmethod
     def create(
@@ -1081,6 +1180,7 @@ class _RuntimeState:
         plan: KernelPlan,
         generated: GeneratedCuTeModule,
         input_tensors: Mapping[str, torch.Tensor],
+        max_active_clusters: Any | None = None,
         ready: torch.Tensor | None = None,
         work_iterators: Mapping[str, torch.Tensor] | None = None,
     ) -> _RuntimeState:
@@ -1122,6 +1222,7 @@ class _RuntimeState:
             input_tensors,
             ready,
             work_iterators,
+            max_active_clusters,
             workspace,
             {},
             {},

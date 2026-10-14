@@ -5,6 +5,7 @@ from .frontend import (
     make_backend,
     prepare_fx_graph,
 )
+from .cache import PlanCache, PlanCacheEntry, PlanCacheResult, make_plan_key
 from .graph import ComputeGraph, import_fx
 from .lowering import (
     canonicalize_semantics,
@@ -54,6 +55,10 @@ from .schedule import (
 
 __all__ = [
     "CaptureCache",
+    "PlanCache",
+    "PlanCacheEntry",
+    "PlanCacheResult",
+    "make_plan_key",
     "CaptureContext",
     "PreparedFX",
     "ComputeGraph",
