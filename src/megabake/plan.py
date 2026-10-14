@@ -303,6 +303,9 @@ class PlanMeasurement:
     complete_call_samples_us: tuple[float, ...] = ()
     device_event_span_samples_us: tuple[float, ...] = ()
     median_complete_call_us: float | None = None
+    median_device_event_span_us: float | None = None
+    isolated_launch_samples_us: tuple[float, ...] = ()
+    median_isolated_launch_us: float | None = None
     verification_complete_call_us: float | None = None
     error: str | None = None
 
@@ -356,6 +359,16 @@ class PlanSearchResult:
                     "reason": candidate.reason,
                     "median_complete_call_us": (
                         candidate.measurement.median_complete_call_us
+                        if candidate.measurement is not None
+                        else None
+                    ),
+                    "median_device_event_span_us": (
+                        candidate.measurement.median_device_event_span_us
+                        if candidate.measurement is not None
+                        else None
+                    ),
+                    "median_isolated_launch_us": (
+                        candidate.measurement.median_isolated_launch_us
                         if candidate.measurement is not None
                         else None
                     ),
@@ -612,7 +625,7 @@ def search_plans(
     selected = (
         min(
             measured,
-            key=lambda candidate: candidate.measurement.median_complete_call_us,
+            key=lambda candidate: _measurement_rank(candidate.measurement),
         )
         if measured
         else None
@@ -635,6 +648,16 @@ def _selection_description(
         for selected in selection.selections
     )
     return f"workers={worker_count};bodies={bodies}"
+
+
+def _measurement_rank(measurement: PlanMeasurement) -> float:
+    if measurement.median_isolated_launch_us is not None:
+        return measurement.median_isolated_launch_us
+    if measurement.median_device_event_span_us is not None:
+        return measurement.median_device_event_span_us
+    if measurement.median_complete_call_us is not None:
+        return measurement.median_complete_call_us
+    return float("inf")
 
 
 def _projected_shared_memory(plan: KernelPlan) -> int:

@@ -52,10 +52,10 @@ def _plan(model, *inputs):
 
 def test_emit_cute_deduplicates_equivalent_bodies_and_saves_diagnostics(tmp_path):
     class Model(torch.nn.Module):
-        def forward(self, value):
-            return torch.relu(value) + torch.relu(value)
+        def forward(self, left, right):
+            return left.sum(dim=-1) + right.sum(dim=-1)
 
-    plan = _plan(Model(), torch.randn(5, 70))
+    plan = _plan(Model(), torch.randn(5, 70), torch.randn(5, 70))
     generated = emit_cute(plan, tmp_path)
 
     ast.parse(generated.source)
@@ -75,7 +75,7 @@ def test_emit_cute_deduplicates_equivalent_bodies_and_saves_diagnostics(tmp_path
 
     source_lines = generated.source.splitlines()
     for symbol, expected in (
-        ("_body_0", "linear_index"),
+        ("_body_0", "sync_threads"),
         ("megabake_kernel", "cooperative_worker_loop("),
         ("launch", ".launch("),
     ):

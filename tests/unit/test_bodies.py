@@ -245,6 +245,30 @@ def test_emit_contraction_body_generates_gemm_source():
     assert "output[o0, o1] = stored_value" in body.source
 
 
+def test_emit_map_body_decomposes_coordinates_by_output_strides():
+    class Model(torch.nn.Module):
+        def forward(self, value):
+            return value + 1
+
+    row_major = torch.randn(5, 70)
+    column_major = row_major.t()
+    programs = []
+    for value in (row_major, column_major):
+        region = _regions(Model(), value)[0]
+        config = get_candidates(region, _target(), _policy()).configurations[0]
+        programs.append((region.tensor_programs[0], config))
+
+    row_body = emit_map_body(*programs[0])
+    column_body = emit_map_body(*programs[1])
+
+    assert "o1 = linear_index % 70" in row_body.source
+    assert "linear_index = linear_index // 70" in row_body.source
+    assert "o0 = linear_index % 5" in row_body.source
+    assert "o0 = linear_index % 70" in column_body.source
+    assert "linear_index = linear_index // 70" in column_body.source
+    assert "o1 = linear_index % 5" in column_body.source
+
+
 def test_emit_contraction_body_preserves_bias_partial_dimensions_and_cast():
     class Model(torch.nn.Module):
         def forward(self, source, weight, bias):

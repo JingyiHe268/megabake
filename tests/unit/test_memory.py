@@ -52,7 +52,7 @@ def test_assign_storage_separates_live_intermediates_and_boundary_outputs():
         def forward(self, value):
             left = torch.relu(value)
             right = torch.neg(value)
-            return left + right
+            return left + right, left * right
 
     plan = _kernel_plan(Model(), torch.randn(2, 3))
     verify_plan(plan)
@@ -123,7 +123,7 @@ def test_verify_plan_rejects_missing_output_undersized_and_overlapping_storage()
         def forward(self, value):
             left = value.relu()
             right = value.neg()
-            return left + right
+            return left + right, left * right
 
     plan = _kernel_plan(Model(), torch.randn(2, 3))
     missing_output = replace(

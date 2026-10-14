@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import torch
 import pytest
@@ -8,6 +9,7 @@ import pytest
 import megabake.planner as planner_module
 from megabake import make_tile_maps, select_bodies
 from megabake.bodies import TargetFacts
+from megabake.compiler import _graph_ordered_inputs
 from megabake.frontend import prepare_fx_graph
 from megabake.graph import import_fx
 from megabake.lowering import canonicalize_semantics
@@ -161,6 +163,60 @@ def test_search_plans_measures_provider_and_worker_candidates():
     assert result.selected.selection.selections[0].body.name == "g0_range_64x128"
     assert result.selected_compiled is not None
     assert result.report()["selected"].startswith("workers=")
+
+
+def test_search_plans_prefers_isolated_time_over_host_binding_time():
+    class Model(torch.nn.Module):
+        def forward(self, source, weight):
+            return source @ weight.T
+
+    source = torch.randn(128, 128, dtype=torch.bfloat16)
+    weight = torch.randn(128, 128, dtype=torch.bfloat16)
+
+    def evaluate(plan, budget):
+        body_name = plan.selection.selections[0].body.name
+        is_generic = body_name.startswith("generic")
+        return PlanMeasurement(
+            compiled=object(),
+            resources={"registers_per_thread": 1},
+            correct=True,
+            complete_call_samples_us=(10.0 if is_generic else 20.0,),
+            median_complete_call_us=10.0 if is_generic else 20.0,
+            device_event_span_samples_us=(30.0 if is_generic else 5.0,),
+            median_device_event_span_us=30.0 if is_generic else 5.0,
+            isolated_launch_samples_us=(30.0 if is_generic else 5.0,),
+            median_isolated_launch_us=30.0 if is_generic else 5.0,
+        )
+
+    result = search_plans(
+        _graph(Model(), source, weight),
+        _target(),
+        budget=SearchBudget(
+            max_plans=8,
+            max_compilations=8,
+            timing_samples=1,
+            evaluator=evaluate,
+        ),
+    )
+
+    assert result.selected is not None
+    assert not result.selected.selection.selections[0].body.name.startswith("generic")
+
+
+def test_graph_ordered_inputs_maps_aot_lifted_parameters():
+    context = SimpleNamespace(
+        input_specs=[
+            SimpleNamespace(name="source"),
+            SimpleNamespace(name="weight"),
+        ]
+    )
+    compiled = SimpleNamespace(input_order=("l_weight_", "l_source_"))
+    source, weight = object(), object()
+
+    assert _graph_ordered_inputs(compiled, context, (source, weight)) == (
+        source,
+        weight,
+    )
 
 
 def test_search_plans_records_unmeasured_candidates_when_budget_is_exhausted():

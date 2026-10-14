@@ -425,15 +425,16 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 - [x] Relax the scalar-chain layout check so intermediates may change dtype when shape and stride ownership are preserved. This unblocks the five-operation SiLU suffix (`neg → exp → add → div → convert`) and the following multiply when both feed a single tail.
 - [x] Topologically sort selected bodies after dependencies are computed so storage-order checks do not create false cycles for fused regions. The fused region previously appeared before its producers in the selection list; `_storage_order_dependencies` then added a conflicting WRITE_AFTER_READ edge.
-- [ ] Extend the chain walker to accept DAG-shaped scalar regions where every user of an intermediate value is also inside the region. The SiLU FP32 cast currently has two users (`neg` and `div`); both are internal but the linear walker stops at the first multi-use producer.
-- [ ] Compose the resulting expression DAG in `_compose_scalar_chain`, preserving every source cast and rounding point.
-- [ ] Measure the complete MLP and record the phase count and kernel time. Compare against the unfused baseline and Inductor.
+- [x] Extend the chain walker to accept DAG-shaped scalar regions where every user of an intermediate value is also inside the region. The SiLU FP32 cast currently has two users (`neg` and `div`); both are internal but the linear walker stops at the first multi-use producer.
+- [x] Compose the resulting expression DAG in `_compose_scalar_chain`, preserving every source cast and rounding point.
+- [x] Decompose flat output indices in actual stride order, including stride-zero axes, so consecutive threads vary the contiguous coordinate.
+- [x] Measure the complete MLP and record the phase count and kernel time. Compare against the unfused baseline and Inductor.
 
 **Output:** a fused scalar region that replaces the seven separate elementwise phases with one, then zero once the multiply joins the GEMM epilogue.
 
 **Check:** the fused region preserves exact output, every source cast, and every secondary output. The selected plan contains one elementwise region or none. Kernel time at batch 256 drops by roughly the measured elementwise overhead (about 160 µs unfused).
 
-**Evidence:** the unfused baseline is in [PERFORMANCE_REPORT.md](PERFORMANCE_REPORT.md) section 5. After the first two items, the MLP plan drops from 10 phases to 5 (`mm`, `convert`, `mm_1`, `mul:fused`, `mm_2`) with exact output. Isolated kernel time at batch 1 improves from 38.4 to 14.1 µs (parity with eager CUDA Graph at 14.2 µs); batch 256 improves from 176.9 to 62.5 µs. The remaining elementwise gap is the separate BF16→FP32 cast and the scalar body.
+**Evidence:** the unfused baseline is in [PERFORMANCE_REPORT.md](PERFORMANCE_REPORT.md) section 5. The completed DAG walker produces a 4-phase plan at batches 1 and 256 (`mm`, `mm_1`, `mul:fused`, `mm_2`) with exact output. Ranking plans by prebuilt isolated launch timing removes host-binding noise from selection. Stride-aware indexing removes the M=256 uncoalescing loss: NCU reports 89,542 global sectors actual versus 89,542 ideal, 34.56 µs duration, 12.19% achieved occupancy, and long-scoreboard/barrier/wait as the leading sampled stalls. The clean benchmark is 13.38 µs kernel and 15.85 µs burst at M=1, and 30.53 µs kernel and 33.24 µs burst at M=256; eager CUDA Graph is 14.31/16.61 µs and 15.97/18.86 µs, while Inductor CUDA Graph is 8.74/10.42 µs and 14.18/16.92 µs. An 8-element unroll measured 30.41 µs and explicit repeated-load reuse measured 30.50 µs at M=256; both were too small to justify their added complexity and were discarded. The public bound path remains host-dominated at 307.84 µs (M=1) and 326.41 µs (M=256).
 
 ## 21. Cache compiled plans while retaining live bindings
 

@@ -567,6 +567,12 @@ def _make_plan_evaluator(
             verification_samples, _ = _complete_call_samples(
                 executable, prepared.example_inputs, 1
             )
+            isolated_samples = _isolated_kernel_samples(
+                compiled,
+                prepared.context,
+                prepared.example_inputs,
+                budget.timing_samples,
+            )
             return PlanMeasurement(
                 compiled=compiled,
                 resources=compiled.resources,
@@ -574,6 +580,9 @@ def _make_plan_evaluator(
                 complete_call_samples_us=complete_samples,
                 device_event_span_samples_us=device_samples,
                 median_complete_call_us=median(complete_samples),
+                median_device_event_span_us=median(device_samples),
+                isolated_launch_samples_us=isolated_samples,
+                median_isolated_launch_us=median(isolated_samples),
                 verification_complete_call_us=verification_samples[0],
             )
         except Exception as error:
@@ -620,10 +629,128 @@ def _search_scheduler(
 def _selected_median(result: Any) -> float:
     for candidate in result.candidates:
         if candidate.plan is result.selected and candidate.measurement is not None:
-            median_value = candidate.measurement.median_complete_call_us
+            median_value = (
+                candidate.measurement.median_isolated_launch_us
+                if candidate.measurement.median_isolated_launch_us is not None
+                else candidate.measurement.median_device_event_span_us
+                if candidate.measurement.median_device_event_span_us is not None
+                else candidate.measurement.median_complete_call_us
+            )
             if median_value is not None:
                 return median_value
     return float("inf")
+
+
+def _isolated_kernel_samples(
+    compiled_kernel: CompiledKernel,
+    context: CaptureContext,
+    example_inputs: Sequence[Any],
+    count: int,
+) -> tuple[float, ...]:
+    graph_inputs = _graph_ordered_inputs(compiled_kernel, context, example_inputs)
+    graph = compiled_kernel.plan.graph
+    if graph is None:
+        raise CompilerError(
+            CompilerDiagnostic(
+                "runtime-binding",
+                "compiled plan is missing its source graph",
+                requirement="source graph",
+            )
+        )
+    state = _RuntimeState.create(
+        compiled_kernel.plan,
+        compiled_kernel.generated,
+        _input_tensors(graph, graph_inputs),
+        ready=compiled_kernel.ready,
+        work_iterators=compiled_kernel.work_iterators,
+    )
+    if compiled_kernel.event_schedule is not None:
+        state.ready.zero_()
+        epoch_stride = 1
+    else:
+        state.ready.fill_(-1)
+        epoch_stride = max(
+            (
+                phase.index
+                for phase in compiled_kernel.plan.phases
+                if phase.barrier is not None
+            ),
+            default=-1,
+        ) + 1
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    fast_path = hasattr(
+        compiled_kernel.compiled, "generate_execution_args"
+    ) and hasattr(compiled_kernel.compiled, "run_compiled_program")
+    epoch = 0
+
+    def prepare() -> tuple[tuple[Any, ...], Any, tuple[Any, ...]]:
+        nonlocal epoch
+        arguments = state.arguments(epoch, stream)
+        epoch += epoch_stride
+        if not fast_path:
+            return arguments, arguments, arguments
+        packed = compiled_kernel.compiled.generate_execution_args(*arguments)
+        execution = (
+            packed[0]
+            if isinstance(packed, tuple) and len(packed) == 2
+            else packed
+        )
+        return execution, packed, arguments
+
+    def launch(token: tuple[tuple[Any, ...], Any, tuple[Any, ...]]) -> None:
+        if fast_path:
+            compiled_kernel.compiled.run_compiled_program(token[0])
+        else:
+            compiled_kernel.compiled(*token[0])
+
+    samples: list[float] = []
+    for _ in range(count):
+        tokens = [prepare() for _ in range(count)]
+        torch.cuda.synchronize()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for token in tokens:
+            launch(token)
+        end.record()
+        end.synchronize()
+        samples.append(start.elapsed_time(end) * 1_000 / count)
+    return tuple(samples)
+
+
+def _graph_ordered_inputs(
+    compiled_kernel: CompiledKernel,
+    context: CaptureContext,
+    example_inputs: Sequence[Any],
+) -> tuple[Any, ...]:
+    positions = {
+        spec.name: position
+        for position, spec in enumerate(context.input_specs)
+    }
+    ordered: list[Any] = [None] * len(example_inputs)
+    for graph_name in compiled_kernel.input_order:
+        candidates = (graph_name, graph_name.removeprefix("l_").removesuffix("_"))
+        position = next(
+            (positions[name] for name in candidates if name in positions), None
+        )
+        if position is None:
+            raise CompilerError(
+                CompilerDiagnostic(
+                    "runtime-binding",
+                    f"cannot map graph input {graph_name!r} to a captured input",
+                    requirement="complete runtime binding",
+                )
+            )
+        ordered[position] = example_inputs[position]
+    if any(value is None for value in ordered):
+        raise CompilerError(
+            CompilerDiagnostic(
+                "runtime-binding",
+                "could not map every captured input to the compiled graph",
+                requirement="complete runtime binding",
+            )
+        )
+    return tuple(ordered)
 
 
 def _complete_call_samples(

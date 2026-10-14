@@ -158,7 +158,7 @@ def emit_map_body(program: TensorProgram, config: BodyConfig) -> GeneratedMapBod
     )
     value = _cast_expression(value, program.store.dtype)
 
-    coordinate_lines = _coordinate_lines(program.store.shape)
+    coordinate_lines = _coordinate_lines(program.store.shape, program.store.strides)
     output_coordinates = ", ".join(
         axis_coordinates[domain.axis] for domain in program.iteration_domains
     )
@@ -230,7 +230,9 @@ def emit_reduction_body(
     assert program.post is not None
     post = _emit_expression(program.post, load_indices, axis_coordinates, program.loads)
 
-    coordinate_lines = _coordinate_lines(program.store.shape, "output_index")
+    coordinate_lines = _coordinate_lines(
+        program.store.shape, program.store.strides, "output_index"
+    )
     output_coordinates = ", ".join(
         axis_coordinates[domain.axis] for domain in output_domains
     )
@@ -325,7 +327,9 @@ def emit_contraction_body(
         program.post, load_indices, axis_coordinates, program.loads
     )
 
-    coordinate_lines = _coordinate_lines(program.store.shape)
+    coordinate_lines = _coordinate_lines(
+        program.store.shape, program.store.strides
+    )
     output_coordinates = ", ".join(
         axis_coordinates[domain.axis] for domain in output_domains
     )
@@ -590,14 +594,23 @@ def _expression_has_accumulator(expression: ScalarExpression) -> bool:
 
 
 def _coordinate_lines(
-    shape: tuple[int, ...], value: str = "linear_index"
+    shape: tuple[int, ...],
+    strides: tuple[int, ...],
+    value: str = "linear_index",
 ) -> str:
+    if len(shape) != len(strides):
+        raise UnsupportedMapBody("output shape and strides do not match")
     lines: list[str] = []
     remainder = value
-    for index, size in enumerate(shape):
+    axes = sorted(
+        range(len(shape)),
+        key=lambda index: (strides[index] == 0, strides[index], index),
+    )
+    for position, index in enumerate(axes):
+        size = shape[index]
         coordinate = f"o{index}"
         lines.append(f"            {coordinate} = {remainder} % {size}\n")
-        if index < len(shape) - 1:
+        if position < len(axes) - 1:
             lines.append(f"            {remainder} = {remainder} // {size}\n")
     return "".join(lines)
 

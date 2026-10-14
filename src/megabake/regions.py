@@ -171,38 +171,36 @@ def _scalar_fusion_candidate(tail: Op, graph: ComputeGraph) -> RegionCandidate |
     if tail.tensor_program.family not in {"elementwise", "copy"}:
         return None
 
-    chain = [tail]
-    current = tail
-    while True:
-        producer = _single_internal_producer(current, graph)
-        if producer is None:
-            break
-        chain.insert(0, producer)
-        current = producer
-    if len(chain) < 2:
+    operations = _scalar_fusion_operations(tail, graph)
+    if len(operations) < 2:
         return None
 
+    operation_ids = {operation.id for operation in operations}
     rejections: list[str] = []
-    if any(_has_illegal_effects(operation) for operation in chain):
+    if any(_has_illegal_effects(operation) for operation in operations):
         rejections.append("source effects do not fit a vector-chain body")
     if any(
-        operation.results[0] in graph.outputs or len(graph.values[operation.results[0]].users) != 1
-        for operation in chain[:-1]
+        operation.results[0] in graph.outputs
+        or any(
+            user not in operation_ids
+            for user in graph.values[operation.results[0]].users
+        )
+        for operation in operations[:-1]
     ):
         rejections.append("an intermediate value has an external use")
     if not all(
         _same_chain_layout(operation.results[0], tail.results[0], graph)
-        for operation in chain
+        for operation in operations
     ):
         rejections.append("source ownership or broadcast contract changes")
 
-    fused_program = _compose_scalar_chain(tuple(chain), graph)
+    fused_program = _compose_scalar_chain(operations, graph)
     external_inputs = tuple(
         load.value_id for load in fused_program.loads
-    ) if fused_program is not None else _external_inputs(tuple(chain), graph)
+    ) if fused_program is not None else _external_inputs(operations, graph)
     return RegionCandidate(
         id=f"region:{tail.id.removeprefix('op:')}:fused",
-        source_op_ids=tuple(operation.id for operation in chain),
+        source_op_ids=tuple(operation.id for operation in operations),
         external_inputs=external_inputs,
         live_outputs=(tail.results[0],),
         tensor_program=fused_program,
@@ -215,32 +213,42 @@ def _scalar_fusion_candidate(tail: Op, graph: ComputeGraph) -> RegionCandidate |
         },
         cost_bytes=sum(
             _value_bytes(operation.results[0], graph) * 2
-            for operation in chain[:-1]
+            for operation in operations[:-1]
         ),
         rejections=tuple(rejections),
     )
 
 
-def _single_internal_producer(consumer: Op, graph: ComputeGraph) -> Op | None:
-    program = consumer.tensor_program
-    if not isinstance(program, TensorProgram) or program.family not in {
+def _scalar_fusion_operations(tail: Op, graph: ComputeGraph) -> tuple[Op, ...]:
+    operations: list[Op] = []
+    visited: set[str] = set()
+
+    def visit(operation: Op) -> None:
+        if operation.id in visited:
+            return
+        visited.add(operation.id)
+        program = operation.tensor_program
+        if not isinstance(program, TensorProgram):
+            return
+        for load in program.loads:
+            producer_id = graph.values[load.value_id].producer
+            if producer_id is None:
+                continue
+            producer = graph.ops[producer_id]
+            if _is_scalar_operation(producer):
+                visit(producer)
+        operations.append(operation)
+
+    visit(tail)
+    return tuple(operations)
+
+
+def _is_scalar_operation(operation: Op) -> bool:
+    program = operation.tensor_program
+    return isinstance(program, TensorProgram) and program.family in {
         "elementwise",
         "copy",
-    }:
-        return None
-    producers = [
-        graph.ops[graph.values[load.value_id].producer]
-        for load in program.loads
-        if graph.values[load.value_id].producer is not None
-    ]
-    fusible = [
-        producer
-        for producer in producers
-        if isinstance(producer.tensor_program, TensorProgram)
-        and producer.tensor_program.family in {"elementwise", "copy"}
-        and graph.values[producer.results[0]].users == (consumer.id,)
-    ]
-    return fusible[0] if len(fusible) == 1 else None
+    }
 
 
 def _compose_scalar_chain(

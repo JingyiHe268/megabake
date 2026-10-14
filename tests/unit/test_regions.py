@@ -90,6 +90,29 @@ def test_form_regions_builds_executable_vector_chain_candidate_and_keeps_baselin
     assert candidate.semantic_facts["source_casts"] == "preserved"
 
 
+def test_form_regions_builds_executable_scalar_dag_candidate():
+    class Model(torch.nn.Module):
+        def forward(self, value):
+            activated = torch.relu(value)
+            return (activated + 1) * (activated * 2)
+
+    torch.manual_seed(59)
+    value = torch.randn(2, 3)
+    graph = form_regions(_import(Model(), value))
+
+    candidate = graph.regions[-1].fusion_candidates[0]
+    assert candidate.id == "region:mul_1:fused"
+    assert set(candidate.source_op_ids) == {
+        "op:relu",
+        "op:add",
+        "op:mul_1",
+        "op:mul",
+    }
+    assert candidate.executable
+    assert candidate.tensor_program is not None
+    assert candidate.tensor_program.loads[0].value_id == "value:arg0_1"
+
+
 def test_form_regions_rejects_vector_chain_when_intermediate_is_external():
     class Model(torch.nn.Module):
         def forward(self, value):

@@ -112,9 +112,7 @@ def _view(tensor):
 def _run_body(body, tensors, threads):
     count = tensors[-1].numel()
     tile_count = (count + threads - 1) // threads
-    work = (
-        torch.arange(tile_count, device="cuda", dtype=torch.int64) * threads
-    )
+    work = torch.arange(tile_count, device="cuda", dtype=torch.int64) * threads
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     views = [_view(work), *(_view(tensor) for tensor in tensors)]
     compiled = cute.compile(body, *views, stream)

@@ -50,13 +50,14 @@ def _scheduled(model, *inputs):
 
 def test_phase_schedule_handles_fork_join_and_keeps_idle_workers_in_barriers():
     class Model(torch.nn.Module):
-        def forward(self, value):
-            left = torch.relu(value)
-            right = torch.neg(value)
+        def forward(self, left, right):
+            left = left.sum(dim=-1)
+            right = right.sum(dim=-1)
             return left + right
 
-    value = torch.randn(2, 3)
-    selection, dependencies, schedule = _scheduled(Model(), value)
+    left = torch.randn(1, 3)
+    right = torch.randn(1, 3)
+    selection, dependencies, schedule = _scheduled(Model(), left, right)
     join = next(
         selected
         for selected in selection.selections
@@ -128,13 +129,14 @@ def test_dependencies_include_all_reduction_input_tiles():
 
 def test_event_schedule_interleaves_fork_join_without_a_phase_barrier():
     class Model(torch.nn.Module):
-        def forward(self, value):
-            left = torch.relu(value)
-            right = torch.neg(value)
+        def forward(self, left, right):
+            left = left.sum(dim=-1)
+            right = right.sum(dim=-1)
             return left + right
 
-    value = torch.randn(2, 3)
-    selection, dependencies, _ = _scheduled(Model(), value)
+    left = torch.randn(1, 3)
+    right = torch.randn(1, 3)
+    selection, dependencies, _ = _scheduled(Model(), left, right)
     schedule = make_event_schedule(
         selection, dependencies, worker_count=2
     )
