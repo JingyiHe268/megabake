@@ -197,6 +197,13 @@ def compile_post_grad(
             "scheduler must be 'phase', 'region-events', or 'auto'"
         )
     graph, selected_target = _post_grad_graph(prepared, target)
+    if policy is not None and policy.mode != prepared.context.mode:
+        raise ValueError(
+            f"selection mode {policy.mode!r} does not match backend mode "
+            f"{prepared.context.mode!r}"
+        )
+    if policy is None:
+        policy = SelectionPolicy(mode=prepared.context.mode)
     if isinstance(search_budget, int):
         if search_budget < 1:
             raise ValueError("search budget must be positive")

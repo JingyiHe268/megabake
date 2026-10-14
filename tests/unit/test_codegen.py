@@ -147,7 +147,7 @@ def test_emit_cute_reuses_g0_scratch_for_duplicate_body_variants(tmp_path):
     ]
     assert generated.source.count("HopperWgmmaGemmPersistentKernel(") == 1
     assert generated.source.count("SmemAllocator().allocate(_g0_body_") == 1
-    assert generated.launch.shared_memory_bytes == 214_016
+    assert generated.launch.shared_memory_bytes == 230_400
 
 
 def test_emit_cute_keeps_g0_variants_with_different_configurations(tmp_path):

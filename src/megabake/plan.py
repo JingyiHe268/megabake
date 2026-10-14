@@ -11,6 +11,7 @@ from .bodies.interface import (
     AxisExpression,
     BodyConfig,
     ParticipantContract,
+    SelectionPolicy,
     TargetFacts,
     TensorLayout,
     WorkItem,
@@ -423,6 +424,8 @@ def search_plans(
     from .planner import enumerate_body_selections, make_tile_maps
     from .schedule import derive_dependencies, make_phase_schedule
 
+    selected_policy = policy or SelectionPolicy()
+    selections = enumerate_body_selections(graph, target, selected_policy)
     if budget is None:
         selected_budget = SearchBudget()
     elif isinstance(budget, int):
@@ -432,7 +435,6 @@ def search_plans(
     else:
         selected_budget = budget
 
-    selections = enumerate_body_selections(graph, target, policy)
     rejections = tuple(
         dict.fromkeys(
             rejection
@@ -497,7 +499,15 @@ def search_plans(
             continue
 
         worker_variants.append(
-            (selection, tuple(sorted(worker_counts, reverse=True)))
+            (
+                selection,
+                tuple(
+                    sorted(
+                        worker_counts,
+                        reverse=selected_policy.mode != "decode",
+                    )
+                ),
+            )
         )
 
     worker_search_selections = max(1, selected_budget.max_compilations // 3)

@@ -32,8 +32,9 @@ def select_bodies(
     target: TargetFacts,
     policy: SelectionPolicy | None = None,
 ) -> BodySelectionPlan:
+    policy = _validated_policy(graph, policy)
     selections, rejections, unsupported = _enumerate_body_selections(
-        graph, target, policy or SelectionPolicy()
+        graph, target, policy
     )
     if not selections:
         return BodySelectionPlan(
@@ -52,9 +53,34 @@ def enumerate_body_selections(
     target: TargetFacts,
     policy: SelectionPolicy | None = None,
 ) -> tuple[BodySelectionPlan, ...]:
+    policy = _validated_policy(graph, policy)
     return _enumerate_body_selections(
-        graph, target, policy or SelectionPolicy()
+        graph, target, policy
     )[0]
+
+
+def _validated_policy(
+    graph: ComputeGraph, policy: SelectionPolicy | None
+) -> SelectionPolicy:
+    selected_policy = policy or SelectionPolicy()
+    if selected_policy.mode not in {"prefill", "decode"}:
+        raise ValueError(
+            f"selection mode {selected_policy.mode!r} must be 'prefill' or 'decode'"
+        )
+    state_contracts = {
+        facts["cache_effects"]["policy"]
+        for region in graph.regions
+        for facts in (
+            region.semantic_facts,
+            *(candidate.semantic_facts for candidate in region.fusion_candidates),
+        )
+        if facts.get("family") == "attention"
+        and isinstance(facts.get("cache_effects"), dict)
+        and isinstance(facts["cache_effects"].get("policy"), str)
+    }
+    if "stateful" in state_contracts and selected_policy.mode != "decode":
+        raise ValueError("prefill mode cannot compile a stateful KV cache update")
+    return selected_policy
 
 
 def _enumerate_body_selections(
@@ -211,7 +237,10 @@ def _body_options(
     )
     return [
         (region, program, body)
-        for body in sorted(candidates.configurations, key=_body_order)
+        for body in sorted(
+            candidates.configurations,
+            key=lambda body: _body_order(body, region, program, policy),
+        )
     ]
 
 
@@ -260,8 +289,48 @@ def _topological_sort_bodies(
     return tuple(bodies[position] for position in order)
 
 
-def _body_order(config: BodyConfig) -> tuple[int, int, int]:
+def _body_order(
+    config: BodyConfig,
+    region: Region,
+    program: TensorProgram,
+    policy: SelectionPolicy,
+) -> tuple[int, ...]:
+    if program.family == "attention":
+        return _attention_body_order(config, region, policy)
+    if program.family == "contraction" and program.store.shape:
+        return _contraction_body_order(config, program, policy)
     return (0 if config.evidence.measured else 1, *_body_cost(config))
+
+
+def _attention_body_order(
+    config: BodyConfig, region: Region, policy: SelectionPolicy
+) -> tuple[int, ...]:
+    loads = {load.id: load for load in region.tensor_programs[0].loads}
+    grouping = region.semantic_facts["head_grouping"]
+    query_length = loads["attention:q"].source_shape[1]
+    kv_length = loads["attention:k"].source_shape[1]
+    parallelism = grouping["batch"] * grouping["query_heads"] * query_length
+    decode_work = query_length == 1 and kv_length > 0 and parallelism > 0
+    mode_priority = 0 if (policy.mode == "decode") == decode_work else 1
+    return (
+        0 if (config.name == "attention_decode_rows") == decode_work else 1,
+        mode_priority,
+        *_body_cost(config),
+    )
+
+
+def _contraction_body_order(
+    config: BodyConfig, program: TensorProgram, policy: SelectionPolicy
+) -> tuple[int, ...]:
+    small_m = program.store.shape[0] <= 16
+    mode_priority = 0 if (policy.mode == "decode") == small_m else 1
+    small_tile = config.tiles.cta_shape[-1] <= 64
+    return (
+        0 if config.evidence.measured else 1,
+        0 if small_tile == small_m else 1,
+        mode_priority,
+        *_body_cost(config),
+    )
 
 
 def make_tile_maps(selection: BodySelectionPlan) -> tuple[TileMap, ...]:

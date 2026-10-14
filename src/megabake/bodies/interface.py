@@ -23,6 +23,7 @@ class TargetFacts:
 
 @dataclass(frozen=True)
 class SelectionPolicy:
+    mode: str = "prefill"
     allow_generic: bool = True
     allow_tuned: bool = True
     numerical_policy: str = "source_semantics"
@@ -192,6 +193,10 @@ def validate_body_config(
     target: TargetFacts | None = None,
     policy: SelectionPolicy | None = None,
 ) -> None:
+    if policy is not None and policy.mode not in {"prefill", "decode"}:
+        raise InvalidBodyConfig(
+            f"selection mode {policy.mode!r} must be 'prefill' or 'decode'"
+        )
     if config.entrypoint.name != "run" or config.entrypoint.arguments != (
         "work_iterator",
         "tensor_bindings",

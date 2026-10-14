@@ -8,7 +8,7 @@ import pytest
 
 import megabake.planner as planner_module
 from megabake import make_tile_maps, select_bodies
-from megabake.bodies import TargetFacts
+from megabake.bodies import SelectionPolicy, TargetFacts
 from megabake.compiler import _graph_ordered_inputs
 from megabake.frontend import prepare_fx_graph
 from megabake.graph import import_fx
@@ -409,3 +409,113 @@ def test_make_tile_maps_inserts_layout_conversion_with_cost_and_dependency(
     assert conversion.dependencies == (relu.region_id,)
     reduction_map = make_tile_maps(selection)[-1]
     assert reduction_map.conversion_bodies == (conversion,)
+
+
+def test_mode_policy_selects_gemm_family_from_actual_dimensions():
+    class Model(torch.nn.Module):
+        def forward(self, source, weight):
+            return source @ weight.T
+
+    short_prefill = torch.randn(4, 128, dtype=torch.bfloat16)
+    large_decode = torch.randn(128, 128, dtype=torch.bfloat16)
+    weight = torch.randn(128, 128, dtype=torch.bfloat16)
+
+    short_prefill_body = select_bodies(
+        _graph(Model(), short_prefill, weight),
+        _target(),
+        SelectionPolicy(mode="prefill"),
+    ).selections[0]
+    short_decode_body = select_bodies(
+        _graph(Model(), short_prefill, weight),
+        _target(),
+        SelectionPolicy(mode="decode"),
+    ).selections[0]
+    large_decode_body = select_bodies(
+        _graph(Model(), large_decode, weight),
+        _target(),
+        SelectionPolicy(mode="decode"),
+    ).selections[0]
+
+    assert short_prefill_body.body.provider == "g0_range"
+    assert short_prefill_body.body.name == "g0_range_64x64"
+    assert short_decode_body.body.provider == "g0_range"
+    assert short_decode_body.body.name == "g0_range_64x64"
+    assert large_decode_body.body.provider == "g0_range"
+    assert large_decode_body.body.name == "g0_range_64x128"
+
+
+def test_mode_policy_selects_attention_body_from_actual_query_work():
+    def grouped_attention(source, key, value, mask):
+        query = source.permute(0, 2, 1, 3)
+        grouped_key = key.permute(0, 2, 1, 3).repeat_interleave(
+            source.shape[2] // key.shape[2], dim=1
+        )
+        grouped_value = value.permute(0, 2, 1, 3).repeat_interleave(
+            source.shape[2] // value.shape[2], dim=1
+        )
+        scores = (
+            query @ grouped_key.transpose(-2, -1)
+        ) * source.shape[-1] ** -0.5 + mask
+        probabilities = torch.softmax(scores.float(), dim=-1).to(source.dtype)
+        return probabilities @ grouped_value
+
+    class Model(torch.nn.Module):
+        def forward(self, source, key, value, mask):
+            return grouped_attention(source, key, value, mask)
+
+    def selected_body(mode, query_length):
+        source = torch.randn(2, query_length, 4, 8, dtype=torch.bfloat16)
+        key = torch.randn(2, 7, 2, 8, dtype=torch.bfloat16)
+        value = torch.randn(2, 7, 2, 8, dtype=torch.bfloat16)
+        mask = torch.randn(2, 1, query_length, 7, dtype=torch.bfloat16)
+        return select_bodies(
+            _graph(Model(), source, key, value, mask),
+            _target(),
+            SelectionPolicy(mode=mode),
+        ).selections[0].body.name
+
+    assert selected_body("prefill", 5) == "attention_prefill_rows"
+    assert selected_body("decode", 1) == "attention_decode_rows"
+
+
+def test_mode_policy_orders_bounded_worker_search():
+    class Model(torch.nn.Module):
+        def forward(self, value):
+            return value * 2
+
+    grid_sizes = []
+
+    def evaluate(plan, budget):
+        grid_sizes.append(plan.launch.grid_size)
+        return PlanMeasurement(
+            compiled=object(),
+            correct=True,
+            median_complete_call_us=1.0,
+        )
+
+    search_plans(
+        _graph(Model(), torch.randn(32, 32)),
+        _target(),
+        SelectionPolicy(mode="decode"),
+        SearchBudget(
+            max_plans=3,
+            max_compilations=3,
+            timing_samples=1,
+            evaluator=evaluate,
+        ),
+    )
+
+    assert grid_sizes == [2, 4, 8]
+
+
+def test_mode_policy_rejects_prefill_for_stateful_cache():
+    class Model(torch.nn.Module):
+        def forward(self, value):
+            return value * 2
+
+    graph = _graph(Model(), torch.randn(2, 3))
+    graph.regions[0].semantic_facts["family"] = "attention"
+    graph.regions[0].semantic_facts["cache_effects"] = {"policy": "stateful"}
+
+    with pytest.raises(ValueError, match="prefill mode cannot compile"):
+        select_bodies(graph, _target(), SelectionPolicy(mode="prefill"))

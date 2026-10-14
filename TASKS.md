@@ -549,11 +549,11 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Implement in:** `plan.py` and backend options.
 
-- [ ] Add `mode=prefill|decode` to `make_backend` and the plan key.
-- [ ] Validate the mode against the captured state contract. Keep computation and requested outputs defined by the graph.
-- [ ] Prioritize suitable small-M or larger-M body families using actual dimensions.
-- [ ] Choose attention candidates using query length, KV length, batch/head parallelism, layout, and mask facts.
-- [ ] Set bounded search priorities and work ordering for each mode. Keep one common graph and plan representation.
+- [x] Add `mode=prefill|decode` to `make_backend` and the plan key.
+- [x] Validate the mode against the captured state contract. Keep computation and requested outputs defined by the graph.
+- [x] Prioritize suitable small-M or larger-M body families using actual dimensions.
+- [x] Choose attention candidates using query length, KV length, batch/head parallelism, layout, and mask facts.
+- [x] Set bounded search priorities and work ordering for each mode. Keep one common graph and plan representation.
 
 **Output:** one compiler that selects different legal execution plans for prefill and decode.
 

@@ -151,11 +151,13 @@ class AttentionBodyProvider:
 
         if target.architecture != "sm90a" or not target.supports_wgmma:
             return reject("provider targets WGMMA-capable sm90a only")
+        body_name = (
+            "attention_decode_rows"
+            if q_load.source_shape[1] == 1
+            else "attention_prefill_rows"
+        )
         return CandidateSet(
-            (
-                _attention_config(region, program, "attention_prefill_rows"),
-                _attention_config(region, program, "attention_decode_rows"),
-            ),
+            (_attention_config(region, program, body_name),),
             (),
         )
 
