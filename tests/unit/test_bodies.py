@@ -155,6 +155,20 @@ def test_emit_reduction_body_generates_sum_mean_and_norm_sources():
     assert "cutlass.Int64(1003)).to(cutlass.Float32)" in mean_body.source
 
 
+def test_emit_reduction_body_generates_softmax_maximum():
+    class Amax(torch.nn.Module):
+        def forward(self, value):
+            return value.amax(dim=-1, keepdim=True)
+
+    region = _regions(Amax(), torch.randn(5, 1003))[0]
+    config = get_candidates(region, _target(), _policy()).configurations[0]
+    body = emit_reduction_body(region.tensor_programs[0], config)
+
+    assert "def exact_maximum(left, right):" in body.source
+    assert "cute.arch.warp_reduction(accumulator, exact_maximum)" in body.source
+    assert "accumulator = exact_maximum(accumulator, scratch[block, warp_index])" in body.source
+
+
 def test_emit_reduction_body_preserves_norm_epsilon_and_cast():
     class Sum(torch.nn.Module):
         def forward(self, value):

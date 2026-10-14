@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from math import prod
+import operator
 
 from .graph import ComputeGraph, Op, Region, RegionCandidate, verify_compute_graph
 from .lowering import (
@@ -172,6 +173,9 @@ def _fusion_candidates(graph: ComputeGraph) -> dict[str, tuple[RegionCandidate, 
         tail_operation = candidate.source_op_ids[-1]
         candidates.setdefault(tail_operation, []).append(candidate)
     for candidate in _rope_candidates(graph):
+        tail_operation = candidate.source_op_ids[-1]
+        candidates.setdefault(tail_operation, []).append(candidate)
+    for candidate in _attention_candidates(graph):
         tail_operation = candidate.source_op_ids[-1]
         candidates.setdefault(tail_operation, []).append(candidate)
     return {tail: tuple(values) for tail, values in candidates.items()}
@@ -853,6 +857,530 @@ def _rope_candidate(concat: Op, graph: ComputeGraph) -> RegionCandidate | None:
 def _producer(value_id: str, graph: ComputeGraph) -> Op | None:
     operation_id = graph.values[value_id].producer
     return graph.ops.get(operation_id) if operation_id is not None else None
+
+
+def _attention_candidates(graph: ComputeGraph) -> tuple[RegionCandidate, ...]:
+    candidates = []
+    for operation in graph.ops.values():
+        if _matches_target(operation, "aten.bmm.default"):
+            candidate = _attention_candidate(operation, graph)
+            if candidate is not None:
+                candidates.append(candidate)
+    return tuple(candidates)
+
+
+def _attention_candidate(value_bmm: Op, graph: ComputeGraph) -> RegionCandidate | None:
+    value_program = value_bmm.tensor_program
+    if not _is_contraction(value_bmm) or not isinstance(value_program, TensorProgram):
+        return None
+    if len(value_program.loads) != 2:
+        return None
+
+    probability_root = _producer_until(
+        value_program.loads[0].value_id,
+        lambda operation: _matches_target(operation, "aten.div.Tensor"),
+        graph,
+    )
+    if probability_root is None:
+        return None
+    division = probability_root
+    softmax = _softmax_operations(division, graph)
+    if softmax is None:
+        return None
+    algorithm, score_value, softmax_operations = softmax
+    score_chain = _score_chain(score_value, graph)
+    if score_chain is None:
+        return None
+    score_add, scale_operation, mask_value, score_bmm = score_chain
+    score_program = score_bmm.tensor_program
+    if (
+        not _is_contraction(score_bmm)
+        or not isinstance(score_program, TensorProgram)
+        or len(score_program.loads) != 2
+    ):
+        return None
+
+    q_root = _value_root(score_program.loads[0].value_id, graph)
+    k_root = _value_root(score_program.loads[1].value_id, graph)
+    v_root = _value_root(value_program.loads[1].value_id, graph)
+    q = graph.values[q_root]
+    k = graph.values[k_root]
+    v = graph.values[v_root]
+    if any(value.shape is None or len(value.shape) != 4 for value in (q, k, v)):
+        return None
+    if q.shape[2] % k.shape[2] or q.shape[-1] != k.shape[-1] or q.shape[-1] != v.shape[-1]:
+        return None
+
+    group_size = q.shape[2] // k.shape[2]
+    batch_and_query_head = AxisAffine(
+        (AxisTerm("b", scale=q.shape[2]), AxisTerm("h"))
+    )
+    batch_and_kv_head = AxisAffine(
+        (AxisTerm("b", scale=k.shape[2]), AxisTerm("h", divisor=group_size))
+    )
+    q_load = IndexedLoad(
+        "attention:q",
+        q_root,
+        (batch_and_query_head, "s", "d"),
+        q.strides or (),
+        q.dtype or "",
+        q.shape,
+    )
+    k_load = IndexedLoad(
+        "attention:k",
+        k_root,
+        (batch_and_kv_head, "k", "d"),
+        k.strides or (),
+        k.dtype or "",
+        k.shape,
+    )
+    v_load = IndexedLoad(
+        "attention:v",
+        v_root,
+        (batch_and_query_head, "k", "d"),
+        v.strides or (),
+        v.dtype or "",
+        v.shape,
+    )
+    score_dtype = graph.values[scale_operation.results[0]].dtype or ""
+    score_expression = _score_expression(
+        q_load, k_load, scale_operation, mask_value, score_dtype, graph
+    )
+    if score_expression is None:
+        return None
+
+    probability_value = graph.values[value_program.loads[0].value_id]
+    probability_path = _producer_path(value_program.loads[0].value_id, division, graph)
+    if probability_path is None:
+        return None
+    operations = _ordered_operations(
+        (
+            score_bmm,
+            scale_operation,
+            *(() if score_add is None else (score_add,)),
+            *softmax_operations,
+            *probability_path,
+            value_bmm,
+        ),
+        graph,
+    )
+    rejections = ["composable attention provider is not implemented"]
+    if any(_has_illegal_effects(operation) for operation in operations):
+        rejections.append("source effects do not fit a composable attention body")
+    external_inputs = tuple(
+        dict.fromkeys(
+            (
+                q_root,
+                k_root,
+                v_root,
+                *(
+                    (mask_value,)
+                    if mask_value is not None
+                    else ()
+                ),
+            )
+        )
+    )
+    return RegionCandidate(
+        id=f"region:{value_bmm.id.removeprefix('op:')}:attention",
+        source_op_ids=tuple(operation.id for operation in operations),
+        external_inputs=external_inputs,
+        live_outputs=_live_outputs(operations, graph),
+        tensor_program=None,
+        semantic_facts={
+            "family": "attention",
+            "algorithm": algorithm,
+            "numerical_policy": {
+                "score_dtype": score_dtype,
+                "statistics_dtype": graph.values[score_value].dtype,
+                "probability_dtype": probability_value.dtype,
+                "accumulator_dtype": score_program.accumulator_dtype,
+            },
+            "q_access": q_load,
+            "k_access": k_load,
+            "v_access": v_load,
+            "head_grouping": {
+                "batch": q.shape[0],
+                "query_heads": q.shape[2],
+                "kv_heads": k.shape[2],
+                "group_size": group_size,
+                "head_dim": q.shape[3],
+            },
+            "scale": _scalar_operand(scale_operation, 1),
+            "mask": _mask_semantics(mask_value, score_dtype, graph),
+            "score_expression": score_expression,
+            "requested_outputs": _live_outputs(operations, graph),
+            "cache_effects": _cache_effects(k_root, v_root, graph),
+            "hook_restrictions": {
+                "score": "row-local additive bias over query and key coordinates only",
+                "mask": "typed pre-softmax selection; block skipping requires a mask proof",
+            },
+        },
+        cost_bytes=sum(
+            _value_bytes(operation.results[0], graph)
+            for operation in operations[:-1]
+            if isinstance(operation.tensor_program, TensorProgram)
+            and operation.tensor_program.store.owns_storage
+        ),
+        rejections=tuple(rejections),
+    )
+
+
+def _producer_until(
+    value_id: str, predicate: Callable[[Op], bool], graph: ComputeGraph
+) -> Op | None:
+    visited: set[str] = set()
+    while value_id not in visited:
+        visited.add(value_id)
+        operation = _producer(value_id, graph)
+        if operation is None:
+            return None
+        if predicate(operation):
+            return operation
+        program = operation.tensor_program
+        if (
+            not isinstance(program, TensorProgram)
+            or program.family not in {"view", "copy", "elementwise"}
+            or len(operation.operands) != 1
+        ):
+            return None
+        value_id = operation.operands[0]
+    return None
+
+
+def _cache_effects(key_root: str, value_root: str, graph: ComputeGraph) -> dict[str, object]:
+    key_state, key_append = _cache_access(key_root, graph)
+    value_state, value_append = _cache_access(value_root, graph)
+    updates = tuple(
+        value_id
+        for value_id in (key_root, value_root)
+        if value_id in graph.outputs
+    )
+    if updates:
+        policy = "functional_append"
+    elif _in_place_cache_update((key_state, value_state, key_root, value_root), graph):
+        policy = "in_place"
+    else:
+        policy = "read_only"
+    return {
+        "reads": (key_state, value_state),
+        "appends": tuple(
+            value_id
+            for value_id in (key_append, value_append)
+            if value_id is not None
+        ),
+        "updates": updates,
+        "policy": policy,
+    }
+
+
+def _cache_access(value_id: str, graph: ComputeGraph) -> tuple[str, str | None]:
+    operation = _producer(value_id, graph)
+    if (
+        operation is not None
+        and _matches_target(operation, "aten.cat.default")
+        and len(operation.operands) == 2
+    ):
+        return operation.operands[0], operation.operands[1]
+    return value_id, None
+
+
+def _in_place_cache_update(cache_values: tuple[str, ...], graph: ComputeGraph) -> bool:
+    return any(
+        operation.effects.get("mutates_inputs")
+        and operation.operands
+        and operation.operands[0] in cache_values
+        for operation in graph.ops.values()
+    )
+
+
+def _softmax_operations(
+    division: Op, graph: ComputeGraph
+) -> tuple[str, str, tuple[Op, ...]] | None:
+    if not _matches_target(division, "aten.div.Tensor") or len(division.operands) != 2:
+        return None
+    exponential = _producer(division.operands[0], graph)
+    subtraction = (
+        _producer(exponential.operands[0], graph)
+        if exponential is not None
+        else None
+    )
+    if (
+        exponential is None
+        or subtraction is None
+        or not _matches_target(exponential, "aten.exp.default")
+        or not _matches_target(subtraction, "aten.sub.Tensor")
+        or len(subtraction.operands) != 2
+    ):
+        return None
+
+    maximum = _producer(subtraction.operands[1], graph)
+    if (
+        maximum is not None
+        and _matches_target(maximum, "aten.amax.default")
+        and exponential.operands == (subtraction.results[0],)
+        and _producer(division.operands[1], graph) is not None
+        and _matches_target(_producer(division.operands[1], graph), "aten.sum.dim_IntList")
+        and _producer(_producer(division.operands[1], graph).operands[0], graph)
+        is exponential
+    ):
+        return "stable_softmax", subtraction.operands[0], (
+            maximum,
+            subtraction,
+            exponential,
+            _producer(division.operands[1], graph),
+            division,
+        )
+
+    maximum_projection = _producer(subtraction.operands[1], graph)
+    sum_projection = _producer(division.operands[1], graph)
+    if (
+        maximum_projection is None
+        or sum_projection is None
+        or operation_target(maximum_projection) != str(operator.getitem)
+        or operation_target(sum_projection) != str(operator.getitem)
+    ):
+        return None
+    statistics = _producer(maximum_projection.operands[0], graph)
+    if (
+        statistics is None
+        or not _matches_target(statistics, "prims.prepare_softmax_online.default")
+        or maximum_projection.operands[0] != statistics.results[0]
+        or sum_projection.operands[0] != statistics.results[1]
+        or statistics.operands != (subtraction.operands[0],)
+        or exponential.operands != (subtraction.results[0],)
+    ):
+        return None
+    return "online_softmax", subtraction.operands[0], (
+        statistics,
+        maximum_projection,
+        sum_projection,
+        subtraction,
+        exponential,
+        division,
+    )
+
+
+def _score_chain(
+    score_value: str, graph: ComputeGraph
+) -> tuple[Op | None, Op, str | None, Op] | None:
+    operation = _producer(score_value, graph)
+    mask_value: str | None = None
+    if operation is not None and _matches_target(operation, "aten.add.Tensor"):
+        if len(operation.operands) != 2:
+            return None
+        mask_value = operation.operands[1]
+        scale_operation = _producer(operation.operands[0], graph)
+    else:
+        scale_operation = operation
+    if scale_operation is None or not _matches_target(scale_operation, "aten.mul.Tensor"):
+        return None
+    score_bmm = _producer_until(
+        scale_operation.operands[0],
+        lambda candidate: _matches_target(candidate, "aten.bmm.default"),
+        graph,
+    )
+    if score_bmm is None or not isinstance(_scalar_operand(scale_operation, 1), (int, float)):
+        return None
+    return operation if mask_value is not None else None, scale_operation, mask_value, score_bmm
+
+
+def _producer_path(value_id: str, stop: Op, graph: ComputeGraph) -> tuple[Op, ...] | None:
+    operations: list[Op] = []
+    visited: set[str] = set()
+    while value_id not in visited:
+        visited.add(value_id)
+        operation = _producer(value_id, graph)
+        if operation is None:
+            return None
+        if operation.id == stop.id:
+            return tuple(operations)
+        program = operation.tensor_program
+        if (
+            not isinstance(program, TensorProgram)
+            or program.family not in {"view", "copy", "elementwise"}
+            or len(operation.operands) != 1
+        ):
+            return None
+        operations.append(operation)
+        value_id = operation.operands[0]
+    return None
+
+
+def _value_root(value_id: str, graph: ComputeGraph) -> str:
+    while True:
+        operation = _producer(value_id, graph)
+        program = operation.tensor_program if operation is not None else None
+        if (
+            operation is None
+            or not isinstance(program, TensorProgram)
+            or program.family not in {"view", "copy"}
+            or len(operation.operands) != 1
+        ):
+            return value_id
+        value_id = operation.operands[0]
+
+
+def _score_expression(
+    q_load: IndexedLoad,
+    k_load: IndexedLoad,
+    scale_operation: Op,
+    mask_value: str | None,
+    dtype: str,
+    graph: ComputeGraph,
+) -> ScalarExpression | None:
+    rounding = _cast_rounding_for(dtype)
+    product = Binary(
+        "mul",
+        Cast(Load(q_load.id, q_load.dtype), dtype, rounding),
+        Cast(Load(k_load.id, k_load.dtype), dtype, rounding),
+        dtype,
+    )
+    scaled = Binary(
+        "mul", product, Constant(_scalar_operand(scale_operation, 1), dtype), dtype
+    )
+    if mask_value is None:
+        return scaled
+    mask = _mask_semantics(mask_value, dtype, graph)
+    mask_expression = mask.get("expression")
+    if not isinstance(mask_expression, ScalarExpression):
+        return None
+    return Binary("add", scaled, Cast(mask_expression, dtype, rounding), dtype)
+
+
+def _mask_semantics(
+    value_id: str, dtype: str, graph: ComputeGraph
+) -> dict[str, object]:
+    operation = _producer(value_id, graph)
+    if operation is not None and _matches_target(operation, "aten.where.self"):
+        program = operation.tensor_program
+        if isinstance(program, TensorProgram):
+            loads = tuple(_semantic_mask_load(load) for load in program.loads)
+            condition = _producer(_condition_value(program, graph), graph)
+            condition_program = condition.tensor_program if condition is not None else None
+            return {
+                "kind": "typed_where",
+                "expression": program.combine,
+                "loads": loads,
+                "condition_expression": (
+                    condition_program.combine
+                    if isinstance(condition_program, TensorProgram)
+                    else None
+                ),
+                "condition_loads": (
+                    tuple(_semantic_mask_load(load) for load in condition_program.loads)
+                    if isinstance(condition_program, TensorProgram)
+                    else ()
+                ),
+                "causal_offset": _causal_offset(condition, graph),
+                "window_offsets": _window_offsets(condition, graph),
+                "block_skip_proof": "none",
+            }
+    value = graph.values[value_id]
+    load = IndexedLoad(
+        "attention:mask",
+        value_id,
+        tuple(
+            semantic_axis if size != 1 else 0
+            for size, semantic_axis in zip(value.shape or (), ("b", "h", "s", "k"))
+        ),
+        value.strides or (),
+        value.dtype or "",
+        value.shape,
+    )
+    return {
+        "kind": "additive_tensor",
+        "expression": Load(load.id, load.dtype),
+        "loads": (load,),
+        "block_skip_proof": "none",
+    }
+
+
+def _semantic_mask_load(load: IndexedLoad) -> IndexedLoad:
+    axes = {
+        "o0": "b",
+        "o1": "h",
+        "o2": "s",
+        "o3": "k",
+    }
+    return replace(
+        load,
+        axes=tuple(axes.get(axis, axis) if isinstance(axis, str) else axis for axis in load.axes),
+    )
+
+
+def _condition_value(program: TensorProgram, graph: ComputeGraph) -> str:
+    condition = program.combine
+    if isinstance(condition, Where) and isinstance(condition.condition, Load):
+        return next(
+            load.value_id for load in program.loads if load.id == condition.condition.load_id
+        )
+    return program.loads[0].value_id
+
+
+def _causal_offset(condition: Op | None, graph: ComputeGraph) -> int | None:
+    if condition is None or not _matches_target(condition, "aten.le.Tensor"):
+        return None
+    return _comparison_offset(condition, graph)
+
+
+def _window_offsets(condition: Op | None, graph: ComputeGraph) -> tuple[int, int] | None:
+    if condition is None or not _matches_target(condition, "aten.bitwise_and.Tensor"):
+        return None
+    if len(condition.operands) != 2:
+        return None
+    upper = _producer(condition.operands[0], graph)
+    lower = _producer(condition.operands[1], graph)
+    if (
+        upper is None
+        or lower is None
+        or not _matches_target(upper, "aten.le.Tensor")
+        or not _matches_target(lower, "aten.ge.Tensor")
+    ):
+        return None
+    lower_offset = _comparison_offset(lower, graph)
+    upper_offset = _comparison_offset(upper, graph)
+    if lower_offset is None or upper_offset is None:
+        return None
+    return lower_offset, upper_offset
+
+
+def _comparison_offset(condition: Op, graph: ComputeGraph) -> int | None:
+    program = condition.tensor_program
+    if not isinstance(program, TensorProgram) or len(program.loads) != 2:
+        return None
+    offset = _producer(program.loads[1].value_id, graph)
+    if offset is None or not (
+        _matches_target(offset, "aten.add.Tensor")
+        or _matches_target(offset, "aten.sub.Tensor")
+    ):
+        return None
+    value = _scalar_operand(offset, 1)
+    if not isinstance(value, int):
+        return None
+    return -value if _matches_target(offset, "aten.sub.Tensor") else value
+
+
+def _scalar_operand(operation: Op, index: int) -> object:
+    arguments = operation.attributes.get("fx_args", ())
+    return arguments[index] if index < len(arguments) else None
+
+
+def operation_target(operation: Op) -> object:
+    return operation.attributes.get("target")
+
+
+def _cast_rounding_for(dtype: str) -> str:
+    return "round_nearest_even" if dtype in {"torch.bfloat16", "torch.float16"} else "exact"
+
+
+def _ordered_operations(operations: tuple[Op, ...], graph: ComputeGraph) -> tuple[Op, ...]:
+    by_id = {operation.id: operation for operation in operations}
+    return tuple(
+        operation
+        for operation_id, operation in graph.ops.items()
+        if operation_id in by_id
+    )
 
 
 def _sole_user(operation: Op, graph: ComputeGraph) -> Op | None:

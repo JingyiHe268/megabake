@@ -373,3 +373,213 @@ def test_form_regions_matches_exact_rope_and_keeps_unfamiliar_variants_generic()
         for region in half_graph.regions
         for candidate in region.fusion_candidates
     )
+
+
+def _grouped_attention(source, key, value, mask):
+    query = source.permute(0, 2, 1, 3)
+    grouped_key = key.permute(0, 2, 1, 3).repeat_interleave(
+        source.shape[2] // key.shape[2], dim=1
+    )
+    grouped_value = value.permute(0, 2, 1, 3).repeat_interleave(
+        source.shape[2] // value.shape[2], dim=1
+    )
+    scores = (
+        query @ grouped_key.transpose(-2, -1)
+    ) * source.shape[-1] ** -0.5 + mask
+    probabilities = torch.softmax(scores.float(), dim=-1).to(source.dtype)
+    return probabilities @ grouped_value, scores
+
+
+def test_task25_matches_grouped_attention_access_mask_and_outputs():
+    class Model(torch.nn.Module):
+        def forward(self, source, key, value, mask):
+            return _grouped_attention(source, key, value, mask)
+
+    torch.manual_seed(25)
+    source = torch.randn(2, 4, 4, 8, dtype=torch.bfloat16)
+    key = torch.randn(2, 4, 2, 8, dtype=torch.bfloat16)
+    value = torch.randn(2, 4, 2, 8, dtype=torch.bfloat16)
+    mask = torch.randn(2, 1, 4, 4)
+    graph = form_regions(_import(Model(), source, key, value, mask))
+
+    candidate = next(
+        candidate
+        for region in graph.regions
+        for candidate in region.fusion_candidates
+        if candidate.semantic_facts.get("family") == "attention"
+    )
+    assert not candidate.executable
+    assert candidate.rejections == ("composable attention provider is not implemented",)
+    assert candidate.external_inputs == (
+        "value:arg0_1",
+        "value:arg1_1",
+        "value:arg2_1",
+        "value:arg3_1",
+    )
+    assert candidate.semantic_facts["algorithm"] == "stable_softmax"
+    assert candidate.semantic_facts["head_grouping"] == {
+        "batch": 2,
+        "query_heads": 4,
+        "kv_heads": 2,
+        "group_size": 2,
+        "head_dim": 8,
+    }
+    assert candidate.semantic_facts["q_access"].value_id == "value:arg0_1"
+    assert candidate.semantic_facts["k_access"].value_id == "value:arg1_1"
+    assert candidate.semantic_facts["v_access"].value_id == "value:arg2_1"
+    assert candidate.semantic_facts["mask"]["kind"] == "additive_tensor"
+    assert candidate.semantic_facts["mask"]["block_skip_proof"] == "none"
+    assert candidate.semantic_facts["numerical_policy"] == {
+        "score_dtype": "torch.bfloat16",
+        "statistics_dtype": "torch.float32",
+        "probability_dtype": "torch.bfloat16",
+        "accumulator_dtype": "torch.float32",
+    }
+    assert "value:add" in candidate.semantic_facts["requested_outputs"]
+    assert candidate.semantic_facts["cache_effects"] == {
+        "reads": ("value:arg1_1", "value:arg2_1"),
+        "appends": (),
+        "updates": (),
+        "policy": "read_only",
+    }
+
+
+def test_task25_matches_typed_causal_mask_with_offset():
+    class Model(torch.nn.Module):
+        def forward(self, source, key, value):
+            rows = torch.arange(source.shape[1]).view(1, 1, -1, 1)
+            columns = torch.arange(key.shape[1]).view(1, 1, 1, -1)
+            causal = torch.where(columns <= rows + 2, 0.0, -1e4)
+            return _grouped_attention(source, key, value, causal)[0]
+
+    torch.manual_seed(25)
+    source = torch.randn(1, 4, 2, 8, dtype=torch.bfloat16)
+    key = torch.randn(1, 4, 1, 8, dtype=torch.bfloat16)
+    value = torch.randn(1, 4, 1, 8, dtype=torch.bfloat16)
+    graph = form_regions(_import(Model(), source, key, value))
+
+    candidate = next(
+        candidate
+        for region in graph.regions
+        for candidate in region.fusion_candidates
+        if candidate.semantic_facts.get("family") == "attention"
+    )
+    mask = candidate.semantic_facts["mask"]
+    assert mask["kind"] == "typed_where"
+    assert mask["expression"].condition.load_id == "load:0"
+    assert mask["condition_expression"].operator == "le"
+    assert mask["causal_offset"] == 2
+    assert mask["block_skip_proof"] == "none"
+
+
+def test_task25_matches_window_mask_bounds():
+    class Model(torch.nn.Module):
+        def forward(self, source, key, value):
+            rows = torch.arange(source.shape[1]).view(1, 1, -1, 1)
+            columns = torch.arange(key.shape[1]).view(1, 1, 1, -1)
+            inside = (columns <= rows + 2) & (columns >= rows - 1)
+            window = torch.where(inside, 0.0, -1e4)
+            return _grouped_attention(source, key, value, window)[0]
+
+    torch.manual_seed(25)
+    source = torch.randn(1, 4, 2, 8, dtype=torch.bfloat16)
+    key = torch.randn(1, 4, 1, 8, dtype=torch.bfloat16)
+    value = torch.randn(1, 4, 1, 8, dtype=torch.bfloat16)
+    graph = form_regions(_import(Model(), source, key, value))
+
+    candidate = next(
+        candidate
+        for region in graph.regions
+        for candidate in region.fusion_candidates
+        if candidate.semantic_facts.get("family") == "attention"
+    )
+    mask = candidate.semantic_facts["mask"]
+    assert mask["kind"] == "typed_where"
+    assert mask["condition_expression"].operator == "bitwise_and"
+    assert mask["window_offsets"] == (-1, 2)
+    assert mask["block_skip_proof"] == "none"
+
+
+def test_task25_preserves_functional_kv_cache_append_effects():
+    class Model(torch.nn.Module):
+        def forward(self, source, past_key, key, past_value, value, mask):
+            full_key = torch.cat((past_key, key), dim=1)
+            full_value = torch.cat((past_value, value), dim=1)
+            output, scores = _grouped_attention(
+                source, full_key, full_value, mask
+            )
+            return output, scores, full_key, full_value
+
+    torch.manual_seed(25)
+    source = torch.randn(1, 2, 2, 8, dtype=torch.bfloat16)
+    past_key = torch.randn(1, 1, 2, 8, dtype=torch.bfloat16)
+    key = torch.randn(1, 2, 2, 8, dtype=torch.bfloat16)
+    past_value = torch.randn(1, 1, 2, 8, dtype=torch.bfloat16)
+    value = torch.randn(1, 2, 2, 8, dtype=torch.bfloat16)
+    mask = torch.randn(1, 1, 2, 3)
+    graph = form_regions(
+        _import(Model(), source, past_key, key, past_value, value, mask)
+    )
+
+    candidate = next(
+        candidate
+        for region in graph.regions
+        for candidate in region.fusion_candidates
+        if candidate.semantic_facts.get("family") == "attention"
+    )
+    key_access = candidate.semantic_facts["k_access"]
+    value_access = candidate.semantic_facts["v_access"]
+    assert candidate.semantic_facts["cache_effects"] == {
+        "reads": ("value:arg1_1", "value:arg3_1"),
+        "appends": ("value:arg2_1", "value:arg4_1"),
+        "updates": (key_access.value_id, value_access.value_id),
+        "policy": "functional_append",
+    }
+
+
+def test_task25_soft_cap_and_row_dependent_hooks_miss_but_preserve_source():
+    class Model(torch.nn.Module):
+        def forward(self, source, key, value):
+            scores = (source @ key.transpose(-2, -1)) * source.shape[-1] ** -0.5
+            capped = 30.0 * torch.tanh(scores / 30.0)
+            probabilities = torch.softmax(capped.float(), dim=-1).to(source.dtype)
+            return probabilities @ value
+
+    torch.manual_seed(25)
+    source = torch.randn(2, 3, 4, 8, dtype=torch.bfloat16)
+    key = torch.randn(2, 3, 4, 8, dtype=torch.bfloat16)
+    value = torch.randn(2, 3, 4, 8, dtype=torch.bfloat16)
+    graph = form_regions(_import(Model(), source, key, value))
+
+    assert not any(
+        candidate.semantic_facts.get("family") == "attention"
+        for region in graph.regions
+        for candidate in region.fusion_candidates
+    )
+    assert len(graph.regions) == len(graph.ops)
+    assert all(
+        len({operation_id for operation_id in region.source_op_ids}) == 1
+        for region in graph.regions
+    )
+
+
+def test_task25_rejects_row_dependent_score_hook_and_preserves_source():
+    class Model(torch.nn.Module):
+        def forward(self, source, key, value):
+            scores = (source @ key.transpose(-2, -1)) * source.shape[-1] ** -0.5
+            centered = scores - scores.mean(dim=-1, keepdim=True)
+            probabilities = torch.softmax(centered.float(), dim=-1).to(source.dtype)
+            return probabilities @ value
+
+    torch.manual_seed(25)
+    source = torch.randn(2, 3, 4, 8, dtype=torch.bfloat16)
+    key = torch.randn(2, 3, 4, 8, dtype=torch.bfloat16)
+    value = torch.randn(2, 3, 4, 8, dtype=torch.bfloat16)
+    graph = form_regions(_import(Model(), source, key, value))
+
+    assert not any(
+        candidate.semantic_facts.get("family") == "attention"
+        for region in graph.regions
+        for candidate in region.fusion_candidates
+    )
+    assert len(graph.regions) == len(graph.ops)

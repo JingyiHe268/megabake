@@ -249,3 +249,20 @@ def test_reduction_body_launcher_handles_sum_mean_and_norms(tmp_path):
         rtol=2e-2,
         atol=1e-2,
     )
+
+
+def test_reduction_body_launcher_handles_softmax_maximum(tmp_path):
+    class Amax(torch.nn.Module):
+        def forward(self, value):
+            return value.amax(dim=-1, keepdim=True)
+
+    rows, columns = 5, 1003
+    source = torch.randn(rows, columns)
+    source[1, 2] = float("nan")
+    program, config = _program(Amax(), source)
+    output = torch.full((rows, 1), float("nan"), device="cuda")
+    result = _run_body("amax", program, config, source.cuda(), output, tmp_path)
+
+    torch.testing.assert_close(
+        result.cpu(), source.amax(dim=-1, keepdim=True), equal_nan=True
+    )

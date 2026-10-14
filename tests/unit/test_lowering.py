@@ -144,6 +144,7 @@ def _evaluate_expression(
             "mul": operator.mul,
             "div": torch.div,
             "pow": torch.pow,
+            "maximum": torch.maximum,
             "bitwise_and": torch.bitwise_and,
             "eq": operator.eq,
             "ne": operator.ne,
@@ -652,13 +653,36 @@ def test_lower_semantics_reports_common_unsupported_fx_decompositions():
         operation.attributes["target"]
         for operation in graph.ops.values()
         if operation.tensor_program is None
-    }
+        }
+    amax_operation = next(
+        operation
+        for operation in graph.ops.values()
+        if operation.attributes["target"] == "aten.amax.default"
+    )
+    assert amax_operation.tensor_program is not None
     assert {
-        "aten.amax.default",
         "aten.clamp_min.default",
         "aten.clamp_max.default",
         "aten.erf.default",
     }.issubset(unknown_targets)
+
+
+def test_task25_softmax_max_primitive_has_exact_generic_expansion():
+    class Model(torch.nn.Module):
+        def forward(self, source):
+            return torch.softmax(source, dim=-1)
+
+    torch.manual_seed(25)
+    source = torch.randn(3, 5)
+    source[1, 2] = float("nan")
+    graph = lower_semantics(_import(Model(), source))
+
+    assert all(operation.tensor_program is not None for operation in graph.ops.values())
+    torch.testing.assert_close(
+        _evaluate_graph(graph, {"source": source}),
+        Model()(source),
+        equal_nan=True,
+    )
     assert any(operation.tensor_program is not None for operation in graph.ops.values())
 
 

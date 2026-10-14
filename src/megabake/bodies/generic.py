@@ -336,8 +336,23 @@ def emit_reduction_body(
         "cute.Tensor" for _ in range(len(input_value_ids) + 1)
     )
     accumulator_type = _cutlass_type(program.accumulator_dtype or "")
+    reduction_operator = _ordered_reduction_operator(program.combine)
+    warp_reduction = (
+        "cute.arch.warp_reduction(accumulator, exact_maximum)"
+        if reduction_operator == "maximum"
+        else "cute.arch.warp_reduction_sum(accumulator)"
+    )
+    merge_partial = (
+        "accumulator = exact_maximum(accumulator, scratch[block, warp_index])"
+        if reduction_operator == "maximum"
+        else "accumulator = accumulator + scratch[block, warp_index]"
+    )
     source = f'''import cutlass
 import cutlass.cute as cute
+
+
+def exact_maximum(left, right):
+    return cute.arch.fmax(left, right, nan=True)
 
 
 @cute.kernel
@@ -362,13 +377,13 @@ def run(
             for reduction_index in cutlass.range(thread, {reduction_domain.size}, {threads}):
                 {reduction_coordinate} = reduction_index
                 accumulator = {combine.code}
-            warp_partial = cute.arch.warp_reduction_sum(accumulator)
+            warp_partial = {warp_reduction}
             if lane == 0:
                 scratch[block, warp] = warp_partial
             cute.arch.sync_threads()
             accumulator = {accumulator_type}({accumulator.code})
             for warp_index in cutlass.range(warps):
-                accumulator = accumulator + scratch[block, warp_index]
+                {merge_partial}
             value = {post.code}
             if thread == 0:
                 output[{output_coordinates}] = value
@@ -511,7 +526,7 @@ def _validate_map_body(program: TensorProgram, config: BodyConfig) -> None:
 
 def _validate_reduction_body(program: TensorProgram, config: BodyConfig) -> None:
     validate_body_config(config)
-    # shortcut: one reduction axis and ordered addition only, add more when a captured fixture needs them.
+    # shortcut: one reduction axis and ordered addition or maximum only
     if program.family != "reduction":
         raise UnsupportedReductionBody(
             f"reduction body generator supports reduction, not {program.family}"
@@ -524,8 +539,15 @@ def _validate_reduction_body(program: TensorProgram, config: BodyConfig) -> None
         )
     if program.init is None or program.post is None or program.accumulator_dtype is None:
         raise UnsupportedReductionBody("reduction body requires complete reduction state")
-    if not _is_add_reduction(program.combine):
-        raise UnsupportedReductionBody("reduction body generator supports ordered addition")
+    if _ordered_reduction_operator(program.combine) not in {"add", "maximum"}:
+        raise UnsupportedReductionBody(
+            "reduction body generator supports ordered addition or maximum"
+        )
+    if (
+        _ordered_reduction_operator(program.combine) == "maximum"
+        and program.accumulator_dtype != "torch.float32"
+    ):
+        raise UnsupportedReductionBody("maximum reduction requires a float32 accumulator")
     if program.init.dtype != program.accumulator_dtype:
         raise UnsupportedReductionBody("initializer and accumulator dtypes differ")
 
@@ -684,6 +706,24 @@ def _is_add_reduction(expression: ScalarExpression) -> bool:
     return left != right
 
 
+def _ordered_reduction_operator(expression: ScalarExpression) -> str | None:
+    if not isinstance(expression, Binary):
+        return None
+    left = _expression_has_accumulator(expression.lhs)
+    right = _expression_has_accumulator(expression.rhs)
+    return expression.operator if left != right else None
+
+
+def _maximum_code(left: str, right: str) -> str:
+    return f"cute.arch.fmax({left}, {right}, nan=True)"
+
+
+def _constant_code(value: int | float | bool) -> str:
+    if isinstance(value, float) and value == float("-inf"):
+        return 'float("-inf")'
+    return repr(value)
+
+
 def _expression_has_accumulator(expression: ScalarExpression) -> bool:
     if isinstance(expression, Accumulator):
         return True
@@ -742,7 +782,7 @@ def _emit_expression(
 
     if isinstance(expression, Constant):
         return _TypedExpression(
-            f"{_cutlass_type(expression.dtype)}({expression.value!r})",
+            f"{_cutlass_type(expression.dtype)}({_constant_code(expression.value)})",
             expression.dtype,
         )
     if isinstance(expression, Accumulator):
@@ -776,6 +816,8 @@ def _emit_expression(
             right = _cast_expression(right, expression.dtype)
         if expression.operator == "pow":
             code = f"cute.pow({left.code}, {right.code})"
+        elif expression.operator == "maximum":
+            code = _maximum_code(left.code, right.code)
         else:
             symbol = _BINARY_SYMBOLS.get(expression.operator)
             if symbol is None:

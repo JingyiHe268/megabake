@@ -917,6 +917,7 @@ def _reduction_program(
     op: Op,
     graph: ComputeGraph,
     is_mean: bool,
+    operator: str = "add",
 ) -> TensorProgram:
     if not node.args:
         raise UnsupportedLowering("reduction has no arguments")
@@ -933,6 +934,8 @@ def _reduction_program(
     )
     if not dims:
         raise UnsupportedLowering("empty reduction is not supported")
+    if operator == "maximum" and any(source.shape[dimension] == 0 for dimension in dims):
+        raise UnsupportedLowering("amax requires a nonempty reduction extent")
 
     axes: list[str | int] = []
     output_dimension = 0
@@ -961,7 +964,7 @@ def _reduction_program(
     accumulator_dtype = result.dtype or ""
     accumulator_load = _cast_load(Load(load.id, load.dtype), accumulator_dtype)
     combine = Binary(
-        "add",
+        operator,
         Accumulator(accumulator_dtype),
         accumulator_load,
         accumulator_dtype,
@@ -987,7 +990,9 @@ def _reduction_program(
             accumulator_dtype,
             _cast_rounding(accumulator_dtype, accumulator_dtype),
         )
-        decomposition = "ordered add reduction"
+        decomposition = (
+            "ordered maximum reduction" if operator == "maximum" else "ordered add reduction"
+        )
     return TensorProgram(
         family="reduction",
         source_target=str(node.target),
@@ -995,7 +1000,11 @@ def _reduction_program(
         iteration_domains=(*output_domains, *reduction_domains),
         reduction_axes=tuple(domain.axis for domain in reduction_domains),
         loads=(load,),
-        init=_zero(accumulator_dtype),
+        init=(
+            _reduction_identity(accumulator_dtype, operator)
+            if operator == "maximum"
+            else _zero(accumulator_dtype)
+        ),
         combine=combine,
         post=post,
         accumulator_dtype=accumulator_dtype,
@@ -1004,6 +1013,26 @@ def _reduction_program(
         ),
         predicates=_predicates((*output_domains, *reduction_domains)),
     )
+
+
+def _amax_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorProgram:
+    return _reduction_program(node, op, graph, is_mean=False, operator="maximum")
+
+
+def _reduction_identity(dtype: str, operator: str) -> Constant:
+    if operator != "maximum":
+        return _zero(dtype)
+    if dtype in {
+        "torch.float16",
+        "torch.bfloat16",
+        "torch.float32",
+        "torch.float64",
+    }:
+        return Constant(float("-inf"), dtype)
+    if dtype == "torch.bool":
+        return Constant(False, dtype)
+    torch_dtype = getattr(torch, dtype.removeprefix("torch."))
+    return Constant(torch.iinfo(torch_dtype).min, dtype)
 
 
 def _int_tuple(value: Any, name: str, length: int) -> tuple[int, ...]:
@@ -1356,6 +1385,7 @@ LOWERERS: dict[Any, LoweringRule] = {
     torch.ops.aten.mean.dim: lambda node, op, graph: _reduction_program(node, op, graph, True),
     torch.ops.aten.sum.default: lambda node, op, graph: _reduction_program(node, op, graph, False),
     torch.ops.aten.mean.default: lambda node, op, graph: _reduction_program(node, op, graph, True),
+    torch.ops.aten.amax.default: _amax_program,
     operator.getitem: _tuple_projection_program,
     torch.ops.aten.cat.default: _concat_program,
     torch.ops.aten.embedding.default: _embedding_program,

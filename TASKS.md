@@ -516,11 +516,11 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Implement in:** `lowering.py` and `regions.py`.
 
-- [ ] Preserve Q/K/V access maps, head grouping, scaling, masks, casts, requested outputs, and cache effects.
-- [ ] Represent supported score and mask expressions as typed device expressions.
-- [ ] Recognize a tuned attention candidate only when its algorithm and numerical policy match the captured program.
-- [ ] Keep the source expansion available for generic execution. Add missing softmax primitives with their exact supported behavior.
-- [ ] Define local hook restrictions. Reject a row-dependent transform from a hook that only has local score data.
+- [x] Preserve Q/K/V access maps, head grouping, scaling, masks, casts, requested outputs, and cache effects.
+- [x] Represent supported score and mask expressions as typed device expressions.
+- [x] Recognize a tuned attention candidate only when its algorithm and numerical policy match the captured program.
+- [x] Keep the source expansion available for generic execution. Add missing softmax primitives with their exact supported behavior.
+- [x] Define local hook restrictions. Reject a row-dependent transform from a hook that only has local score data.
 
 **Output:** attention regions with explicit semantics and a retained generic expansion.
 
