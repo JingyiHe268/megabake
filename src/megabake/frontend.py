@@ -11,6 +11,7 @@ import torch
 from torch.utils import _pytree as pytree
 
 from .fx_handler.utils import dump_graph
+from .diagnostics import CompilerError
 
 
 _PINNED_TORCH = (2, 14)
@@ -259,8 +260,10 @@ def _validate_options(options: Mapping[str, Any]) -> dict[str, Any]:
     fallback = options.get("fallback", "error")
     if mode not in {"prefill", "decode"}:
         raise ValueError(f"Unsupported mode {mode!r}; expected 'prefill' or 'decode'")
-    if fallback not in {"error"}:
-        raise ValueError(f"Unsupported fallback {fallback!r}; expected 'error'")
+    if fallback not in {"error", "inductor"}:
+        raise ValueError(
+            f"Unsupported fallback {fallback!r}; expected 'error' or 'inductor'"
+        )
     if not isinstance(options.get("cache", True), bool):
         raise TypeError("cache must be a boolean")
     model_name = options.get("model_name", "model")
@@ -526,22 +529,40 @@ def make_backend(**options: Any) -> Callable[..., Any]:
         )
         compiled = None
         if should_compile:
-            from .compiler import compile_post_grad
+            from .compiler import compile_inductor_fallback, compile_post_grad
 
-            compiled = compile_post_grad(
-                prepared,
-                output_dir=(
-                    Path(validated_options["dump_dir"]) / "generated"
-                    if validated_options["dump_dir"] is not None
-                    else None
-                ),
-                scheduler=validated_options["scheduler"],
-                cache=plan_cache,
-            )
+            backend.megabake_last_compiled = None
+            backend.megabake_last_compile_us = None
+            backend.megabake_last_trace = None
+            try:
+                compiled = compile_post_grad(
+                    prepared,
+                    output_dir=(
+                        Path(validated_options["dump_dir"]) / "generated"
+                        if validated_options["dump_dir"] is not None
+                        else None
+                    ),
+                    scheduler=validated_options["scheduler"],
+                    cache=plan_cache,
+                )
+            except CompilerError as error:
+                if (
+                    validated_options["fallback"] != "inductor"
+                    or not error.safe_for_fallback
+                ):
+                    raise
+                forward = compile_inductor_fallback(prepared, str(error))
+                backend.megabake_last_fallback = forward
+                forward.megabake_contexts = contexts
+                forward.megabake_cache = cache
+                forward.megabake_plan_cache = plan_cache
+                return forward
             forward = compiled
             prepared.context.requirements["execution"] = "megakernel"
+            backend.megabake_last_fallback = None
         else:
             forward = prepared.forward
+            backend.megabake_last_fallback = None
         forward.megabake_contexts = contexts
         forward.megabake_cache = cache
         forward.megabake_plan_cache = plan_cache

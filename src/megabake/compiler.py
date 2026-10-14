@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, replace
 from importlib.util import module_from_spec, spec_from_file_location
 from statistics import median
@@ -49,6 +50,100 @@ from .runtime import (
 
 class UnsupportedCompiler(RuntimeError):
     pass
+
+
+def _source_location(operation: Any) -> str:
+    location = (operation.source_location or "").strip()
+    lines = location.splitlines()
+    return next(
+        (line.strip() for line in reversed(lines) if line.lstrip().startswith("File ")),
+        lines[-1] if lines else "unknown source location",
+    )
+
+
+def _semantic_diagnostic(graph: ComputeGraph) -> CompilerDiagnostic | None:
+    unresolved = tuple(
+        operation for operation in graph.ops.values() if operation.tensor_program is None
+    )
+    if not unresolved:
+        return None
+    messages = [
+        (
+            f"{operation.id} ({operation.attributes.get('target')}) "
+            f"at {_source_location(operation)}: "
+            f"{operation.numerical_rules.get('reason', 'missing lowering rule')}"
+        )
+        for operation in unresolved
+    ]
+    return CompilerDiagnostic(
+        "semantic-lowering",
+        "; ".join(messages),
+        tuple(operation.id for operation in unresolved),
+        tuple(region.id for region in graph.regions),
+        "complete MegaBake semantic coverage",
+    )
+
+
+def _structural_plan_exists(
+    graph: ComputeGraph,
+    target: TargetFacts,
+    policy: SelectionPolicy | None,
+    scheduler: str,
+) -> bool:
+    result = search_plans(
+        graph,
+        target,
+        policy,
+        SearchBudget(evaluator=None),
+    )
+    return any(
+        candidate.plan is not None and candidate.status == "unmeasured"
+        for candidate in result.candidates
+    )
+
+
+def _preflight_complete_plan(
+    graph: ComputeGraph,
+    target: TargetFacts,
+    policy: SelectionPolicy | None,
+    scheduler: str,
+) -> None:
+    schedulers = ("phase", "region-events") if scheduler == "auto" else (scheduler,)
+    if any(
+        _structural_plan_exists(graph, target, policy, scheduler_name)
+        for scheduler_name in schedulers
+    ):
+        return
+    semantic = _semantic_diagnostic(graph)
+    if semantic is not None:
+        raise CompilerError(semantic, safe_for_fallback=True)
+    reasons: list[str] = []
+    for scheduler_name in schedulers:
+        result = search_plans(
+            graph,
+            target,
+            policy,
+            SearchBudget(evaluator=None),
+        )
+        reasons.extend(
+            f"{candidate.description}: {candidate.reason or candidate.status}"
+            for candidate in result.candidates
+            if candidate.status != "measured"
+        )
+        reasons.extend(
+            f"{rejection.region_id}/{rejection.provider}: {rejection.reason}"
+            for rejection in result.rejections
+        )
+    raise CompilerError(
+        CompilerDiagnostic(
+            "plan-search",
+            "; ".join(dict.fromkeys(reasons)) or "no complete plan was produced",
+            _source_op_ids_from_graph(graph),
+            tuple(region.id for region in graph.regions),
+            "one structurally complete plan",
+        ),
+        safe_for_fallback=True,
+    )
 
 
 @dataclass(frozen=True)
@@ -136,6 +231,7 @@ def compile_post_grad(
         )
 
     def compile_selected() -> CompiledKernel:
+        _preflight_complete_plan(graph, selected_target, policy, scheduler)
         with torch.no_grad():
             reference = prepared.forward(*prepared.example_inputs)
         if scheduler == "auto":
@@ -226,6 +322,92 @@ def compile_post_grad(
     )
     forward.megabake_compile_us = (time.perf_counter() - compile_started) * 1_000_000
     forward.megabake_cache_hit = cache_hit
+    return forward
+
+
+def compile_inductor_fallback(
+    prepared: PreparedFX, reason: str
+) -> Callable[..., Any]:
+    from torch._inductor.compile_fx import compile_fx
+
+    graph = copy.deepcopy(prepared.graph)
+    compiled = compile_fx(graph, prepared.example_inputs)
+    context = prepared.context
+    parameter_positions = {
+        index
+        for index, name in enumerate(context.input_order)
+        if name in context.parameter_names
+    }
+    runtime_positions = [
+        index
+        for index in range(len(context.input_order))
+        if index not in parameter_positions
+    ]
+    current_parameters = {
+        context.input_order[index]: prepared.example_inputs[index]
+        for index in parameter_positions
+        if index < len(prepared.example_inputs)
+    }
+    launch_count = 0
+
+    def forward(*args: Any, **kwargs: Any) -> Any:
+        nonlocal launch_count
+        if kwargs:
+            raise CompilerError(
+                CompilerDiagnostic(
+                    "fallback-binding",
+                    "keyword arguments are not supported by the fallback callable",
+                    requirement="positional runtime arguments",
+                )
+            )
+        runtime_values = pytree.tree_flatten(args)[0]
+        if len(runtime_values) == len(context.input_order):
+            full_inputs = list(runtime_values)
+        elif len(runtime_values) == len(runtime_positions):
+            full_inputs = [None] * len(context.input_order)
+            for position, value in zip(runtime_positions, runtime_values, strict=True):
+                full_inputs[position] = value
+            for position in parameter_positions:
+                name = context.input_order[position]
+                value = current_parameters.get(name)
+                if value is None:
+                    raise CompilerError(
+                        CompilerDiagnostic(
+                            "fallback-binding",
+                            f"missing current parameter {name}",
+                            requirement="current parameter binding",
+                        )
+                    )
+                full_inputs[position] = value
+        else:
+            raise CompilerError(
+                CompilerDiagnostic(
+                    "fallback-binding",
+                    (
+                        f"expected {len(runtime_positions)} runtime arguments "
+                        f"or {len(context.input_order)} graph arguments, "
+                        f"got {len(runtime_values)}"
+                    ),
+                    requirement="runtime argument count",
+                )
+            )
+
+        output = compiled(*full_inputs)
+        launch_count += 1
+        forward.megabake_launch_count = launch_count
+        context.requirements["fallback_launch_count"] = launch_count
+        return pytree.tree_unflatten(
+            output,
+            context.runtime_output_tree_spec or context.output_tree_spec,
+        )
+
+    context.requirements["execution"] = "inductor_fallback"
+    context.requirements["fallback_reason"] = reason
+    context.requirements["fallback_launch_count"] = launch_count
+    forward.megabake_execution = "inductor_fallback"
+    forward.megabake_fallback_reason = reason
+    forward.megabake_launch_count = launch_count
+    forward.megabake_context = context
     return forward
 
 
@@ -614,9 +796,15 @@ def _post_grad_graph(
     prepared: PreparedFX, target: TargetFacts | None
 ) -> tuple[ComputeGraph, TargetFacts]:
     try:
-        selected_target = target or _target_facts(_common_cuda_device(prepared.example_inputs))
         graph = import_fx(prepared.graph, prepared.context)
-        return form_regions(canonicalize_semantics(graph)), selected_target
+        graph = form_regions(canonicalize_semantics(graph))
+        semantic = _semantic_diagnostic(graph)
+        if semantic is not None:
+            raise CompilerError(semantic, safe_for_fallback=True)
+        selected_target = target or _target_facts(
+            _common_cuda_device(prepared.example_inputs)
+        )
+        return graph, selected_target
     except CompilerError:
         raise
     except Exception as error:

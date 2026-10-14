@@ -148,7 +148,9 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument(
         "--mode", choices=("prefill", "decode"), default=argparse.SUPPRESS
     )
-    common.add_argument("--fallback", choices=("error",), default=argparse.SUPPRESS)
+    common.add_argument(
+        "--fallback", choices=("error", "inductor"), default=argparse.SUPPRESS
+    )
     common.add_argument("--no-cache", action="store_true", default=argparse.SUPPRESS)
     common.add_argument("--dump-dir", default=argparse.SUPPRESS)
     parser = argparse.ArgumentParser(prog="megabake", parents=[common])

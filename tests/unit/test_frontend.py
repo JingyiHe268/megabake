@@ -1,8 +1,9 @@
 import pytest
 import torch
 from torch.fx import GraphModule
+from torch._inductor import compile_fx as inductor_compile_fx
 
-from megabake import make_backend, prepare_fx_graph
+from megabake import CompilerError, make_backend, prepare_fx_graph
 
 
 class Model(torch.nn.Module):
@@ -14,6 +15,25 @@ class Model(torch.nn.Module):
         return torch.nn.functional.gelu(self.linear(value))
 
 
+_opaque_calls = [0]
+
+
+@torch.library.custom_op("megabake_task22::opaque", mutates_args=())
+def opaque(value: torch.Tensor) -> torch.Tensor:
+    _opaque_calls[0] += 1
+    return value * 3
+
+
+@opaque.register_fake
+def _(value: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(value)
+
+
+class OpaqueModel(torch.nn.Module):
+    def forward(self, value):
+        return opaque(value) + 1
+
+
 def test_make_backend_rejects_invalid_mode():
     with pytest.raises(ValueError, match="Unsupported mode"):
         make_backend(mode="training")
@@ -22,6 +42,11 @@ def test_make_backend_rejects_invalid_mode():
 def test_make_backend_rejects_invalid_scheduler():
     with pytest.raises(ValueError, match="scheduler must be"):
         make_backend(scheduler="tile-events")
+
+
+def test_make_backend_rejects_invalid_fallback():
+    with pytest.raises(ValueError, match="Unsupported fallback"):
+        make_backend(fallback="eager")
 
 
 def test_make_backend_defaults_to_measured_scheduler_selection():
@@ -43,7 +68,7 @@ def test_prepare_fx_graph_remains_fx_and_skips_inductor_compilation(monkeypatch)
         raise AssertionError("Inductor compilation must not be invoked")
 
     monkeypatch.setattr(
-        torch._inductor.compile_fx, "compile_fx_forward", forbidden
+        inductor_compile_fx, "compile_fx_forward", forbidden
     )
 
     class Model(torch.nn.Module):
@@ -106,3 +131,39 @@ def test_torch_compile_returns_fx_reference_and_follows_parameters():
         model.linear.weight.add_(1)
         assert torch.allclose(optimized(second), model(second))
     assert backend.megabake_contexts[-1].phase == "post_grad"
+
+
+def test_task22_strict_rejection_happens_before_execution():
+    value = torch.randn(3, 4)
+    exported = torch.export.export(OpaqueModel(), (value,))
+    backend = make_backend(
+        fallback="error", compile_kernel=True, cache=False
+    )
+    calls_before = _opaque_calls[0]
+    with pytest.raises(CompilerError, match="missing lowering rule") as rejection:
+        backend(exported.graph_module, (value,))
+    assert "File " in str(rejection.value)
+    assert "source operations: op:opaque" in str(rejection.value)
+    assert _opaque_calls[0] == calls_before
+
+
+def test_task22_inductor_fallback_handles_changed_inputs():
+    value = torch.randn(3, 4)
+    backend = make_backend(
+        fallback="inductor", compile_kernel=True, cache=False
+    )
+    forward = torch.compile(OpaqueModel(), backend=backend, fullgraph=True)
+    calls_before = _opaque_calls[0]
+    with torch.no_grad():
+        first = forward(value)
+        second = forward(value + 1)
+    fallback = backend.megabake_last_fallback
+    assert torch.allclose(first, value * 3 + 1)
+    assert torch.allclose(second, (value + 1) * 3 + 1)
+    assert _opaque_calls[0] == calls_before + 2
+    assert fallback.megabake_execution == "inductor_fallback"
+    assert "missing lowering rule" in fallback.megabake_fallback_reason
+    assert fallback.megabake_launch_count == 2
+    context = backend.megabake_contexts[-1]
+    assert context.requirements["execution"] == "inductor_fallback"
+    assert context.requirements["fallback_launch_count"] == 2

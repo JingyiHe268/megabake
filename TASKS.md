@@ -460,16 +460,18 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Implement in:** `frontend.py` and `compiler.py`.
 
-- [ ] Add `fallback=error|inductor`, with `error` as the default.
-- [ ] In strict mode, report the unresolved operation, source location, or composition failure before device execution.
-- [ ] In fallback mode, delegate the whole captured invocation through a pinned Inductor adapter without recursively entering MegaBake.
-- [ ] Retain the same runtime wrappers, guards, outputs, aliases, and state behavior.
-- [ ] Label the result `inductor_fallback` and record its reason and launch count.
-- [ ] Keep runtime device errors separate from compile rejection. Never retry a partly executed stateful invocation through fallback.
+- [x] Add `fallback=error|inductor`, with `error` as the default.
+- [x] In strict mode, report the unresolved operation, source location, or composition failure before device execution.
+- [x] In fallback mode, delegate the whole captured invocation through a pinned Inductor adapter without recursively entering MegaBake.
+- [x] Retain the same runtime wrappers, guards, outputs, aliases, and state behavior.
+- [x] Label the result `inductor_fallback` and record its reason and launch count.
+- [x] Keep runtime device errors separate from compile rejection. Never retry a partly executed stateful invocation through fallback.
 
 **Output:** a deliberate compatibility path when a complete megakernel cannot be produced.
 
 **Check:** capture an opaque operation with no MegaBake lowering. Test strict rejection and supported delegation on changed runtime inputs.
+
+**Evidence:** `make_backend` accepts `fallback=error|inductor` and defaults to strict rejection. Semantic and structural plan checks run before the reference invocation, so unresolved operations and composition failures are source-linked and never partly executed before fallback selection. Only pre-execution `CompilerError` rejections can select the pinned `compile_fx` adapter; post-execution runtime failures remain errors. The fallback wrapper preserves parameter/runtime argument binding and records `inductor_fallback`, its reason, and its launch count. CPU tests cover strict rejection without calling the opaque operation and repeated Inductor delegation with changed input values.
 
 ## 23. Extend generic coverage to unfamiliar graphs
 
