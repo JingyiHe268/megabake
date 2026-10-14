@@ -66,6 +66,14 @@ def _enumerate_body_selections(
     options_by_region: list[list[Option]] = []
     rejections: list[RejectionRecord] = []
     unsupported: list[UnsupportedRegion] = []
+    covered_by_candidates = {
+        operation_id
+        for region in graph.regions
+        for candidate in region.fusion_candidates
+        if candidate.executable
+        for operation_id in candidate.source_op_ids
+    }
+    covered_empty_regions: list[int] = []
 
     for region in graph.regions:
         options: list[Option] = []
@@ -100,7 +108,8 @@ def _enumerate_body_selections(
             isinstance(program, TensorProgram) and program.family == "view"
             for program in region.tensor_programs
         ):
-            options_by_region.append([None])
+            options.append(None)
+            options_by_region.append(options)
             continue
         if region.tensor_programs:
             program = region.tensor_programs[0]
@@ -113,6 +122,13 @@ def _enumerate_body_selections(
         else:
             unsupported.append(UnsupportedRegion(region.id, "region has no tensor program"))
         if not options:
+            if all(
+                operation_id in covered_by_candidates
+                for operation_id in region.source_op_ids
+            ):
+                covered_empty_regions.append(len(options_by_region))
+                options_by_region.append([None])
+                continue
             unsupported.append(UnsupportedRegion(region.id, "no valid provider candidate"))
         options_by_region.append(options)
 
@@ -128,6 +144,12 @@ def _enumerate_body_selections(
                 continue
             chosen.append(option)
             covered_operations.update(option[0].source_op_ids)
+        if any(
+            not combination[index]
+            and not set(graph.regions[index].source_op_ids) <= covered_operations
+            for index in covered_empty_regions
+        ):
+            continue
         if not chosen:
             continue
         selected_bodies = [_selected_body(*option) for option in chosen]
@@ -136,14 +158,25 @@ def _enumerate_body_selections(
             for selected in selected_bodies
             for operation_id in selected.source_op_ids
         }
+        producer_regions_by_value = {
+            value_id: region_ids_by_operation[graph.values[value_id].producer]
+            for value_id in graph.values
+            if graph.values[value_id].producer in region_ids_by_operation
+        }
+        for value in graph.values.values():
+            relation = value.storage_relation
+            if relation.storage_id in producer_regions_by_value:
+                producer_regions_by_value.setdefault(
+                    value.id, producer_regions_by_value[relation.storage_id]
+                )
         selected_bodies = [
             replace(
                 selected,
                 dependencies=tuple(
                     dict.fromkeys(
-                        region_ids_by_operation[graph.values[value_id].producer]
+                        producer_regions_by_value[value_id]
                         for value_id in selected.inputs
-                        if graph.values[value_id].producer in region_ids_by_operation
+                        if value_id in producer_regions_by_value
                     )
                 ),
             )

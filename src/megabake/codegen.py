@@ -11,6 +11,7 @@ from typing import Any
 from collections.abc import Mapping
 
 from .bodies.gemm import HopperWgmmaGemmPersistentKernel
+from .bodies.attention import emit_attention_body
 from .bodies.generic import (
     emit_contraction_body,
     emit_map_body,
@@ -350,7 +351,7 @@ def _emit_generic_module(
         iterator_name = f"work_iterator_{phase.index}"
         step = (
             1
-            if selection.program.family == "reduction"
+            if selection.program.family in {"reduction", "attention"}
             else generated.threads_per_cta
         )
         work_iterators.append(
@@ -768,6 +769,8 @@ def _normalize_generic_selection(
             selection,
             body=replace(body, participants=participants, tiles=tiles, scratch=scratch),
         )
+    elif family == "attention":
+        return replace(selection, body=replace(body, participants=participants))
     else:
         raise UnsupportedCodegen(f"cannot normalize generic body family {family}")
 
@@ -785,6 +788,8 @@ def _generate_device_body(selection: SelectedBody):
         return emit_reduction_body(program, selection.body)
     if program.family == "contraction":
         return emit_contraction_body(program, selection.body)
+    if program.family == "attention":
+        return emit_attention_body(program, selection.body)
     raise UnsupportedCodegen(f"unsupported device body family {program.family}")
 
 

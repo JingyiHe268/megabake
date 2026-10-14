@@ -408,8 +408,8 @@ def test_task25_matches_grouped_attention_access_mask_and_outputs():
         for candidate in region.fusion_candidates
         if candidate.semantic_facts.get("family") == "attention"
     )
-    assert not candidate.executable
-    assert candidate.rejections == ("composable attention provider is not implemented",)
+    assert candidate.executable
+    assert candidate.rejections == ()
     assert candidate.external_inputs == (
         "value:arg0_1",
         "value:arg1_1",

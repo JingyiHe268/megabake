@@ -386,8 +386,10 @@ def test_catalog_describes_g0_range_and_rejects_incompatible_target():
         "generic",
         "g0_range",
     ]
-    assert rejected.rejections[-1].provider == "g0_range"
-    assert "shared memory" in rejected.rejections[-1].reason
+    g0_rejection = next(
+        rejection for rejection in rejected.rejections if rejection.provider == "g0_range"
+    )
+    assert "shared memory" in g0_rejection.reason
 
 
 def test_gemm_candidates_reject_incompatible_operand_layout():

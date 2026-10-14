@@ -1,4 +1,10 @@
 from .catalog import get_candidates
+from .attention import (
+    GeneratedAttentionBody,
+    UnsupportedAttentionBody,
+    attention_candidates,
+    emit_attention_body,
+)
 from .gemm import gemm_candidates
 from .generic import (
     GeneratedContractionBody,
@@ -25,6 +31,10 @@ from .interface import (
 __all__ = [
     "get_candidates",
     "gemm_candidates",
+    "GeneratedAttentionBody",
+    "UnsupportedAttentionBody",
+    "attention_candidates",
+    "emit_attention_body",
     "GeneratedContractionBody",
     "GeneratedMapBody",
     "GeneratedReductionBody",

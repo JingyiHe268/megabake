@@ -870,7 +870,7 @@ def _load_access(
         coordinates.append(coordinate)
         if load.source_shape is not None and not isinstance(axis, DataIndex):
             size = load.source_shape[len(coordinates) - 1]
-            bounds.extend((f"({coordinate}) >= 0", f"({coordinate}) < {size}"))
+            bounds.append(f"0 <= ({coordinate}) < {size}")
     access = f"tensor_bindings[{index}][{', '.join(coordinates)}]"
     if bounds:
         zero = f"{_cutlass_type(load.dtype)}(0)"

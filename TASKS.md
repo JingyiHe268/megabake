@@ -532,12 +532,12 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Implement in:** `attention.py`, using the common provider interface.
 
-- [ ] Measure a strong target implementation and inspect applicable Mirage Hopper device bodies.
-- [ ] Port its device pipeline with explicit warp roles, tile layouts, scratch, barriers, and completion points.
-- [ ] Compile supported score and mask hooks into that pipeline. Preserve softmax state and probability casts.
-- [ ] Return prefill and decode body candidates where their access and numerical contracts hold.
-- [ ] Keep generic execution available for valid variants outside the tuned family. Check materialized-score workspace before admission.
-- [ ] Compose the provider with GEMM and norm bodies. Query the complete kernel's resource use again.
+- [x] Measure a strong target implementation and inspect applicable Mirage Hopper device bodies.
+- [x] Port its device pipeline with explicit warp roles, tile layouts, scratch, barriers, and completion points.
+- [x] Compile supported score and mask hooks into that pipeline. Preserve softmax state and probability casts.
+- [x] Return prefill and decode body candidates where their access and numerical contracts hold.
+- [x] Keep generic execution available for valid variants outside the tuned family. Check materialized-score workspace before admission.
+- [x] Compose the provider with GEMM and norm bodies. Query the complete kernel's resource use again.
 
 **Output:** attention device work that can execute inside the same persistent kernel.
 

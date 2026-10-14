@@ -1527,6 +1527,14 @@ class _RuntimeState:
                 values[binding.value_id] = input_tensors[binding.value_id]
                 continue
             if binding.kind in {"alias", "output"}:
+                internal_alias = _internal_alias(
+                    binding.value_id, plan.graph, values
+                )
+                if internal_alias is not None and binding.layout is not None:
+                    values[binding.value_id] = internal_alias.as_strided(
+                        binding.layout.shape, binding.layout.strides
+                    )
+                    continue
                 alias = _boundary_alias(binding.value_id, plan.graph, input_tensors)
                 if alias is not None:
                     values[binding.value_id] = alias
@@ -1710,6 +1718,28 @@ def _boundary_alias(
             base.shape if value.shape is None else value.shape,
             base.stride() if value.strides is None else value.strides,
         )
+    return None
+
+
+def _internal_alias(
+    value_id: str,
+    graph: ComputeGraph,
+    values: Mapping[str, torch.Tensor],
+) -> torch.Tensor | None:
+    candidates = [value_id]
+    seen: set[str] = set()
+    while candidates:
+        candidate = candidates.pop()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate != value_id and candidate in values:
+            return values[candidate]
+        value = graph.values.get(candidate)
+        if value is None:
+            continue
+        relation = value.storage_relation
+        candidates.extend((*relation.aliases, relation.storage_id))
     return None
 
 

@@ -1459,6 +1459,8 @@ class G0RangeBodyProvider:
             return reject("provider supports contraction only")
         if len(program.loads) != 2:
             return reject("bias epilogues are not supported")
+        if len(program.store.shape) != 2:
+            return reject("provider supports two-dimensional GEMM only")
         if (
             any(load.dtype != "torch.bfloat16" for load in program.loads)
             or program.store.dtype != "torch.bfloat16"
@@ -1532,12 +1534,17 @@ def g0_range_body(config: BodyConfig) -> HopperWgmmaGemmPersistentKernel:
 def cute_gemm_tensors(a, b, c):
     from cutlass.cute.runtime import from_dlpack
 
+    if a.ndim > 2:
+        a = a.reshape(-1, a.shape[-1])
     if any(tensor.data_ptr() % 16 for tensor in (a, b, c)):
         raise ValueError("GEMM tensor base addresses must be 16-byte aligned")
 
     def view(tensor):
+        leading_dim = next(
+            index for index, stride in enumerate(tensor.stride()) if stride == 1
+        )
         return from_dlpack(tensor.unsqueeze(-1), assumed_align=16).mark_layout_dynamic(
-            leading_dim=1
+            leading_dim=leading_dim
         )
 
     return view(a), view(b), view(c)

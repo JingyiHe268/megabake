@@ -231,7 +231,12 @@ def derive_dependencies(selection: BodySelectionPlan) -> DependencyPlan:
             if producer is None:
                 continue
             for value_id in consumer.inputs:
-                if value_id not in producer.outputs:
+                aliases = {
+                    value_id,
+                    *selection.graph.values[value_id].storage_relation.aliases,
+                    selection.graph.values[value_id].storage_relation.storage_id,
+                }
+                if not aliases.intersection(producer.outputs):
                     continue
                 dependencies.append(
                     _tile_dependency(
