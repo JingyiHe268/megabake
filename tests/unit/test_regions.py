@@ -259,3 +259,117 @@ def test_form_regions_keeps_unfamiliar_operations_representable():
     assert unknown_region.semantic_facts == {}
     assert graph.ops[unknown_operation_id].tensor_program is None
     assert len(graph.regions) == len(graph.ops)
+
+
+def test_form_regions_matches_exact_rms_norm_with_residual_and_casts():
+    class Model(torch.nn.Module):
+        def forward(self, source, weight, residual):
+            widened = source.float()
+            variance = torch.pow(widened, 2).mean(dim=-1, keepdim=True)
+            scale = torch.rsqrt(variance + 1e-5)
+            normalized = scale * widened
+            affine = normalized * weight
+            return affine.to(torch.bfloat16) + residual
+
+    torch.manual_seed(24)
+    source = torch.randn(3, 7, dtype=torch.bfloat16)
+    weight = torch.randn(7, dtype=torch.bfloat16)
+    residual = torch.randn(3, 7, dtype=torch.bfloat16)
+    graph = form_regions(_import(Model(), source, weight, residual))
+
+    tail = next(region for region in graph.regions if region.id == "region:add_1")
+    candidate = next(
+        candidate
+        for candidate in tail.fusion_candidates
+        if candidate.semantic_facts["family"] == "rms_norm"
+    )
+    assert candidate.semantic_facts == {
+        "family": "rms_norm",
+        "reduction_axis": 1,
+        "width": 7,
+        "epsilon": 1e-5,
+        "affine": "value:arg1_1",
+        "residual": "value:arg2_1",
+        "source_casts": ("torch.bfloat16->torch.float32", "torch.float32->torch.bfloat16"),
+    }
+    program = candidate.tensor_program
+    assert program is not None
+    assert program.source_target == "rms_norm"
+    assert program.reduction_axes == ("r0",)
+    assert len(program.loads) == 5
+    assert {load.value_id for load in program.loads} == {
+        "value:arg0_1",
+        "value:arg1_1",
+        "value:arg2_1",
+    }
+
+
+def test_form_regions_matches_exact_rope_and_keeps_unfamiliar_variants_generic():
+    class Model(torch.nn.Module):
+        def forward(self, source, cosine, sine):
+            half = source.shape[-1] // 2
+            first = (
+                source[..., :half] * cosine[..., :half]
+                - source[..., half:] * sine[..., :half]
+            )
+            second = (
+                source[..., half:] * sine[..., half:]
+                + source[..., :half] * cosine[..., half:]
+            )
+            return torch.cat((first, second), dim=-1)
+
+    torch.manual_seed(24)
+    source = torch.randn(3, 6, dtype=torch.bfloat16)
+    cosine = torch.randn(3, 6, dtype=torch.bfloat16)
+    sine = torch.randn(3, 6, dtype=torch.bfloat16)
+    graph = form_regions(_import(Model(), source, cosine, sine))
+
+    tail = next(region for region in graph.regions if region.id == "region:cat")
+    candidate = next(
+        candidate
+        for candidate in tail.fusion_candidates
+        if candidate.semantic_facts["family"] == "rope"
+    )
+    assert candidate.semantic_facts == {
+        "family": "rope",
+        "axis": 1,
+        "width": 6,
+        "rotary_width": 6,
+        "rotation": "i <-> i + rotary_width / 2",
+        "pass_through": 0,
+        "source_casts": (),
+    }
+    program = candidate.tensor_program
+    assert program is not None
+    assert program.source_target == "rope"
+    assert len(program.loads) == 5
+    assert {load.value_id for load in program.loads} == {
+        "value:arg0_1",
+        "value:arg1_1",
+        "value:arg2_1",
+    }
+
+    class CastModel(Model):
+        def forward(self, source, cosine, sine):
+            return super().forward(source.float(), cosine.float(), sine.float())
+
+    cast_graph = form_regions(_import(CastModel(), source, cosine, sine))
+    assert not any(
+        candidate.semantic_facts.get("family") == "rope"
+        for region in cast_graph.regions
+        for candidate in region.fusion_candidates
+    )
+
+    half_graph = form_regions(
+        _import(
+            Model(),
+            source.float().to(torch.float16),
+            cosine.float().to(torch.float16),
+            sine.float().to(torch.float16),
+        )
+    )
+    assert not any(
+        candidate.semantic_facts.get("family") == "rope"
+        for region in half_graph.regions
+        for candidate in region.fusion_candidates
+    )

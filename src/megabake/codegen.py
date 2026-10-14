@@ -366,6 +366,9 @@ def _emit_generic_module(
             )
         )
 
+        program_input_ids = tuple(
+            dict.fromkeys(load.value_id for load in selection.program.loads)
+        )
         tensor_names = tuple(
             _tensor_name(
                 tensor_arguments,
@@ -378,7 +381,7 @@ def _emit_generic_module(
                     for conversion in phase.conversion_bodies
                 ),
             )
-            for value_id in selection.inputs
+            for value_id in program_input_ids
         ) + (
             _tensor_name(
                 tensor_arguments,
@@ -564,6 +567,15 @@ def _emit_generic_module(
         if event_schedule is not None
         else "from megabake.runtime import cooperative_worker_loop, grid_barrier"
     )
+    rope_conversion_import = (
+        "from cutlass.cute.arch.nvvm_wrappers import cvt_f32_bf16\n"
+        if any(
+            selection.program.source_target == "rope"
+            and selection.program.store.dtype == "torch.bfloat16"
+            for selection in plan.selection.selections
+        )
+        else ""
+    )
     kernel_arguments = [
         "ready: cute.Tensor",
         "workers: cutlass.Int32",
@@ -586,6 +598,7 @@ def _emit_generic_module(
     source = f'''import cutlass
 import cutlass.cute as cute
 from cuda.bindings import driver as cuda
+{rope_conversion_import}
 
 {runtime_import}
 from megabake.bodies.gemm import HopperWgmmaGemmPersistentKernel

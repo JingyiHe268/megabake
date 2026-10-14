@@ -154,7 +154,9 @@ def emit_map_body(program: TensorProgram, config: BodyConfig) -> GeneratedMapBod
     axis_coordinates = {
         domain.axis: f"o{index}" for index, domain in enumerate(program.iteration_domains)
     }
-    load_indices = {load.id: index for index, load in enumerate(program.loads)}
+    input_value_ids = tuple(dict.fromkeys(load.value_id for load in program.loads))
+    binding_indices = {value_id: index for index, value_id in enumerate(input_value_ids)}
+    load_indices = {load.id: binding_indices[load.value_id] for load in program.loads}
     value = _emit_expression(
         program.combine, load_indices, axis_coordinates, program.loads
     )
@@ -164,8 +166,16 @@ def emit_map_body(program: TensorProgram, config: BodyConfig) -> GeneratedMapBod
     output_coordinates = ", ".join(
         axis_coordinates[domain.axis] for domain in program.iteration_domains
     )
+    if program.source_target == "rope":
+        return _emit_rope_map_body(
+            program,
+            threads,
+            axis_coordinates,
+            coordinate_lines,
+            output_coordinates,
+        )
     binding_type = ", ".join(
-        "cute.Tensor" for _ in range(len(program.loads) + 1)
+        "cute.Tensor" for _ in range(len(input_value_ids) + 1)
     )
     source = f'''import cutlass
 import cutlass.cute as cute
@@ -181,13 +191,95 @@ def run(
     block, _, _ = cute.arch.block_idx()
     thread, _, _ = cute.arch.thread_idx()
     workers, _, _ = cute.arch.grid_dim()
-    output = tensor_bindings[{len(program.loads)}]
+    output = tensor_bindings[{len(input_value_ids)}]
     output_count = cute.size(output)
     for tile in cutlass.range(block, cute.size(work_iterator), workers):
         linear_index = work_iterator[tile] + thread
         if linear_index < output_count:
 {coordinate_lines}            value = {value.code}
             output[{output_coordinates}] = value
+'''
+    element_count = 1
+    for size in program.store.shape:
+        element_count *= size
+    tile_count = (element_count + threads - 1) // threads
+    return GeneratedMapBody(
+        source=source,
+        threads_per_cta=threads,
+        tile_elements=threads,
+        tile_count=tile_count,
+    )
+
+
+def _emit_rope_map_body(
+    program: TensorProgram,
+    threads: int,
+    axis_coordinates: Mapping[str, str],
+    coordinate_lines: str,
+    output_coordinates: str,
+) -> GeneratedMapBody:
+    final_axis = program.iteration_domains[-1].axis
+    final_coordinate = axis_coordinates[final_axis]
+    rotary_width = program.loads[3].source_shape[-1] if program.loads[3].source_shape else None
+    if rotary_width is None:
+        domain_sizes = {
+            domain.axis: domain.size for domain in program.iteration_domains
+        }
+        rotary_width = domain_sizes[final_axis]
+    half_width = rotary_width // 2
+    current = _load_access(program.loads[0], 0, program.loads, axis_coordinates)
+    plus = _load_access(program.loads[1], 0, program.loads, axis_coordinates)
+    minus = _load_access(program.loads[2], 0, program.loads, axis_coordinates)
+    cosine = _load_access(program.loads[3], 1, program.loads, axis_coordinates)
+    sine = _load_access(program.loads[4], 2, program.loads, axis_coordinates)
+    output_type = _cutlass_type(program.store.dtype)
+    round_call = (
+        "cvt_f32_bf16"
+        if program.store.dtype == "torch.bfloat16"
+        else "cutlass.Float32"
+    )
+    conversion_import = (
+        "from cutlass.cute.arch.nvvm_wrappers import cvt_f32_bf16\n"
+        if program.store.dtype == "torch.bfloat16"
+        else ""
+    )
+    source = f'''import cutlass
+import cutlass.cute as cute
+{conversion_import}
+
+
+@cute.kernel
+def run(
+    work_iterator: cute.Tensor,
+    tensor_bindings: tuple[cute.Tensor, cute.Tensor, cute.Tensor, cute.Tensor],
+    scratch,
+    epilogue,
+):
+    block, _, _ = cute.arch.block_idx()
+    thread, _, _ = cute.arch.thread_idx()
+    workers, _, _ = cute.arch.grid_dim()
+    output = tensor_bindings[3]
+    output_count = cute.size(output)
+    for tile in cutlass.range(block, cute.size(work_iterator), workers):
+        linear_index = work_iterator[tile] + thread
+        if linear_index < output_count:
+{coordinate_lines}            current_value = {current.code}
+            plus_value = {plus.code}
+            minus_value = {minus.code}
+            cosine_value = {cosine.code}
+            sine_value = {sine.code}
+            value = current_value
+            if {final_coordinate} < {half_width}:
+                left_product = {round_call}(cutlass.Float32(current_value * cosine_value).ir_value())
+                right_product = {round_call}(cutlass.Float32(plus_value * sine_value).ir_value())
+                value = {round_call}(cutlass.Float32(left_product - right_product).ir_value())
+            elif {final_coordinate} < {rotary_width}:
+                left_product = {round_call}(cutlass.Float32(current_value * sine_value).ir_value())
+                right_product = {round_call}(cutlass.Float32(minus_value * cosine_value).ir_value())
+                value = {round_call}(cutlass.Float32(left_product + right_product).ir_value())
+            else:
+                value = current_value
+            output[{output_coordinates}] = {output_type}(value)
 '''
     element_count = 1
     for size in program.store.shape:
@@ -220,7 +312,9 @@ def emit_reduction_body(
         domain.axis: f"o{index}" for index, domain in enumerate(output_domains)
     }
     reduction_coordinate = f"r{program.reduction_axes.index(reduction_domain.axis)}"
-    load_indices = {load.id: index for index, load in enumerate(program.loads)}
+    input_value_ids = tuple(dict.fromkeys(load.value_id for load in program.loads))
+    binding_indices = {value_id: index for index, value_id in enumerate(input_value_ids)}
+    load_indices = {load.id: binding_indices[load.value_id] for load in program.loads}
 
     accumulator = _emit_expression(program.init, load_indices, axis_coordinates, program.loads)
     combine = _emit_expression(
@@ -239,7 +333,7 @@ def emit_reduction_body(
         axis_coordinates[domain.axis] for domain in output_domains
     )
     binding_type = ", ".join(
-        "cute.Tensor" for _ in range(len(program.loads) + 1)
+        "cute.Tensor" for _ in range(len(input_value_ids) + 1)
     )
     accumulator_type = _cutlass_type(program.accumulator_dtype or "")
     source = f'''import cutlass
@@ -259,7 +353,7 @@ def run(
     warp = thread // 32
     lane = thread % 32
     warps = {warps}
-    output = tensor_bindings[{len(program.loads)}]
+    output = tensor_bindings[{len(input_value_ids)}]
     output_count = cute.size(output)
     for tile in cutlass.range(block, cute.size(work_iterator), workers):
         output_index = work_iterator[tile]
@@ -556,14 +650,28 @@ def _validate_body_layouts(
     ):
         raise UnsupportedMapBody("body output layout does not match tensor program")
 
+    loads_by_value: dict[str, list[Any]] = {}
+    for load in program.loads:
+        loads_by_value.setdefault(load.value_id, []).append(load)
     for load in program.loads:
         layout = config.layouts.inputs[load.value_id]
         if (
-            layout.axes != load.axes
-            or layout.strides != tuple(load.strides)
+            layout.strides != tuple(load.strides)
             or layout.dtype != load.dtype
         ):
             raise UnsupportedMapBody("body input layout does not match tensor program")
+        primary_load = loads_by_value[load.value_id][0]
+        if load is primary_load and layout.axes != primary_load.axes:
+            raise UnsupportedMapBody("body input layout does not match tensor program")
+        if any(
+            other.source_shape != load.source_shape
+            or other.strides != load.strides
+            or other.dtype != load.dtype
+            for other in loads_by_value[load.value_id]
+        ):
+            raise UnsupportedMapBody(
+                "repeated loads of one value must share shape, strides, and dtype"
+            )
         if any(stride < 0 for stride in load.strides):
             raise UnsupportedMapBody("negative input strides are not supported")
 
@@ -627,7 +735,9 @@ def _emit_expression(
         index = load_indices.get(expression.load_id)
         if index is None:
             raise UnsupportedMapBody(f"unknown load {expression.load_id}")
-        load = loads[index]
+        load = next(
+            candidate for candidate in loads if candidate.id == expression.load_id
+        )
         return _load_access(load, index, loads, axis_coordinates)
 
     if isinstance(expression, Constant):

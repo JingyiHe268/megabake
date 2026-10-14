@@ -498,15 +498,17 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Implement in:** `regions.py` and `generic.py`; split files only as implementations grow.
 
-- [ ] Match exact norm and RoPE semantics. Extract axes, epsilon, residual/affine terms, casts, and rotation rules.
-- [ ] Generate those expressions around reusable row and vector schedules.
-- [ ] Return tuned candidates only when the full source behavior fits. Retain generic candidates for other variants.
-- [ ] Fuse compatible projection epilogues or residual work while preserving all outputs and numerical rules.
-- [ ] Compose these schedules with the MLP and repeat resource, scratch, and body-transition checks.
+- [x] Match exact norm and RoPE semantics. Extract axes, epsilon, residual/affine terms, casts, and rotation rules.
+- [x] Generate those expressions around reusable row and vector schedules.
+- [x] Return tuned candidates only when the full source behavior fits. Retain generic candidates for other variants.
+- [x] Fuse compatible projection epilogues or residual work while preserving all outputs and numerical rules.
+- [x] Compose these schedules with the MLP and repeat resource, scratch, and body-transition checks.
 
 **Output:** performant norm and RoPE variants generated from source expressions.
 
 **Check:** use different epsilons, widths, casts, residual terms, and supported strides. Compare the complete region after composition.
+
+**Evidence:** exact RMSNorm matching now covers BF16 widening, affine terms, epsilon, final rounding, and residual addition in one reduction program. Exact full-width paired RoPE matching covers BF16/FP32, positive strides, and the captured half-slice expression in one vector program; explicit casts and FP16 remain on generic candidates. SM90 tests compare both complete regions bit-exactly with eager execution, including a non-contiguous RoPE input, and compose RMSNorm, the existing gated MLP, and RoPE in one megakernel while checking topological dependencies, worker assignments, phase barriers, scratch reuse, and occupancy. Partial three-operand RoPE is intentionally not claimed.
 
 ## 25. Import and recognize attention precisely
 

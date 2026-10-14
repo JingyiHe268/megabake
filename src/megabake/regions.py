@@ -7,9 +7,13 @@ from math import prod
 
 from .graph import ComputeGraph, Op, Region, RegionCandidate, verify_compute_graph
 from .lowering import (
+    AxisAffine,
+    AxisPredicate,
+    AxisTerm,
     Binary,
     Constant,
     IndexedLoad,
+    IterationDomain,
     Accumulator,
     AxisIndex,
     Cast,
@@ -17,6 +21,8 @@ from .lowering import (
     ScalarExpression,
     TensorProgram,
     Unary,
+    TensorStore,
+    Where,
 )
 
 
@@ -162,6 +168,12 @@ def _fusion_candidates(graph: ComputeGraph) -> dict[str, tuple[RegionCandidate, 
     if gated_candidate is not None:
         tail_operation = gated_candidate.source_op_ids[-1]
         candidates.setdefault(tail_operation, []).append(gated_candidate)
+    for candidate in _rms_norm_candidates(graph):
+        tail_operation = candidate.source_op_ids[-1]
+        candidates.setdefault(tail_operation, []).append(candidate)
+    for candidate in _rope_candidates(graph):
+        tail_operation = candidate.source_op_ids[-1]
+        candidates.setdefault(tail_operation, []).append(candidate)
     return {tail: tuple(values) for tail, values in candidates.items()}
 
 
@@ -324,6 +336,590 @@ def _substitute_loads(
             false_value=_substitute_loads(expression.false_value, replacements),
         )
     raise ValueError(f"unsupported scalar expression {expression!r}")
+
+
+def _rms_norm_candidates(graph: ComputeGraph) -> tuple[RegionCandidate, ...]:
+    candidates = []
+    for operation in graph.ops.values():
+        program = operation.tensor_program
+        if (
+            not isinstance(program, TensorProgram)
+            or program.family != "reduction"
+            or program.source_target != "aten.mean.dim"
+        ):
+            continue
+        candidate = _rms_norm_candidate(operation, graph)
+        if candidate is not None:
+            candidates.append(candidate)
+    return tuple(candidates)
+
+
+def _rms_norm_candidate(mean: Op, graph: ComputeGraph) -> RegionCandidate | None:
+    chain = _rms_norm_chain(mean, graph)
+    if chain is None:
+        return None
+    operations, x_id, weight_id, epsilon = chain
+    tail = operations[-1]
+    tail_value = graph.values[tail.results[0]]
+    if tail_value.shape is None or tail_value.dtype is None or tail_value.strides is None:
+        return None
+    x_value = graph.values[x_id]
+    if x_value.shape is None or x_value.dtype is None or x_value.strides is None:
+        return None
+    if len(x_value.shape) < 2 or x_value.shape[-1] <= 0:
+        return None
+
+    output_domains = tuple(
+        IterationDomain(f"o{index}", size)
+        for index, size in enumerate(tail_value.shape)
+    )
+    reduction_domain = IterationDomain("r0", x_value.shape[-1])
+    output_axes = tuple(domain.axis for domain in output_domains)
+    leaf_loads: list[IndexedLoad] = []
+
+    def leaf_load(value_id: str, axes: tuple[object, ...]) -> Load:
+        value = graph.values[value_id]
+        load = IndexedLoad(
+            id=f"load:{len(leaf_loads)}",
+            value_id=value_id,
+            axes=axes,
+            strides=value.strides or (),
+            dtype=value.dtype or "",
+            source_shape=value.shape,
+        )
+        leaf_loads.append(load)
+        return Load(load.id, load.dtype)
+
+    x_reduction_load = leaf_load(
+        x_id, (*output_axes[:-1], reduction_domain.axis)
+    )
+    x_post_load = leaf_load(x_id, output_axes)
+    weight_reduction_load = (
+        leaf_load(weight_id, (reduction_domain.axis,)) if weight_id is not None else None
+    )
+    weight_post_load = (
+        leaf_load(weight_id, output_axes[-1:]) if weight_id is not None else None
+    )
+    residual_id = None
+    if (
+        tail.tensor_program is not None
+        and isinstance(tail.tensor_program.combine, Binary)
+        and tail.tensor_program.combine.operator == "add"
+    ):
+        for operand_id in tail.operands:
+            if operand_id != operations[-2].results[0]:
+                residual_id = operand_id
+    residual_load = (
+        leaf_load(residual_id, output_axes)
+        if residual_id is not None
+        else None
+    )
+
+    expressions: dict[str, ScalarExpression] = {}
+    post_expressions: dict[str, ScalarExpression] = {}
+    x_expression_ids = {x_id}
+    if (
+        operations[0].attributes.get("target") == "prims.convert_element_type.default"
+        and operations[0].operands[0] == x_id
+    ):
+        x_expression_ids.add(operations[0].results[0])
+    after_mean = False
+    for operation in operations:
+        program = operation.tensor_program
+        if not isinstance(program, TensorProgram):
+            return None
+        if operation is mean:
+            input_expression = expressions.get(program.loads[0].value_id)
+            if input_expression is None:
+                return None
+            combine = _substitute_loads(
+                program.combine,
+                {program.loads[0].id: input_expression},
+            )
+            expressions[operation.results[0]] = program.post
+            post_expressions[operation.results[0]] = program.post
+            after_mean = True
+            continue
+        target_expressions = post_expressions if after_mean else expressions
+        replacements: dict[str, ScalarExpression] = {}
+        for load in program.loads:
+            expression = target_expressions.get(load.value_id)
+            if expression is None:
+                if load.value_id in x_expression_ids:
+                    expression = x_post_load if after_mean else x_reduction_load
+                elif weight_reduction_load is not None and load.value_id == weight_id:
+                    expression = (
+                        weight_post_load if after_mean else weight_reduction_load
+                    )
+                elif residual_load is not None and load.value_id == residual_id:
+                    expression = residual_load
+                else:
+                    return None
+            replacements[load.id] = expression
+        target_expressions[operation.results[0]] = _substitute_loads(
+            program.combine, replacements
+        )
+
+    program = TensorProgram(
+        family="reduction",
+        source_target="rms_norm",
+        decomposition="row sum of squares with generated pre- and post-reduction expressions",
+        iteration_domains=(*output_domains, reduction_domain),
+        reduction_axes=(reduction_domain.axis,),
+        loads=tuple(leaf_loads),
+        init=mean.tensor_program.init if isinstance(mean.tensor_program, TensorProgram) else None,
+        combine=combine,
+        post=post_expressions[tail.results[0]],
+        accumulator_dtype=mean.tensor_program.accumulator_dtype
+        if isinstance(mean.tensor_program, TensorProgram)
+        else None,
+        store=TensorStore(
+            tail_value.id,
+            tail_value.shape,
+            tail_value.dtype,
+            tail_value.strides,
+            True,
+        ),
+        predicates=tuple(
+            AxisPredicate(domain.axis, domain.size)
+            for domain in (*output_domains, reduction_domain)
+        ),
+    )
+    operation_ids = {operation.id for operation in operations}
+    rejections: list[str] = []
+    if any(_has_illegal_effects(operation) for operation in operations):
+        rejections.append("source effects do not fit a fused norm body")
+    if any(
+        any(user not in operation_ids for user in graph.values[operation.results[0]].users)
+        for operation in operations[:-1]
+    ):
+        rejections.append("a norm intermediate value has an external use")
+
+    source_casts = tuple(
+        f"{graph.values[operation.operands[0]].dtype}->{graph.values[operation.results[0]].dtype}"
+        for operation in operations
+        if operation.attributes.get("target") == "prims.convert_element_type.default"
+    )
+    return RegionCandidate(
+        id=f"region:{tail.id.removeprefix('op:')}:rms_norm",
+        source_op_ids=tuple(operation.id for operation in operations),
+        external_inputs=_external_inputs(tuple(operations), graph),
+        live_outputs=_live_outputs(tuple(operations), graph),
+        tensor_program=program,
+        semantic_facts={
+            "family": "rms_norm",
+            "reduction_axis": len(x_value.shape) - 1,
+            "width": x_value.shape[-1],
+            "epsilon": epsilon,
+            "affine": weight_id,
+            "residual": residual_id,
+            "source_casts": source_casts,
+        },
+        cost_bytes=sum(
+            _value_bytes(operation.results[0], graph)
+            for operation in operations[:-1]
+        ),
+        rejections=tuple(rejections),
+    )
+
+
+def _rms_norm_chain(
+    mean: Op, graph: ComputeGraph
+) -> tuple[tuple[Op, ...], str, str | None, float] | None:
+    mean_program = mean.tensor_program
+    if not isinstance(mean_program, TensorProgram):
+        return None
+    if len(mean_program.reduction_axes) != 1:
+        return None
+    pow_operation = _producer(mean.operands[0], graph)
+    if pow_operation is None or not _matches_target(
+        pow_operation, "aten.pow.Tensor_Scalar"
+    ):
+        return None
+    cast_operation = _producer(pow_operation.operands[0], graph)
+    if cast_operation is not None and _matches_target(
+        cast_operation, "prims.convert_element_type.default"
+    ):
+        x_id = cast_operation.operands[0]
+    else:
+        x_id = pow_operation.operands[0]
+        cast_operation = None
+
+    add = _sole_user(mean, graph)
+    if add is None or not (
+        _matches_target(add, "aten.add.Scalar")
+        or _matches_target(add, "aten.add.Tensor")
+    ):
+        return None
+    rsqrt = _sole_user(add, graph)
+    if rsqrt is None or not _matches_target(rsqrt, "aten.rsqrt.default"):
+        return None
+    scale = _sole_user(rsqrt, graph)
+    if scale is None or not _matches_target(scale, "aten.mul.Tensor"):
+        return None
+    scale_x_id = cast_operation.results[0] if cast_operation is not None else x_id
+    if scale_x_id not in scale.operands or rsqrt.results[0] not in scale.operands:
+        return None
+
+    affine = _sole_user(scale, graph)
+    weight_id: str | None = None
+    tail = scale
+    if (
+        affine is not None
+        and _matches_target(affine, "aten.mul.Tensor")
+        and scale.results[0] in affine.operands
+    ):
+        weight_id = next(
+            operand_id for operand_id in affine.operands if operand_id != scale.results[0]
+        )
+        if weight_id not in graph.inputs:
+            return None
+        tail = affine
+
+    output_cast = _sole_user(tail, graph)
+    if (
+        output_cast is not None
+        and _matches_target(output_cast, "prims.convert_element_type.default")
+        and graph.values[output_cast.operands[0]].dtype
+        != graph.values[output_cast.results[0]].dtype
+    ):
+        tail = output_cast
+
+    residual = _sole_user(tail, graph)
+    if (
+        residual is not None
+        and _matches_target(residual, "aten.add.Tensor")
+        and tail.results[0] in residual.operands
+    ):
+        residual_id = next(
+            operand_id
+            for operand_id in residual.operands
+            if operand_id != tail.results[0]
+        )
+        if (
+            residual_id not in graph.inputs
+            or graph.values[residual_id].shape != graph.values[tail.results[0]].shape
+        ):
+            residual = None
+        else:
+            tail = residual
+
+    operations = [
+        operation
+        for operation in graph.ops.values()
+        if operation.id
+        in {
+            operation.id
+            for operation in (
+                cast_operation,
+                pow_operation,
+                mean,
+                add,
+                rsqrt,
+                scale,
+                affine,
+                output_cast,
+                residual,
+            )
+            if operation is not None
+        }
+    ]
+    add_program = add.tensor_program
+    if (
+        not isinstance(add_program, TensorProgram)
+        or not isinstance(add_program.combine, Binary)
+        or not isinstance(add_program.combine.rhs, Constant)
+        or not isinstance(add_program.combine.rhs.value, float)
+    ):
+        return None
+    return tuple(operations), x_id, weight_id, add_program.combine.rhs.value
+
+
+def _rope_candidates(graph: ComputeGraph) -> tuple[RegionCandidate, ...]:
+    candidates = []
+    for operation in graph.ops.values():
+        program = operation.tensor_program
+        if program is None or program.family != "concat":
+            continue
+        candidate = _rope_candidate(operation, graph)
+        if candidate is not None:
+            candidates.append(candidate)
+    return tuple(candidates)
+
+
+def _rope_candidate(concat: Op, graph: ComputeGraph) -> RegionCandidate | None:
+    program = concat.tensor_program
+    if program is None or program.family != "concat" or len(concat.operands) != 2:
+        return None
+    if program.semantics.get("axis") != len(graph.values[concat.results[0]].shape or ()) - 1:
+        return None
+    sub = _producer(concat.operands[0], graph)
+    add = _producer(concat.operands[1], graph)
+    if sub is None or add is None:
+        return None
+    if not (
+        _binary_operator(sub, "sub")
+        and _binary_operator(add, "add")
+        and _binary_operator(_producer(sub.operands[0], graph), "mul")
+        and _binary_operator(_producer(sub.operands[1], graph), "mul")
+        and _binary_operator(_producer(add.operands[0], graph), "mul")
+        and _binary_operator(_producer(add.operands[1], graph), "mul")
+    ):
+        return None
+
+    roots: dict[str, int] = {}
+    for multiply in (
+        _producer(sub.operands[0], graph),
+        _producer(sub.operands[1], graph),
+        _producer(add.operands[0], graph),
+        _producer(add.operands[1], graph),
+    ):
+        if multiply is None:
+            return None
+        for operand_id in multiply.operands:
+            root = _view_root(operand_id, graph)
+            if root is None:
+                return None
+            roots[root] = roots.get(root, 0) + 1
+    if len(roots) != 3 or sorted(roots.values()) != [2, 2, 4]:
+        return None
+    x_id = next(value_id for value_id, count in roots.items() if count == 4)
+    trig_ids = tuple(value_id for value_id, count in roots.items() if count == 2)
+    cos_id, sin_id = trig_ids
+    if any(
+        (
+            producer := _producer(root_id, graph)
+        ) is not None
+        and _matches_target(producer, "prims.convert_element_type.default")
+        for root_id in roots
+    ):
+        return None
+    operations = _rope_operations(concat, (x_id, cos_id, sin_id), graph)
+    if any("convert_element_type" in str(op.attributes.get("target")) for op in operations):
+        return None
+
+    output = graph.values[concat.results[0]]
+    x = graph.values[x_id]
+    cos = graph.values[cos_id]
+    sin = graph.values[sin_id]
+    if (
+        output.shape is None
+        or output.strides is None
+        or x.shape != output.shape
+        or cos.shape is None
+        or sin.shape is None
+        or len(cos.shape) != len(sin.shape)
+        or cos.shape != sin.shape
+        or cos.shape[-1] % 2
+        or output.shape[-1] < cos.shape[-1]
+        or output.dtype not in {"torch.float32", "torch.bfloat16"}
+        or not {x.dtype, cos.dtype, sin.dtype, output.dtype} == {output.dtype}
+        or any(stride < 0 for stride in (*x.strides, *cos.strides, *sin.strides, *output.strides))
+    ):
+        return None
+    rank = len(output.shape)
+    rotary_width = cos.shape[-1]
+    half_width = rotary_width // 2
+    if any(
+        cos.shape[index] != output.shape[index]
+        for index in range(len(cos.shape) - 1)
+    ):
+        return None
+
+    output_axes = tuple(f"o{index}" for index in range(rank))
+    final_axis = output_axes[-1]
+    leading_axes = output_axes[:-1]
+    trig_axes = tuple(
+        final_axis if index == len(cos.shape) - 1 else f"o{index}"
+        for index in range(len(cos.shape))
+    )
+    plus_axis = AxisAffine((AxisTerm(final_axis),), offset=half_width)
+    minus_axis = AxisAffine((AxisTerm(final_axis),), offset=-half_width)
+    loads = (
+        IndexedLoad("load:0", x_id, output_axes, x.strides or (), x.dtype or "", x.shape),
+        IndexedLoad("load:1", x_id, (*leading_axes, plus_axis), x.strides or (), x.dtype or "", x.shape),
+        IndexedLoad("load:2", x_id, (*leading_axes, minus_axis), x.strides or (), x.dtype or "", x.shape),
+        IndexedLoad("load:3", cos_id, trig_axes, cos.strides or (), cos.dtype or "", cos.shape),
+        IndexedLoad("load:4", sin_id, trig_axes, sin.strides or (), sin.dtype or "", sin.shape),
+    )
+    dtype = output.dtype or ""
+    compute_dtype = "torch.float32" if dtype in {"torch.bfloat16", "torch.float16"} else dtype
+
+    def source_binary(
+        operator: str, lhs: ScalarExpression, rhs: ScalarExpression
+    ) -> ScalarExpression:
+        if compute_dtype == dtype:
+            return Binary(operator, lhs, rhs, dtype)
+        lhs = Cast(lhs, compute_dtype, "round_nearest_even")
+        rhs = Cast(rhs, compute_dtype, "round_nearest_even")
+        return Cast(
+            Binary(operator, lhs, rhs, compute_dtype),
+            dtype,
+            "round_nearest_even",
+        )
+
+    axis_index = AxisIndex(final_axis, "torch.int64")
+    first = source_binary(
+        "sub",
+        source_binary(
+            "mul", Load("load:0", x.dtype or ""), Load("load:3", cos.dtype or "")
+        ),
+        source_binary(
+            "mul", Load("load:1", x.dtype or ""), Load("load:4", sin.dtype or "")
+        ),
+    )
+    second = source_binary(
+        "add",
+        source_binary(
+            "mul", Load("load:0", x.dtype or ""), Load("load:4", sin.dtype or "")
+        ),
+        source_binary(
+            "mul", Load("load:2", x.dtype or ""), Load("load:3", cos.dtype or "")
+        ),
+    )
+    expression = Where(
+        Binary(
+            "lt",
+            axis_index,
+            Constant(half_width, "torch.int64"),
+            "torch.bool",
+        ),
+        first,
+        Where(
+            Binary(
+                "lt",
+                axis_index,
+                Constant(rotary_width, "torch.int64"),
+                "torch.bool",
+            ),
+            second,
+            Load("load:0", x.dtype or ""),
+            dtype,
+        ),
+        dtype,
+    )
+    fused_program = TensorProgram(
+        family="elementwise",
+        source_target="rope",
+        decomposition="paired half-width rotation with an optional pass-through tail",
+        iteration_domains=tuple(
+            IterationDomain(axis, size) for axis, size in zip(output_axes, output.shape)
+        ),
+        reduction_axes=(),
+        loads=loads,
+        init=None,
+        combine=expression,
+        post=None,
+        accumulator_dtype=None,
+        store=TensorStore(output.id, output.shape, output.dtype or "", output.strides, True),
+        predicates=tuple(
+            AxisPredicate(axis, size) for axis, size in zip(output_axes, output.shape)
+        ),
+    )
+    operation_ids = {operation.id for operation in operations}
+    rejections: list[str] = []
+    if any(_has_illegal_effects(operation) for operation in operations):
+        rejections.append("source effects do not fit a fused RoPE body")
+    if any(
+        any(user not in operation_ids for user in graph.values[operation.results[0]].users)
+        for operation in operations[:-1]
+    ):
+        rejections.append("a RoPE intermediate value has an external use")
+    return RegionCandidate(
+        id=f"region:{concat.id.removeprefix('op:')}:rope",
+        source_op_ids=tuple(operation.id for operation in operations),
+        external_inputs=_external_inputs(tuple(operations), graph),
+        live_outputs=_live_outputs(tuple(operations), graph),
+        tensor_program=fused_program,
+        semantic_facts={
+            "family": "rope",
+            "axis": rank - 1,
+            "width": output.shape[-1],
+            "rotary_width": rotary_width,
+            "rotation": "i <-> i + rotary_width / 2",
+            "pass_through": output.shape[-1] - rotary_width,
+            "source_casts": (),
+        },
+        cost_bytes=sum(
+            _value_bytes(operation.results[0], graph)
+            for operation in operations[:-1]
+            if isinstance(operation.tensor_program, TensorProgram)
+            and operation.tensor_program.store.owns_storage
+        ),
+        rejections=tuple(rejections),
+    )
+
+
+def _producer(value_id: str, graph: ComputeGraph) -> Op | None:
+    operation_id = graph.values[value_id].producer
+    return graph.ops.get(operation_id) if operation_id is not None else None
+
+
+def _sole_user(operation: Op, graph: ComputeGraph) -> Op | None:
+    users = graph.values[operation.results[0]].users
+    if len(users) != 1:
+        return None
+    return graph.ops.get(users[0])
+
+
+def _matches_target(operation: Op, target: str) -> bool:
+    return operation.attributes.get("target") == target
+
+
+def _binary_operator(operation: Op | None, operator: str) -> bool:
+    if operation is None or not isinstance(operation.tensor_program, TensorProgram):
+        return False
+    return (
+        isinstance(operation.tensor_program.combine, Binary)
+        and operation.tensor_program.combine.operator == operator
+    )
+
+
+def _transitive_operations(operation: Op, graph: ComputeGraph) -> tuple[Op, ...]:
+    operation_ids = {operation.id}
+    frontier = list(operation.operands)
+    while frontier:
+        value_id = frontier.pop()
+        producer = _producer(value_id, graph)
+        if producer is None or producer.id in operation_ids:
+            continue
+        operation_ids.add(producer.id)
+        frontier.extend(producer.operands)
+    return tuple(
+        candidate for candidate in graph.ops.values() if candidate.id in operation_ids
+    )
+
+
+def _rope_operations(
+    concat: Op, root_ids: tuple[str, str, str], graph: ComputeGraph
+) -> tuple[Op, ...]:
+    operation_ids = {concat.id}
+    frontier = list(concat.operands)
+    roots = set(root_ids)
+    while frontier:
+        value_id = frontier.pop()
+        if value_id in roots:
+            continue
+        producer = _producer(value_id, graph)
+        if producer is None or producer.id in operation_ids:
+            continue
+        operation_ids.add(producer.id)
+        frontier.extend(producer.operands)
+    return tuple(
+        candidate for candidate in graph.ops.values() if candidate.id in operation_ids
+    )
+
+
+def _view_root(value_id: str, graph: ComputeGraph) -> str | None:
+    while True:
+        producer = _producer(value_id, graph)
+        if producer is None:
+            return value_id
+        if not _matches_target(producer, "aten.slice.Tensor") and not _matches_target(
+            producer, "aten.unsqueeze.default"
+        ):
+            return value_id
+        value_id = producer.operands[0]
 
 
 def _gated_mlp_candidate(graph: ComputeGraph) -> RegionCandidate | None:

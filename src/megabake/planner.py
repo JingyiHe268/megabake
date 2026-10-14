@@ -320,9 +320,41 @@ def _make_tile_map(
         contract = body.layouts.inputs.get(load.value_id)
         if contract is None:
             raise InvalidTileMap(f"{selected.region_id} has no layout for {load.value_id}")
-        if tuple(contract.axes) != tuple(load.axes):
-            raise InvalidTileMap(f"{selected.region_id} input axes do not match {load.value_id}")
-        input_layouts.append((load.value_id, CuTeLayout.from_contract(contract)))
+        conversion = next(
+            (
+                candidate
+                for candidate in conversions
+                if candidate.value_id == load.value_id
+                and candidate.target_region_id == selected.region_id
+            ),
+            None,
+        )
+        if contract.dtype != load.dtype or (
+            conversion is None and tuple(contract.strides) != tuple(load.strides)
+        ):
+            raise InvalidTileMap(f"{selected.region_id} input layout does not match {load.value_id}")
+        base_layout = (
+            conversion.target_layout
+            if conversion is not None
+            else CuTeLayout.from_contract(contract)
+        )
+        if tuple(contract.axes) == tuple(load.axes):
+            layout = base_layout
+        else:
+            domain_sizes = {
+                domain.axis: domain.size for domain in program.iteration_domains
+            }
+            shape = load.source_shape or tuple(
+                1 if isinstance(axis, int) else domain_sizes[axis]
+                for axis in load.axes
+            )
+            layout = CuTeLayout(
+                load.dtype,
+                shape,
+                base_layout.strides,
+                contract.alignment_bytes,
+            )
+        input_layouts.append((load.value_id, layout))
 
     grid = TileGrid(program.store.shape, _output_tile_shape(program, body))
     reduction_size = prod(

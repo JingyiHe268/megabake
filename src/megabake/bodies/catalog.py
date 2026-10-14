@@ -247,8 +247,11 @@ def _layouts(program: Any, alignment_bytes: int | None = None) -> LayoutContract
     domain_sizes = {
         domain.axis: domain.size for domain in program.iteration_domains
     }
-    inputs = {
-        load.value_id: TensorLayout(
+    inputs: dict[str, TensorLayout] = {}
+    for load in program.loads:
+        if load.value_id in inputs:
+            continue
+        inputs[load.value_id] = TensorLayout(
             dtype=load.dtype,
             axes=tuple(load.axes),
             strides=tuple(load.strides),
@@ -262,8 +265,6 @@ def _layouts(program: Any, alignment_bytes: int | None = None) -> LayoutContract
                 )
             ),
         )
-        for load in program.loads
-    }
     store = program.store
     output_axes = tuple(
         domain.axis
