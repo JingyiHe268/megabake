@@ -601,16 +601,18 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Implement in:** `memory.py`, `plan.py`, and `codegen.py`.
 
-- [ ] Derive value lifetimes from phase barriers or explicit release dependencies. Include asynchronous readers.
-- [ ] Reuse workspace slices only for nonoverlapping lifetimes. Adapt Mirage's allocator with these verified intervals.
-- [ ] Verify shared scratch lifetimes separately from global value lifetimes.
-- [ ] Deduplicate body variants across equivalent layers. Bind each layer's weights and state through data.
-- [ ] Use repeated phase loops where they reduce code without changing bindings or computation.
-- [ ] Measure peak workspace, compiled code size, and resource use. Revalidate the worker grid after changes.
+- [x] Derive value lifetimes from phase barriers or explicit release dependencies. Include asynchronous readers.
+- [x] Reuse workspace slices only for nonoverlapping lifetimes. Adapt Mirage's allocator with these verified intervals.
+- [x] Verify shared scratch lifetimes separately from global value lifetimes.
+- [x] Deduplicate body variants across equivalent layers. Bind each layer's weights and state through data.
+- [x] Use repeated phase loops where they reduce code without changing bindings or computation.
+- [x] Measure peak workspace, compiled code size, and resource use. Revalidate the worker grid after changes.
 
 **Output:** storage and generated code that can scale to the complete declared model.
 
 **Check:** poison released storage and compare changing layer inputs. Check concurrent-call isolation and all output lifetimes.
+
+**Evidence:** workspace assignments now carry producer, reader, release, and half-open phase intervals; a Mirage-derived best-fit interval allocator reuses nonoverlapping slices, and plan verification rejects any byte overlap while live. Shared-memory phase lifetimes are verified separately. Runtime allocates one invocation-private workspace backing tensor and creates all reused views from its offsets, so reported peak memory matches actual allocation. Equivalent generic and G0 bodies share definitions, while repeated phases use one runner selected by the runtime phase index with per-phase tensor and state bindings. `CompiledResources` records peak/live workspace, body variants, phase runners, CUBIN size, generated-source size, and occupancy-derived worker limits. CPU unit tests cover interval reuse, overlap rejection, scratch lifetimes, body deduplication, repeated phase/event runners, and emission metadata. SM90 execution, poison, changing-layer, and concurrent-call checks were not run on this GPU-less host.
 
 ## 31. Compile the complete captured model
 

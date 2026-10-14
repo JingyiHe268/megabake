@@ -90,6 +90,9 @@ class LaunchMetadata:
     tensors: tuple[TensorArgument, ...]
     phases: tuple[PhaseEmission, ...]
     launch_policy: str = "megabake_cooperative"
+    body_variant_count: int = 0
+    phase_runner_count: int = 0
+    source_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -223,6 +226,8 @@ def _emit_generic_module(
     g0_definitions: list[str] = []
     conversion_definitions: list[str] = []
     phase_runners: list[str] = []
+    phase_runner_calls: dict[int, list[tuple[int, list[str]]]] = {}
+    phase_runner_symbols: dict[int, str] = {}
     phase_publishers: list[str] = []
     g0_tensor_arguments: list[TensorArgument] = []
     g0_prepared: list[tuple[str, str, str, str, str, str, str]] = []
@@ -309,11 +314,9 @@ def _emit_generic_module(
                 f"            {epilogue},\n"
                 "        )"
             ]
-            phase_runners.append(
-                f"    @cute.jit\n"
-                f"    def _run_phase_{phase.index}():\n"
-                + "\n".join(runner_lines)
-                + "\n"
+            phase_runner_symbols[phase.index] = f"_run_variant_{variant_id}"
+            phase_runner_calls.setdefault(variant_id, []).append(
+                (phase.index, runner_lines)
             )
             phase_records.append(
                 PhaseEmission(
@@ -468,11 +471,9 @@ def _emit_generic_module(
                 f"    def _publish_phase_{phase.index}(epoch: cutlass.Int32):\n"
                 f"        grid_barrier(ready, workers, epoch + {phase.index})\n"
             )
-        phase_runners.append(
-            f"    @cute.jit\n"
-            f"    def _run_phase_{phase.index}():\n"
-            + "\n".join(runner_lines)
-            + "\n"
+        phase_runner_symbols[phase.index] = f"_run_variant_{variant_id}"
+        phase_runner_calls.setdefault(variant_id, []).append(
+            (phase.index, runner_lines)
         )
         phase_records.append(
             PhaseEmission(
@@ -488,6 +489,9 @@ def _emit_generic_module(
                 phase.barrier.id if phase.barrier else None,
             )
         )
+
+    for variant_id, calls in phase_runner_calls.items():
+        phase_runners.append(_phase_runner_source(variant_id, calls))
 
     if event_schedule is not None:
         event_by_region: dict[str, int] = {}
@@ -628,12 +632,12 @@ def megabake_kernel(
         pass
 
     @cute.jit
-    def _run_terminal():
+    def _run_terminal(phase_index: cutlass.Int32):
         pass
 
 {"".join(phase_runners)}
 {"".join(phase_publishers)}
-{_event_worker_loop(plan, event_schedule)}
+{_event_worker_loop(plan, phase_runner_symbols, event_schedule)}
 
 
 @cute.jit
@@ -674,12 +678,35 @@ def launch(
             if event_schedule is not None
             else "megabake_cooperative"
         ),
+        body_variant_count=len(g0_definitions) + len(body_definitions),
+        phase_runner_count=len(phase_runner_calls),
+        source_bytes=len(source.encode("utf-8")),
     )
     return source, launch_metadata, _source_map(source, plan, phase_records)
 
 
+def _phase_runner_source(
+    variant_id: int, calls: list[tuple[int, list[str]]]
+) -> str:
+    lines = [
+        "    @cute.jit",
+        f"    def _run_variant_{variant_id}(phase_index: cutlass.Int32):",
+    ]
+    ordered_calls = sorted(calls)
+    if len(ordered_calls) == 1:
+        lines.extend(ordered_calls[0][1])
+    else:
+        for position, (phase_index, call_lines) in enumerate(ordered_calls):
+            keyword = "if" if position == 0 else "elif"
+            lines.append(f"        {keyword} phase_index == {phase_index}:")
+            lines.extend(f"    {line}" for line in call_lines)
+    return "\n".join(lines) + "\n"
+
+
 def _event_worker_loop(
-    plan: KernelPlan, event_schedule: EventSchedule | None
+    plan: KernelPlan,
+    phase_runner_symbols: Mapping[int, str],
+    event_schedule: EventSchedule | None,
 ) -> str:
     if event_schedule is None:
         return f'''    cooperative_worker_loop(
@@ -687,7 +714,7 @@ def _event_worker_loop(
         workers,
         epoch,
         (
-{("," + chr(10)).join([f"            ({phase.index}, _run_phase_{phase.index}, _no_op, {f'_publish_phase_{phase.index}' if phase.barrier is not None else '_ignore_epoch'})" for phase in plan.phases] + [f"            ({len(plan.phases)}, _run_terminal, _no_op, _ignore_epoch)"])}
+{("," + chr(10)).join([f"            ({phase.index}, {phase_runner_symbols[phase.index]}, _no_op, {f'_publish_phase_{phase.index}' if phase.barrier is not None else '_ignore_epoch'})" for phase in plan.phases] + [f"            ({len(plan.phases)}, _run_terminal, _no_op, _ignore_epoch)"])}
         ),
     )
 '''
@@ -698,8 +725,9 @@ def _event_worker_loop(
     }
     entries = tuple(
         (
+            phase.index,
             f"_wait_phase_{phase.index}" if phase.dependencies else "_ignore_epoch",
-            f"_run_phase_{phase.index}",
+            phase_runner_symbols[phase.index],
             f"_publish_phase_{phase.index}"
             if phase.region_id in event_regions
             else "_no_op",
@@ -711,7 +739,7 @@ def _event_worker_loop(
         workers,
         epoch,
         (
-{("," + chr(10)).join(f"            ({entry[0]}, {entry[1]}, {entry[2]})" for entry in entries)}
+{("," + chr(10)).join(f"            ({entry[0]}, {entry[1]}, {entry[2]}, {entry[3]})" for entry in entries)}
         ),
     )
 '''

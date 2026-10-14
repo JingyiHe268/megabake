@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 
 from .bodies.interface import TargetFacts
@@ -21,6 +21,14 @@ class InvalidStorage(ValueError):
 
 
 @dataclass(frozen=True)
+class StorageLifetime:
+    start_phase: int
+    end_phase: int
+    reader_region_ids: tuple[str, ...]
+    release_kind: str
+
+
+@dataclass(frozen=True)
 class GlobalStorageAssignment:
     storage_id: str
     value_id: str
@@ -30,6 +38,7 @@ class GlobalStorageAssignment:
     required_bytes: int
     alignment_bytes: int
     layout: CuTeLayout
+    lifetime: StorageLifetime
 
 
 @dataclass(frozen=True)
@@ -57,6 +66,7 @@ class WorkerScratchPhase:
     barrier_offsets: Mapping[str, int]
     descriptor_offsets: Mapping[str, int]
     phase_initialization: Mapping[str, int]
+    lifetime: StorageLifetime
 
 
 @dataclass(frozen=True)
@@ -93,9 +103,9 @@ class StoragePlan:
     worker_scratch: tuple[WorkerScratch, ...]
     state: tuple[StateStorageAssignment, ...] = ()
     allocation_provenance: str = (
-        "adapted from Mirage plan_dtensor_memory "
+        "adapted from Mirage plan_stensor_memory "
         "f9eb70c254acefc9f3667b2a973d0dcf25471fce; "
-        "uses CuTe physical extents, body alignment, and explicit assignments"
+        "uses verified half-open phase lifetimes and best-fit interval reuse"
     )
 
     @property
@@ -112,6 +122,24 @@ class StoragePlan:
     @property
     def worker_scratch_alignment_bytes(self) -> int:
         return max((scratch.alignment_bytes for scratch in self.worker_scratch), default=1)
+
+    @property
+    def peak_live_workspace_bytes(self) -> int:
+        phase_count = max(
+            (assignment.lifetime.end_phase for assignment in self.workspace),
+            default=0,
+        )
+        return max(
+            (
+                sum(
+                    assignment.size_bytes
+                    for assignment in self.workspace
+                    if assignment.lifetime.start_phase <= phase < assignment.lifetime.end_phase
+                )
+                for phase in range(phase_count)
+            ),
+            default=0,
+        )
 
 
 @dataclass(frozen=True)
@@ -142,9 +170,8 @@ def assign_storage(plan: PhaseSchedule) -> KernelPlan:
         raise InvalidStorage("phase schedule is missing its dependency plan")
 
     tile_maps = {tile_map.region_id: tile_map for tile_map in _tile_maps(selection)}
-    workspace: list[GlobalStorageAssignment] = []
+    workspace_requests: list[_WorkspaceRequest] = []
     bindings: list[TensorBinding] = []
-    cursor = 0
 
     consumers = _consumers(selection)
     for selected in selection.selections:
@@ -170,14 +197,16 @@ def assign_storage(plan: PhaseSchedule) -> KernelPlan:
                     if candidate_id == value_id
                 )
             )
-            assignment, cursor = _allocate_workspace(
-                value_id,
-                value_id,
-                selected.region_id,
-                (source_layout, *consumer_layouts),
-                cursor,
+            workspace_requests.append(
+                _make_workspace_request(
+                    value_id,
+                    value_id,
+                    selected.region_id,
+                    (source_layout, *consumer_layouts),
+                    consumers.get(value_id, ()),
+                    plan.phases,
+                )
             )
-            workspace.append(assignment)
             region_ids = (selected.region_id, *consumers.get(value_id, ()))
             if conversions:
                 region_ids = (selected.region_id,)
@@ -193,14 +222,16 @@ def assign_storage(plan: PhaseSchedule) -> KernelPlan:
 
             for conversion in conversions:
                 converted_id = f"{value_id}:converted:{conversion.target_region_id}"
-                assignment, cursor = _allocate_workspace(
-                    converted_id,
-                    value_id,
-                    conversion.source_region_id,
-                    (conversion.target_layout,),
-                    cursor,
+                workspace_requests.append(
+                    _make_workspace_request(
+                        converted_id,
+                        value_id,
+                        conversion.source_region_id,
+                        (conversion.target_layout,),
+                        (conversion.target_region_id,),
+                        plan.phases,
+                    )
                 )
-                workspace.append(assignment)
                 bindings.append(
                     TensorBinding(
                         value_id=value_id,
@@ -214,8 +245,23 @@ def assign_storage(plan: PhaseSchedule) -> KernelPlan:
     bindings.extend(_boundary_bindings(selection, tile_maps))
     bindings = _deduplicate_bindings(bindings)
     worker_scratch = _worker_scratch(plan)
+    offsets, workspace_bytes = _allocate_workspace(workspace_requests)
+    workspace = tuple(
+        GlobalStorageAssignment(
+            request.storage_id,
+            request.value_id,
+            request.producer_region_id,
+            offsets[request.storage_id],
+            request.size_bytes,
+            request.required_bytes,
+            request.alignment_bytes,
+            request.layout,
+            request.lifetime,
+        )
+        for request in workspace_requests
+    )
     storage = StoragePlan(
-        tuple(workspace),
+        workspace,
         tuple(bindings),
         worker_scratch,
         _state_assignments(selection),
@@ -279,17 +325,40 @@ def verify_plan(plan: KernelPlan) -> None:
         if binding.boundary and binding.storage_id in workspace_ids:
             raise InvalidStorage(f"boundary binding {binding.value_id} uses workspace storage")
 
-    cursor = 0
-    for assignment in sorted(plan.storage.workspace, key=lambda item: item.offset_bytes):
-        if assignment.offset_bytes < cursor:
-            raise InvalidStorage(f"workspace slice {assignment.storage_id} overlaps another slice")
+    phase_by_region = {phase.region_id: phase for phase in plan.phases}
+    for assignment in plan.storage.workspace:
         if assignment.offset_bytes % assignment.alignment_bytes:
             raise InvalidStorage(f"workspace slice {assignment.storage_id} is misaligned")
         if assignment.size_bytes < assignment.required_bytes:
             raise InvalidStorage(f"workspace slice {assignment.storage_id} is undersized")
         if assignment.offset_bytes + assignment.size_bytes > plan.storage.workspace_bytes:
             raise InvalidStorage(f"workspace slice {assignment.storage_id} exceeds workspace")
-        cursor = assignment.offset_bytes + assignment.size_bytes
+
+        lifetime = assignment.lifetime
+        if lifetime.start_phase < 0 or lifetime.end_phase > len(plan.phases):
+            raise InvalidStorage(f"workspace slice {assignment.storage_id} has an invalid lifetime")
+        if lifetime.start_phase >= lifetime.end_phase:
+            raise InvalidStorage(f"workspace slice {assignment.storage_id} has an empty lifetime")
+        producer = phase_by_region.get(assignment.producer_region_id)
+        if producer is None or producer.index != lifetime.start_phase:
+            raise InvalidStorage(f"workspace slice {assignment.storage_id} has an invalid producer")
+        for region_id in lifetime.reader_region_ids:
+            reader = phase_by_region.get(region_id)
+            if reader is None or not lifetime.start_phase <= reader.index < lifetime.end_phase:
+                raise InvalidStorage(f"workspace slice {assignment.storage_id} has an invalid reader")
+
+    for index, left in enumerate(plan.storage.workspace):
+        for right in plan.storage.workspace[index + 1 :]:
+            lifetime_overlap = (
+                left.lifetime.start_phase < right.lifetime.end_phase
+                and right.lifetime.start_phase < left.lifetime.end_phase
+            )
+            byte_overlap = (
+                left.offset_bytes < right.offset_bytes + right.size_bytes
+                and right.offset_bytes < left.offset_bytes + left.size_bytes
+            )
+            if lifetime_overlap and byte_overlap:
+                raise InvalidStorage(f"workspace slice {left.storage_id} overlaps {right.storage_id}")
 
     _verify_worker_scratch(plan)
     _verify_launch(plan)
@@ -339,32 +408,111 @@ def _aliases_boundary(
     )
 
 
-def _allocate_workspace(
+@dataclass(frozen=True)
+class _WorkspaceRequest:
+    storage_id: str
+    value_id: str
+    producer_region_id: str
+    size_bytes: int
+    required_bytes: int
+    alignment_bytes: int
+    layout: CuTeLayout
+    lifetime: StorageLifetime
+
+
+def _make_workspace_request(
     storage_id: str,
     value_id: str,
     producer_region_id: str,
     layouts: tuple[CuTeLayout, ...],
-    cursor: int,
-) -> tuple[GlobalStorageAssignment, int]:
+    reader_region_ids: tuple[str, ...],
+    phases: tuple[ScheduledPhase, ...],
+) -> _WorkspaceRequest:
     if not layouts:
         raise InvalidStorage(f"workspace value {value_id} has no layout")
     required_bytes = max(_layout_size_bytes(layout) for layout in layouts)
     alignment_bytes = max(128, *(layout.alignment_bytes for layout in layouts))
-    offset = _round_up(cursor, alignment_bytes)
     size = _round_up(required_bytes, 128)
-    return (
-        GlobalStorageAssignment(
-            storage_id=storage_id,
-            value_id=value_id,
-            producer_region_id=producer_region_id,
-            offset_bytes=offset,
-            size_bytes=size,
-            required_bytes=required_bytes,
-            alignment_bytes=alignment_bytes,
-            layout=layouts[0],
-        ),
-        _round_up(offset + size, 128),
+    phase_by_region = {phase.region_id: phase for phase in phases}
+    producer = phase_by_region.get(producer_region_id)
+    if producer is None:
+        raise InvalidStorage(f"workspace value {value_id} has no producer phase")
+    readers = tuple(
+        sorted(
+            (phase_by_region[region_id] for region_id in reader_region_ids),
+            key=lambda phase: phase.index,
+        )
     )
+    end_phase = producer.index + 1
+    for reader in readers:
+        end_phase = max(end_phase, reader.index + 1)
+    release_phase = readers[-1] if readers else producer
+    return _WorkspaceRequest(
+        storage_id,
+        value_id,
+        producer_region_id,
+        size,
+        required_bytes,
+        alignment_bytes,
+        layouts[0],
+        StorageLifetime(
+            producer.index,
+            end_phase,
+            tuple(dict.fromkeys(reader_region_ids)),
+            "phase_barrier" if release_phase.barrier is not None else "body_completion",
+        ),
+    )
+
+
+def _allocate_workspace(
+    requests: Sequence[_WorkspaceRequest],
+) -> tuple[Mapping[str, int], int]:
+    events: list[tuple[int, int, str]] = []
+    for request in requests:
+        events.extend(
+            (
+                (request.lifetime.start_phase, 1, request.storage_id),
+                (request.lifetime.end_phase, 0, request.storage_id),
+            )
+        )
+    events.sort()
+
+    request_by_id = {request.storage_id: request for request in requests}
+    offsets: dict[str, int] = {}
+    free_ranges: list[tuple[int, int]] = []
+    peak = 0
+    for _, event_kind, storage_id in events:
+        request = request_by_id[storage_id]
+        if event_kind == 0:
+            free_ranges.append((offsets[storage_id], offsets[storage_id] + request.size_bytes))
+            free_ranges.sort()
+            merged: list[tuple[int, int]] = []
+            for start, end in free_ranges:
+                if merged and start <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+                else:
+                    merged.append((start, end))
+            free_ranges = merged
+            continue
+
+        candidates = []
+        for range_index, (start, end) in enumerate(free_ranges):
+            offset = _round_up(start, request.alignment_bytes)
+            if offset + request.size_bytes <= end:
+                candidates.append((end - offset - request.size_bytes, offset, range_index))
+        if candidates:
+            _, offset, range_index = min(candidates)
+            start, end = free_ranges.pop(range_index)
+            if start < offset:
+                free_ranges.append((start, offset))
+            if offset + request.size_bytes < end:
+                free_ranges.append((offset + request.size_bytes, end))
+            free_ranges.sort()
+        else:
+            offset = _round_up(peak, request.alignment_bytes)
+            peak = offset + request.size_bytes
+        offsets[storage_id] = offset
+    return offsets, _round_up(peak, 128)
 
 
 def _boundary_bindings(
@@ -607,6 +755,12 @@ def _scratch_phase(phase: ScheduledPhase) -> WorkerScratchPhase:
         barrier_offsets=barrier_offsets,
         descriptor_offsets=descriptor_offsets,
         phase_initialization={barrier_name: 0 for barrier_name in body.pipeline.barriers},
+        lifetime=StorageLifetime(
+            phase.index,
+            phase.index + 1,
+            (),
+            "phase_barrier" if phase.barrier is not None else "body_completion",
+        ),
     )
 
 
@@ -658,6 +812,14 @@ def _verify_worker_scratch(plan: KernelPlan) -> None:
                 raise InvalidStorage(f"{phase.region_id} scratch barrier assignment is incompatible")
             if tuple(phase_layout.descriptor_offsets) != tuple(phase.body.pipeline.descriptors):
                 raise InvalidStorage(f"{phase.region_id} scratch descriptor assignment is incompatible")
+            lifetime = phase_layout.lifetime
+            if (
+                lifetime.start_phase != phase.index
+                or lifetime.end_phase != phase.index + 1
+                or lifetime.reader_region_ids
+                or lifetime.release_kind not in {"phase_barrier", "body_completion"}
+            ):
+                raise InvalidStorage(f"{phase.region_id} scratch lifetime is invalid")
         if target is not None and worker.size_bytes > target.max_shared_memory_per_cta:
             raise InvalidStorage(f"worker {worker.worker_id} scratch exceeds shared-memory capacity")
 

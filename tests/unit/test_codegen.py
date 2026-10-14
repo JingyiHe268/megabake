@@ -14,6 +14,7 @@ from megabake import (
     make_phase_schedule,
     select_bodies,
 )
+from megabake.schedule import make_region_event_schedule
 from megabake.plan import ConversionBody, CuTeLayout
 from megabake.bodies import SelectionPolicy, TargetFacts
 from megabake.frontend import prepare_fx_graph
@@ -62,6 +63,9 @@ def test_emit_cute_deduplicates_equivalent_bodies_and_saves_diagnostics(tmp_path
     assert generated.source.count("def _body_0(") == 1
     assert generated.source.count("def _body_1(") == 1
     assert generated.source.count("_body_0(") == 3
+    assert generated.source.count("def _run_variant_0(") == 1
+    assert "if phase_index == 0:" in generated.source
+    assert "elif phase_index == 1:" in generated.source
     assert generated.source.count("grid_barrier(ready, workers, epoch +") == 2
     assert "cooperative_worker_loop(" in generated.source
     assert generated.source_path.exists()
@@ -72,6 +76,9 @@ def test_emit_cute_deduplicates_equivalent_bodies_and_saves_diagnostics(tmp_path
     assert {"device_body", "phase_barrier", "enclosing_kernel", "host_launch_wrapper"} <= kinds
     assert all(generated.launch.work_iterators)
     assert all(iterator.dtype == "torch.int64" for iterator in generated.launch.work_iterators)
+    assert generated.launch.body_variant_count == 2
+    assert generated.launch.phase_runner_count == 2
+    assert generated.launch.source_bytes == len(generated.source.encode())
 
     source_lines = generated.source.splitlines()
     for symbol, expected in (
@@ -86,6 +93,26 @@ def test_emit_cute_deduplicates_equivalent_bodies_and_saves_diagnostics(tmp_path
             source_lines[entry.line_start - 1 : entry.line_end]
         )
         assert expected in mapped_source
+
+
+def test_emit_cute_reuses_phase_runners_with_event_scheduling(tmp_path):
+    class Model(torch.nn.Module):
+        def forward(self, left, right):
+            return left.sum(dim=-1) + right.sum(dim=-1)
+
+    plan = _plan(Model(), torch.randn(5, 70), torch.randn(5, 70))
+    event_schedule = make_region_event_schedule(
+        plan.selection,
+        plan.dependencies,
+        worker_count=plan.launch.grid_size,
+    )
+
+    generated = emit_cute(plan, tmp_path, event_schedule=event_schedule)
+
+    ast.parse(generated.source)
+    assert "cooperative_event_worker_loop(" in generated.source
+    assert generated.source.count("def _run_variant_0(") == 1
+    assert "(0, _ignore_epoch, _run_variant_0, _publish_phase_0)" in generated.source
 
 
 def test_emit_cute_puts_g0_inside_one_cooperative_kernel(tmp_path):

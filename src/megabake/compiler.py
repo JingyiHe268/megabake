@@ -155,6 +155,12 @@ class CompiledResources:
     dynamic_shared_memory_bytes: int
     active_blocks_per_sm: int
     max_cooperative_workers: int
+    workspace_bytes: int
+    peak_live_workspace_bytes: int
+    body_variant_count: int
+    phase_runner_count: int
+    compiled_code_bytes: int
+    generated_code_bytes: int
 
 
 @dataclass(frozen=True)
@@ -539,6 +545,8 @@ def compile_plan(
             compiled = cute.compile(module.launch, *state.compile_arguments)
             resources = _query_resources(
                 compiled,
+                current_plan,
+                generated,
                 current_plan.launch.threads_per_block,
                 generated.launch.shared_memory_bytes,
             )
@@ -843,6 +851,7 @@ def bind_callable(
     forward.megabake_compiled = compiled_kernel
     forward.megabake_trace = trace
     forward.megabake_context = context
+    forward.megabake_runtime_state = state
     return forward
 
 
@@ -1299,7 +1308,11 @@ def _load_generated_module(generated: GeneratedCuTeModule) -> Any:
 
 
 def _query_resources(
-    compiled: Any, threads: int, dynamic_shared_bytes: int
+    compiled: Any,
+    plan: KernelPlan,
+    generated: GeneratedCuTeModule,
+    threads: int,
+    dynamic_shared_bytes: int,
 ) -> CompiledResources:
     kernel_names = tuple(compiled.kernel_info)
     if len(kernel_names) != 1:
@@ -1368,7 +1381,25 @@ def _query_resources(
         dynamic_shared_bytes,
         int(active_blocks),
         int(active_blocks) * properties.multi_processor_count,
+        plan.storage.workspace_bytes,
+        plan.storage.peak_live_workspace_bytes,
+        generated.launch.body_variant_count,
+        generated.launch.phase_runner_count,
+        _compiled_code_bytes(compiled),
+        generated.launch.source_bytes,
     )
+
+
+def _compiled_code_bytes(compiled: Any) -> int:
+    cubin = getattr(compiled, "__cubin__", None)
+    if isinstance(cubin, bytes):
+        return len(cubin)
+    if cubin is None:
+        return 0
+    cubin_path = Path(str(cubin))
+    if cubin_path.is_file():
+        return cubin_path.stat().st_size
+    return len(str(cubin).encode("utf-8"))
 
 
 def _with_worker_count(
@@ -1430,6 +1461,7 @@ class _RuntimeState:
         outputs: Mapping[str, torch.Tensor],
         values: Mapping[str, torch.Tensor],
         g0_tensors: tuple[tuple[torch.Tensor, ...], ...],
+        workspace_base: torch.Tensor,
     ):
         self.plan = plan
         self.generated = generated
@@ -1437,6 +1469,7 @@ class _RuntimeState:
         self.ready = ready
         self.work_iterators = work_iterators
         self.workspace = workspace
+        self.workspace_base = workspace_base
         self.outputs = outputs
         self.values = values
         self.g0_tensors = g0_tensors
@@ -1488,11 +1521,13 @@ class _RuntimeState:
                 )
                 for iterator in generated.launch.work_iterators
             }
-        workspace: dict[str, torch.Tensor] = {}
-        for assignment in plan.storage.workspace:
-            if assignment.storage_id in workspace:
-                continue
-            workspace[assignment.storage_id] = _allocate(assignment.layout, device)
+        workspace_base = torch.empty(
+            plan.storage.workspace_bytes, dtype=torch.uint8, device=device
+        )
+        workspace: dict[str, torch.Tensor] = {
+            assignment.storage_id: _workspace_view(workspace_base, assignment)
+            for assignment in plan.storage.workspace
+        }
         state = cls(
             plan,
             generated,
@@ -1504,6 +1539,7 @@ class _RuntimeState:
             {},
             {},
             (),
+            workspace_base,
         )
         state._refresh_values(input_tensors)
         return state
@@ -1513,6 +1549,9 @@ class _RuntimeState:
 
     def reset_ready(self) -> None:
         self.ready.fill_(-1)
+
+    def poison_workspace(self, value: int = 0xE5) -> None:
+        self.workspace_base.fill_(value)
 
     def _refresh_values(self, input_tensors: Mapping[str, torch.Tensor]) -> None:
         plan = self.plan
@@ -1708,6 +1747,23 @@ def _validate_state_capacities(
                     requirement="bounded KV state",
                 )
             )
+
+
+def _workspace_view(base: torch.Tensor, assignment: Any) -> torch.Tensor:
+    dtype = getattr(torch, assignment.layout.dtype.removeprefix("torch."))
+    element_size = dtype.itemsize
+    if assignment.required_bytes % element_size:
+        raise CompilerError(
+            CompilerDiagnostic(
+                "workspace-binding",
+                f"workspace slice {assignment.storage_id} is not element-aligned",
+                requirement="dtype-aligned workspace slice",
+            )
+        )
+    storage = base.narrow(
+        0, assignment.offset_bytes, assignment.required_bytes
+    ).view(dtype)
+    return storage.as_strided(assignment.layout.shape, assignment.layout.strides)
 
 
 def _allocate(layout: Any, device: torch.device) -> torch.Tensor:

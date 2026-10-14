@@ -75,7 +75,7 @@ def cooperative_worker_loop(
     phases: cutlass.Constexpr,
 ):
     for phase_index, run_phase, drain, publish in phases:
-        run_phase()
+        run_phase(phase_index)
         drain()
         publish(epoch_base)
 
@@ -87,9 +87,9 @@ def cooperative_event_worker_loop(
     epoch: cutlass.Int32,
     phases: cutlass.Constexpr,
 ):
-    for wait, run, publish in phases:
+    for phase_index, wait, run, publish in phases:
         wait(epoch)
-        run()
+        run(phase_index)
         publish()
 
 

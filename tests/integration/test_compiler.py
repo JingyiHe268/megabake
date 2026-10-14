@@ -57,6 +57,14 @@ def test_task_15_compiles_binds_and_reexecutes_through_torch_compile(tmp_path):
     assert compiled.resources.local_memory_bytes_per_thread == 0
     assert compiled.resources.active_blocks_per_sm >= 1
     assert compiled.resources.max_cooperative_workers >= compiled.plan.launch.grid_size
+    assert compiled.resources.workspace_bytes == compiled.plan.storage.workspace_bytes
+    assert (
+        compiled.resources.peak_live_workspace_bytes
+        == compiled.plan.storage.peak_live_workspace_bytes
+    )
+    assert compiled.resources.body_variant_count > 0
+    assert compiled.resources.compiled_code_bytes > 0
+    assert compiled.resources.generated_code_bytes > 0
     assert compiled.generated.source_path.exists()
     assert compiled.generated.source_map_path.exists()
     assert len(backend.megabake_last_trace) == 3

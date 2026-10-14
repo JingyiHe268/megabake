@@ -53,7 +53,7 @@ def _phase_kernel(
     _, _, block = cute.arch.block_idx()
 
     @cute.jit
-    def produce():
+    def produce(phase_index: cutlass.Int32):
         active = cutlass.Int32(block != workers - 1)
         total = cutlass.Float32(0.0)
         for index in cutlass.range(active * 100_000):
@@ -61,7 +61,7 @@ def _phase_kernel(
         produced[block] = total
 
     @cute.jit
-    def consume():
+    def consume(phase_index: cutlass.Int32):
         total = cutlass.Float32(0.0)
         for worker in cutlass.range(workers - 1):
             total = total + produced[worker]

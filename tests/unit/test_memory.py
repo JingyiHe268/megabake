@@ -17,6 +17,8 @@ from megabake.frontend import prepare_fx_graph
 from megabake.graph import import_fx
 from megabake.lowering import canonicalize_semantics
 from megabake.memory import InvalidStorage
+from megabake.memory import _allocate_workspace, _make_workspace_request
+from megabake.compiler import _workspace_view
 from megabake.regions import form_regions
 
 
@@ -116,6 +118,87 @@ def test_assign_storage_adds_worker_barriers_and_descriptors_for_gemm():
     assert gemm_scratch.body_data_offset_bytes == 512
     assert plan.launch.threads_per_block == 256
     assert plan.launch.dynamic_shared_memory_bytes == plan.storage.worker_scratch_bytes
+
+
+def test_workspace_allocator_reuses_nonoverlapping_lifetimes():
+    class Model(torch.nn.Module):
+        def forward(self, value):
+            left = torch.relu(value)
+            right = torch.neg(value)
+            return left + right, left * right
+
+    plan = _kernel_plan(Model(), torch.randn(2, 3))
+    layout = plan.storage.workspace[0].layout
+    first, second, third, fourth = plan.phases
+    requests = (
+        _make_workspace_request(
+            "first", "first", first.region_id, (layout,), (second.region_id,), plan.phases
+        ),
+        _make_workspace_request(
+            "second",
+            "second",
+            third.region_id,
+            (layout,),
+            (fourth.region_id,),
+            plan.phases,
+        ),
+    )
+
+    offsets, workspace_bytes = _allocate_workspace(requests)
+
+    assert offsets == {"first": 0, "second": 0}
+    assert workspace_bytes == 128
+    assert requests[0].lifetime.end_phase <= requests[1].lifetime.start_phase
+
+
+def test_runtime_workspace_views_share_reused_backing_storage():
+    class Model(torch.nn.Module):
+        def forward(self, value):
+            left = torch.relu(value)
+            right = torch.neg(value)
+            return left + right, left * right
+
+    plan = _kernel_plan(Model(), torch.randn(2, 3))
+    first, second = plan.storage.workspace
+    reused = replace(second, offset_bytes=first.offset_bytes)
+    base = torch.empty(plan.storage.workspace_bytes, dtype=torch.uint8)
+
+    first_view = _workspace_view(base, first)
+    second_view = _workspace_view(base, reused)
+    base.fill_(0xE5)
+    first_view.fill_(7.0)
+
+    assert torch.equal(first_view, second_view)
+
+
+def test_verify_plan_separates_workspace_and_scratch_lifetimes():
+    class Model(torch.nn.Module):
+        def forward(self, value):
+            left = torch.relu(value)
+            right = torch.neg(value)
+            return left + right, left * right
+
+    plan = _kernel_plan(Model(), torch.randn(2, 3))
+    first, second = plan.storage.workspace
+    reused = replace(
+        second,
+        offset_bytes=first.offset_bytes,
+        lifetime=replace(first.lifetime, start_phase=1),
+    )
+    broken = replace(
+        plan,
+        storage=replace(plan.storage, workspace=(first, reused)),
+    )
+    with pytest.raises(InvalidStorage, match="overlaps"):
+        verify_plan(broken)
+
+    assert plan.storage.worker_scratch
+    assert all(
+        phase.lifetime.start_phase == phase.phase_index
+        and phase.lifetime.end_phase == phase.phase_index + 1
+        for worker in plan.storage.worker_scratch
+        for phase in worker.phases
+    )
 
 
 def test_verify_plan_rejects_missing_output_undersized_and_overlapping_storage():

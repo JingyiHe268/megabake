@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import torch
@@ -43,6 +44,9 @@ def _assert_block_plan(backend):
     assert any(phase.barrier is not None for phase in compiled.plan.phases)
     assert compiled.resources.active_blocks_per_sm >= 1
     assert compiled.resources.max_cooperative_workers >= compiled.plan.launch.grid_size
+    assert compiled.resources.workspace_bytes == compiled.plan.storage.workspace_bytes
+    assert compiled.resources.compiled_code_bytes > 0
+    assert compiled.resources.body_variant_count < len(compiled.plan.phases)
 
 
 def _assert_one_kernel(function):
@@ -106,8 +110,23 @@ def test_task29_compiles_complete_prefill_block(tmp_path):
         expected = model(*inputs)
         second_actual = optimized(*second_inputs)
         second_expected = model(*second_inputs)
+        optimized.megabake_runtime_state.poison_workspace()
+        poisoned_actual = optimized(*inputs)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            concurrent_results = list(
+                executor.map(
+                    lambda item: item[0](*item[1]),
+                    ((optimized, inputs), (optimized, second_inputs)),
+                )
+            )
 
-    for result, reference in ((actual, expected), (second_actual, second_expected)):
+    for result, reference in (
+        (actual, expected),
+        (second_actual, second_expected),
+        (poisoned_actual, expected),
+        (concurrent_results[0], expected),
+        (concurrent_results[1], second_expected),
+    ):
         assert all(
             (result_value.float() - reference_value.float()).norm().item()
             / reference_value.float().norm().item()

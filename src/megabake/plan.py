@@ -409,6 +409,12 @@ def _resource_report(resources: Any) -> Any:
             "local_memory_bytes_per_thread",
             "active_blocks_per_sm",
             "max_cooperative_workers",
+            "workspace_bytes",
+            "peak_live_workspace_bytes",
+            "body_variant_count",
+            "phase_runner_count",
+            "compiled_code_bytes",
+            "generated_code_bytes",
         )
         if hasattr(resources, name)
     }
