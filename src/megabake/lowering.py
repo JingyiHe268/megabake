@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import operator
+import copy
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -24,12 +25,32 @@ class AxisPredicate:
 
 
 @dataclass(frozen=True)
+class AxisTerm:
+    axis: str
+    scale: int = 1
+    divisor: int = 1
+    modulus: int = 0
+
+
+@dataclass(frozen=True)
+class AxisAffine:
+    terms: tuple[AxisTerm, ...]
+    offset: int = 0
+
+
+@dataclass(frozen=True)
+class DataIndex:
+    load_id: str
+
+
+@dataclass(frozen=True)
 class IndexedLoad:
     id: str
     value_id: str
-    axes: tuple[str | int, ...]
+    axes: tuple[str | int | AxisAffine | DataIndex, ...]
     strides: tuple[int, ...]
     dtype: str
+    source_shape: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -108,6 +129,8 @@ ScalarExpression = (
     | Cast
 )
 
+AxisExpression = str | int | AxisAffine | DataIndex
+
 
 @dataclass(frozen=True)
 class TensorProgram:
@@ -168,7 +191,7 @@ def _predicates(domains: Sequence[IterationDomain]) -> tuple[AxisPredicate, ...]
     return tuple(AxisPredicate(domain.axis, domain.size) for domain in domains)
 
 
-def _load(value: Value, axes: Sequence[str | int], index: int) -> IndexedLoad:
+def _load(value: Value, axes: Sequence[AxisExpression], index: int) -> IndexedLoad:
     if value.strides is None:
         raise UnsupportedLowering(f"value {value.id} lacks strides")
     return IndexedLoad(
@@ -177,7 +200,36 @@ def _load(value: Value, axes: Sequence[str | int], index: int) -> IndexedLoad:
         axes=tuple(axes),
         strides=value.strides,
         dtype=value.dtype or "",
+        source_shape=value.shape,
     )
+
+
+def _affine(*terms: AxisTerm, offset: int = 0) -> AxisAffine:
+    return AxisAffine(terms, offset)
+
+
+def axis_references(axis: AxisExpression) -> tuple[str, ...]:
+    if isinstance(axis, str):
+        return (axis,)
+    if isinstance(axis, int):
+        return ()
+    if isinstance(axis, DataIndex):
+        return ()
+    return tuple(dict.fromkeys(term.axis for term in axis.terms))
+
+
+def axis_coordinate(axis: AxisExpression, coordinates: Mapping[str, int]) -> int:
+    if isinstance(axis, str):
+        return coordinates[axis]
+    if isinstance(axis, int):
+        return axis
+    value = axis.offset
+    for term in axis.terms:
+        coordinate = coordinates[term.axis] // term.divisor
+        if term.modulus:
+            coordinate %= term.modulus
+        value += coordinate * term.scale
+    return value
 
 
 def _broadcast_axes(value: Value, output_shape: Sequence[int]) -> tuple[str | int, ...]:
@@ -954,8 +1006,301 @@ def _reduction_program(
     )
 
 
+def _int_tuple(value: Any, name: str, length: int) -> tuple[int, ...]:
+    if not isinstance(value, Sequence) or len(value) != length:
+        raise UnsupportedLowering(f"{name} must have {length} values")
+    values = tuple(value)
+    if any(not isinstance(item, int) or item <= 0 for item in values):
+        raise UnsupportedLowering(f"{name} values must be positive integers")
+    return values
+
+
+def _convolution_program(
+    node: torch.fx.Node, op: Op, graph: ComputeGraph
+) -> TensorProgram:
+    if len(node.args) != 9:
+        raise UnsupportedLowering("convolution must have nine arguments")
+    input_value = _node_value(node.args[0], graph)
+    weight_value = _node_value(node.args[1], graph)
+    bias_node = node.args[2]
+    stride = _int_tuple(node.args[3], "convolution stride", 2)
+    padding = _int_tuple(node.args[4], "convolution padding", 2)
+    dilation = _int_tuple(node.args[5], "convolution dilation", 2)
+    if node.args[6] or any(value for value in node.args[7]):
+        raise UnsupportedLowering("transposed convolution is not supported")
+    groups = node.args[8]
+    if not isinstance(groups, int) or groups <= 0:
+        raise UnsupportedLowering("convolution groups must be a positive integer")
+
+    result = _result_value(op, graph)
+    if (
+        input_value.shape is None
+        or weight_value.shape is None
+        or len(input_value.shape) != 4
+        or len(weight_value.shape) != 4
+    ):
+        raise UnsupportedLowering("only static 2-D convolution is supported")
+    batch, input_channels, input_height, input_width = input_value.shape
+    output_channels, channels_per_group, kernel_height, kernel_width = weight_value.shape
+    if input_channels != channels_per_group * groups or output_channels % groups:
+        raise UnsupportedLowering("convolution groups do not match its operands")
+    output_shape = (
+        batch,
+        output_channels,
+        (input_height + 2 * padding[0] - dilation[0] * (kernel_height - 1) - 1)
+        // stride[0]
+        + 1,
+        (input_width + 2 * padding[1] - dilation[1] * (kernel_width - 1) - 1)
+        // stride[1]
+        + 1,
+    )
+    if result.shape != output_shape:
+        raise UnsupportedLowering("convolution result shape does not match its operands")
+
+    kernel_extent = kernel_height * kernel_width
+    channels_per_output_group = output_channels // groups
+    input_load = _load(
+        input_value,
+        (
+            AxisAffine((AxisTerm("o0"),)),
+            _affine(
+                AxisTerm("o1", scale=channels_per_group, divisor=channels_per_output_group),
+                AxisTerm("r0", divisor=kernel_extent),
+            ),
+            _affine(
+                AxisTerm("o2", scale=stride[0]),
+                AxisTerm(
+                    "r0", scale=dilation[0], divisor=kernel_width, modulus=kernel_height
+                ),
+                offset=-padding[0],
+            ),
+            _affine(
+                AxisTerm("o3", scale=stride[1]),
+                AxisTerm("r0", scale=dilation[1], modulus=kernel_width),
+                offset=-padding[1],
+            ),
+        ),
+        0,
+    )
+    weight_load = _load(
+        weight_value,
+        (
+            "o1",
+            _affine(AxisTerm("r0", divisor=kernel_extent)),
+            _affine(
+                AxisTerm("r0", divisor=kernel_width, modulus=kernel_height)
+            ),
+            _affine(AxisTerm("r0", modulus=kernel_width)),
+        ),
+        1,
+    )
+    loads = [input_load, weight_load]
+    bias_load: IndexedLoad | None = None
+    if bias_node is not None:
+        bias_value = _node_value(bias_node, graph)
+        if bias_value.shape != (output_channels,):
+            raise UnsupportedLowering("convolution bias shape does not match its output channels")
+        bias_load = _load(bias_value, ("o1",), 2)
+        loads.append(bias_load)
+
+    accumulator_dtype = _accumulator_dtype(
+        result.dtype or "",
+        [input_value.dtype or "", weight_value.dtype or ""],
+    )
+    product = Binary(
+        "mul",
+        _cast_load(Load(input_load.id, input_load.dtype), accumulator_dtype),
+        _cast_load(Load(weight_load.id, weight_load.dtype), accumulator_dtype),
+        accumulator_dtype,
+    )
+    combine = Binary(
+        "add", Accumulator(accumulator_dtype), product, accumulator_dtype
+    )
+    post = _contraction_post(
+        accumulator_dtype,
+        result.dtype or "",
+        bias_load,
+    )
+    output_domains = _domains("o", result.shape)
+    reduction_domains = (
+        IterationDomain("r0", channels_per_group * kernel_extent),
+    )
+    return TensorProgram(
+        family="contraction",
+        source_target=str(node.target),
+        decomposition=(
+            "indexed multiply-accumulate with padding, stride, dilation, and groups"
+        ),
+        iteration_domains=(*output_domains, *reduction_domains),
+        reduction_axes=("r0",),
+        loads=tuple(loads),
+        init=_zero(accumulator_dtype),
+        combine=combine,
+        post=post,
+        accumulator_dtype=accumulator_dtype,
+        store=TensorStore(
+            result.id, result.shape, result.dtype or "", result.strides, True
+        ),
+        predicates=_predicates((*output_domains, *reduction_domains)),
+    )
+
+
+def _conv2d_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorProgram:
+    if not 3 <= len(node.args) <= 8:
+        raise UnsupportedLowering("conv2d must have three to eight arguments")
+    args = list(node.args)
+    args.extend([None] * (8 - len(args)))
+    input_node, weight_node, bias_node, stride, padding, dilation, _, groups = args
+    convolution_node = copy.copy(node)
+    convolution_node.target = torch.ops.aten.convolution.default
+    convolution_node.args = (
+        input_node,
+        weight_node,
+        bias_node,
+        stride or (1, 1),
+        padding or (0, 0),
+        dilation or (1, 1),
+        False,
+        (0, 0),
+        groups or 1,
+    )
+    return _convolution_program(convolution_node, op, graph)
+
+
+def _avg_pool2d_program(
+    node: torch.fx.Node, op: Op, graph: ComputeGraph
+) -> TensorProgram:
+    if not 2 <= len(node.args) <= 7:
+        raise UnsupportedLowering("avg_pool2d must have two to seven arguments")
+    args = list(node.args)
+    args.extend([None] * (7 - len(args)))
+    _, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override = args[:7]
+    ceil_mode = bool(ceil_mode)
+    count_include_pad = True if count_include_pad is None else bool(count_include_pad)
+    if ceil_mode or not count_include_pad or divisor_override is not None:
+        raise UnsupportedLowering(
+            "only count_include_pad avg_pool2d without ceil mode is supported"
+        )
+    kernel = _int_tuple(kernel_size, "avg_pool2d kernel", 2)
+    pool_stride = _int_tuple(stride or kernel_size, "avg_pool2d stride", 2)
+    pool_padding = _int_tuple(padding or (0, 0), "avg_pool2d padding", 2)
+    source = _node_value(node.args[0], graph)
+    result = _result_value(op, graph)
+    if source.shape is None or len(source.shape) != 4:
+        raise UnsupportedLowering("avg_pool2d requires a static 4-D input")
+    batch, channels, input_height, input_width = source.shape
+    output_shape = (
+        batch,
+        channels,
+        (input_height + 2 * pool_padding[0] - kernel[0]) // pool_stride[0] + 1,
+        (input_width + 2 * pool_padding[1] - kernel[1]) // pool_stride[1] + 1,
+    )
+    if result.shape != output_shape:
+        raise UnsupportedLowering("avg_pool2d result shape does not match its input")
+
+    kernel_extent = kernel[0] * kernel[1]
+    load = _load(
+        source,
+        (
+            "o0",
+            "o1",
+            _affine(
+                AxisTerm("o2", scale=pool_stride[0]),
+                AxisTerm("r0", divisor=kernel[1], modulus=kernel[0]),
+                offset=-pool_padding[0],
+            ),
+            _affine(
+                AxisTerm("o3", scale=pool_stride[1]),
+                AxisTerm("r0", modulus=kernel[1]),
+                offset=-pool_padding[1],
+            ),
+        ),
+        0,
+    )
+    accumulator_dtype = _accumulator_dtype(result.dtype or "", [source.dtype or ""])
+    combine = Binary(
+        "add",
+        Accumulator(accumulator_dtype),
+        _cast_load(Load(load.id, load.dtype), accumulator_dtype),
+        accumulator_dtype,
+    )
+    post = Cast(
+        Binary(
+            "div",
+            Accumulator(accumulator_dtype),
+            _constant(kernel_extent),
+            accumulator_dtype,
+        ),
+        result.dtype or "",
+        _cast_rounding(accumulator_dtype, result.dtype or ""),
+    )
+    output_domains = _domains("o", result.shape)
+    reduction_domains = (IterationDomain("r0", kernel_extent),)
+    return TensorProgram(
+        family="reduction",
+        source_target=str(node.target),
+        decomposition="indexed window sum divided by the window extent",
+        iteration_domains=(*output_domains, *reduction_domains),
+        reduction_axes=("r0",),
+        loads=(load,),
+        init=_zero(accumulator_dtype),
+        combine=combine,
+        post=post,
+        accumulator_dtype=accumulator_dtype,
+        store=TensorStore(
+            result.id, result.shape, result.dtype or "", result.strides, True
+        ),
+        predicates=_predicates((*output_domains, *reduction_domains)),
+    )
+
+
+def _gather_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorProgram:
+    if len(node.args) != 3:
+        raise UnsupportedLowering("gather must have three arguments")
+    source = _node_value(node.args[0], graph)
+    dimension = _normalized_dimension(node.args[1], len(source.shape or ()))
+    index = _node_value(node.args[2], graph)
+    result = _result_value(op, graph)
+    if source.shape is None or index.shape is None or result.shape is None:
+        raise UnsupportedLowering("gather operands need static shapes")
+    if index.shape != result.shape or source.shape != result.shape:
+        raise UnsupportedLowering("gather operands and result must have the same shape")
+    if index.id not in graph.inputs:
+        raise UnsupportedLowering("data-dependent gather requires a runtime index input")
+    if index.dtype not in {
+        "torch.int32",
+        "torch.int64",
+    }:
+        raise UnsupportedLowering("gather indices must be int32 or int64")
+
+    output_axes = tuple(f"o{dimension_index}" for dimension_index in range(len(result.shape)))
+    index_load = _load(index, output_axes, 0)
+    source_axes = tuple(
+        DataIndex(index_load.id) if dimension_index == dimension else axis
+        for dimension_index, axis in enumerate(output_axes)
+    )
+    source_load = _load(source, source_axes, 1)
+    return TensorProgram(
+        family="elementwise",
+        source_target=str(node.target),
+        decomposition="data-indexed gather with a validated runtime index domain",
+        iteration_domains=_domains("o", result.shape),
+        reduction_axes=(),
+        loads=(index_load, source_load),
+        init=None,
+        combine=Load(source_load.id, source_load.dtype),
+        post=None,
+        accumulator_dtype=None,
+        store=TensorStore(
+            result.id, result.shape, result.dtype or "", result.strides, True
+        ),
+        predicates=_predicates(_domains("o", result.shape)),
+    )
+
+
 LOWERERS: dict[Any, LoweringRule] = {
     torch.ops.aten.add.Tensor: lambda node, op, graph: _binary_program(node, op, graph, "add"),
+    torch.ops.aten.add.Scalar: lambda node, op, graph: _binary_program(node, op, graph, "add"),
     torch.ops.aten.sub.Tensor: lambda node, op, graph: _binary_program(node, op, graph, "sub"),
     torch.ops.aten.mul.Tensor: lambda node, op, graph: _binary_program(node, op, graph, "mul"),
     torch.ops.aten.div.Tensor: lambda node, op, graph: _binary_program(node, op, graph, "div"),
@@ -1003,6 +1348,10 @@ LOWERERS: dict[Any, LoweringRule] = {
     torch.ops.aten.bmm.default: _bmm_program,
     torch.ops.aten.addmm.default: _addmm_program,
     torch.ops.aten.linear.default: _linear_program,
+    torch.ops.aten.convolution.default: _convolution_program,
+    torch.ops.aten.conv2d.default: _conv2d_program,
+    torch.ops.aten.avg_pool2d.default: _avg_pool2d_program,
+    torch.ops.aten.gather.default: _gather_program,
     torch.ops.aten.sum.dim_IntList: lambda node, op, graph: _reduction_program(node, op, graph, False),
     torch.ops.aten.mean.dim: lambda node, op, graph: _reduction_program(node, op, graph, True),
     torch.ops.aten.sum.default: lambda node, op, graph: _reduction_program(node, op, graph, False),
@@ -1093,7 +1442,19 @@ def _verify_tensor_program(program: TensorProgram, op: Op, graph: ComputeGraph) 
         if source.shape is not None and source.strides is None:
             raise UnsupportedLowering(f"load {load.id} source lacks strides")
         maximum_address = 0
+        if load.source_shape is not None and source.shape != load.source_shape:
+            raise UnsupportedLowering(f"load {load.id} source shape does not match its value")
         for axis, stride in zip(load.axes, load.strides):
+            if isinstance(axis, DataIndex):
+                if axis.load_id not in load_ids:
+                    raise UnsupportedLowering(
+                        f"load {load.id} uses an unknown data index"
+                    )
+                continue
+            if isinstance(axis, AxisAffine):
+                if set(axis_references(axis)) - set(axes):
+                    raise UnsupportedLowering(f"load {load.id} uses an unbound affine axis")
+                continue
             if isinstance(axis, str):
                 if axis not in axes:
                     raise UnsupportedLowering(f"load {load.id} uses unbound axis {axis}")
@@ -1128,7 +1489,7 @@ def _verify_tensor_program(program: TensorProgram, op: Op, graph: ComputeGraph) 
             loads_by_id = {load.id: load for load in program.loads}
             for load_id in _expression_loads(program.post):
                 if any(
-                    axis in program.reduction_axes
+                    set(axis_references(axis)) & set(program.reduction_axes)
                     for axis in loads_by_id[load_id].axes
                 ):
                     raise UnsupportedLowering("post expression depends on a reduction coordinate")

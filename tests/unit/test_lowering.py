@@ -9,9 +9,12 @@ import torch
 from torch.utils._pytree import tree_unflatten
 
 from megabake import prepare_fx_graph
+from megabake.bodies import SelectionPolicy, TargetFacts
 from megabake.graph import import_fx
 from megabake.lowering import (
     Accumulator,
+    AxisAffine,
+    DataIndex,
     AxisIndex,
     Binary,
     CanonicalProgram,
@@ -22,11 +25,14 @@ from megabake.lowering import (
     TensorProgram,
     Unary,
     Where,
+    axis_coordinate,
     canonicalize_semantics,
     dump_lowering_graph,
     lower_semantics,
     semantic_coverage,
 )
+from megabake.plan import SearchBudget, search_plans
+from megabake.regions import form_regions
 
 
 def _context(graph: torch.fx.GraphModule, *values: torch.Tensor) -> SimpleNamespace:
@@ -697,3 +703,128 @@ def test_import_fx_rejects_symbolic_dimensions_instead_of_specializing_them():
             (x, y),
             output_tree_spec=exported.call_spec.out_spec,
         )
+
+
+def test_task23_convolution_is_an_indexed_grouped_contraction():
+    class Model(torch.nn.Module):
+        def forward(self, source, weight, bias):
+            return torch.nn.functional.conv2d(
+                source,
+                weight,
+                bias,
+                stride=(2, 1),
+                padding=(1, 2),
+                dilation=(2, 1),
+                groups=2,
+            )
+
+    source = torch.randn(2, 4, 9, 10)
+    weight = torch.randn(6, 2, 3, 3)
+    bias = torch.randn(6)
+    graph = lower_semantics(_import(Model(), source, weight, bias))
+    operation = next(iter(graph.ops.values()))
+    program = operation.tensor_program
+
+    assert isinstance(program, TensorProgram)
+    assert program.family == "contraction"
+    assert "groups" in program.decomposition
+    assert program.reduction_axes == ("r0",)
+    input_channel = program.loads[0].axes[1]
+    assert isinstance(input_channel, AxisAffine)
+    assert axis_coordinate(input_channel, {"o1": 4, "r0": 9}) == 3
+
+
+def test_task23_pooling_is_an_indexed_reduction_with_masked_windows():
+    class Model(torch.nn.Module):
+        def forward(self, source):
+            return torch.nn.functional.avg_pool2d(
+                source, (2, 2), stride=(1, 1), padding=(1, 1)
+            )
+
+    source = torch.randn(2, 3, 5, 6)
+    graph = lower_semantics(_import(Model(), source))
+    operation = next(iter(graph.ops.values()))
+    program = operation.tensor_program
+
+    assert isinstance(program, TensorProgram)
+    assert program.family == "reduction"
+    assert program.loads[0].source_shape == (2, 3, 5, 6)
+    assert axis_coordinate(program.loads[0].axes[2], {"o2": 0, "r0": 0}) == -1
+    assert axis_coordinate(program.loads[0].axes[2], {"o2": 1, "r0": 2}) == 1
+
+
+def test_task23_unfamiliar_norm_and_fork_join_plan_generically():
+    class NormVariant(torch.nn.Module):
+        def forward(self, source):
+            scale = (source * source).mean(dim=-1, keepdim=True)
+            return source * torch.rsqrt(scale + 1e-6)
+
+    class ForkJoin(torch.nn.Module):
+        def forward(self, source):
+            value = source + 1
+            return value * 2, value + 3
+
+    target = TargetFacts(
+        architecture="sm90a",
+        threads_per_warp=32,
+        max_threads_per_cta=1024,
+        max_shared_memory_per_cta=232_448,
+        max_registers_per_thread=255,
+        multiprocessor_count=60,
+        supports_tma=True,
+        supports_wgmma=True,
+    )
+    policy = SelectionPolicy(allow_tuned=False)
+    for model, value in (
+        (NormVariant(), torch.randn(3, 7)),
+        (ForkJoin(), torch.randn(3, 7)),
+    ):
+        graph = form_regions(lower_semantics(_import(model, value)))
+        assert semantic_coverage(graph)["unresolved"] == 0
+        result = search_plans(graph, target, policy, SearchBudget(evaluator=None))
+        assert result.candidates
+        assert all(candidate.status == "unmeasured" for candidate in result.candidates)
+        assert all("generic/" in candidate.description for candidate in result.candidates)
+
+
+def test_task23_runtime_gather_uses_validated_conservative_read_domain():
+    class Model(torch.nn.Module):
+        def forward(self, source, index):
+            return torch.gather(source, 1, index)
+
+    source = torch.randn(2, 3, 4)
+    index = torch.randint(0, 3, (2, 3, 4))
+    graph = form_regions(lower_semantics(_import(Model(), source, index)))
+    operation = next(iter(graph.ops.values()))
+    program = operation.tensor_program
+
+    assert isinstance(program, TensorProgram)
+    assert program.family == "elementwise"
+    assert isinstance(program.loads[1].axes[1], DataIndex)
+    target = TargetFacts(
+        architecture="sm90a",
+        threads_per_warp=32,
+        max_threads_per_cta=1024,
+        max_shared_memory_per_cta=232_448,
+        max_registers_per_thread=255,
+        multiprocessor_count=60,
+        supports_tma=True,
+        supports_wgmma=True,
+    )
+    result = search_plans(
+        graph, target, SelectionPolicy(allow_tuned=False), SearchBudget(evaluator=None)
+    )
+    candidate = result.candidates[0]
+    assert candidate.plan is not None
+    gather_tile = next(
+        tile_map
+        for tile_map in candidate.plan.tile_maps
+        if operation.id in tile_map.body.semantic.source_op_ids
+    )
+    source_tile = next(
+        tile
+        for access in gather_tile.accesses
+        for tile in access.inputs
+        if tile.value_id == "value:arg0_1"
+    )
+    assert source_tile.shape[1] == 3

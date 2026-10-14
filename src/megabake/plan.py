@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from typing import Any, Protocol
 
 from .bodies.interface import (
+    AxisExpression,
     BodyConfig,
     ParticipantContract,
     TargetFacts,
@@ -105,7 +106,7 @@ class CuTeLayout:
 @dataclass(frozen=True)
 class LogicalTile:
     value_id: str
-    axes: tuple[str | int, ...]
+    axes: tuple[AxisExpression, ...]
     layout: CuTeLayout
     origin: tuple[int, ...]
     shape: tuple[int, ...]

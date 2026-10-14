@@ -4,6 +4,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
+from ..lowering import AxisAffine, DataIndex
+
+AxisExpression = str | int | AxisAffine | DataIndex
+
 
 @dataclass(frozen=True)
 class TargetFacts:
@@ -75,7 +79,7 @@ class SemanticContract:
 @dataclass(frozen=True)
 class TensorLayout:
     dtype: str
-    axes: tuple[str | int, ...]
+    axes: tuple[AxisExpression, ...]
     strides: tuple[int, ...]
     alignment_bytes: int
     shape: tuple[int, ...] | None = None

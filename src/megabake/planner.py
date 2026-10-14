@@ -7,6 +7,7 @@ from math import prod
 from typing import Any
 
 from .bodies.catalog import get_candidates
+from .lowering import AxisAffine, DataIndex
 from .bodies.interface import BodyConfig, SelectionPolicy, TargetFacts
 from .graph import ComputeGraph, Region
 from .lowering import TensorProgram
@@ -403,7 +404,18 @@ def _input_tile(
         for domain in program.iteration_domains
         if domain.axis in program.reduction_axes
     }
+    axis_ranges = {
+        **{
+            axis: (output_origin[index], output_origin[index] + output_tile_shape[index] - 1)
+            for index, axis in enumerate(output_axes)
+        },
+        **{axis: (0, size - 1) for axis, size in reduction_domains.items()},
+    }
     for axis in load.axes:
+        if isinstance(axis, DataIndex):
+            origin.append(0)
+            shape.append(layout.shape[len(origin) - 1])
+            continue
         if isinstance(axis, int):
             origin.append(axis)
             shape.append(1)
@@ -417,8 +429,38 @@ def _input_tile(
             origin.append(0)
             shape.append(reduction_domains[axis])
             continue
-        raise InvalidTileMap(f"input axis {axis} is not connected to the iteration domains")
+        if not isinstance(axis, AxisAffine):
+            raise InvalidTileMap(
+                f"input axis {axis} is not connected to the iteration domains"
+            )
+        minimum, maximum = _affine_bounds(axis, axis_ranges)
+        if maximum < 0 or minimum >= layout.shape[len(origin)]:
+            origin.append(0)
+            shape.append(1)
+        else:
+            origin.append(max(minimum, 0))
+            shape.append(max(maximum - max(minimum, 0) + 1, 1))
     return _logical_tile(load.value_id, tuple(load.axes), layout, tuple(origin), tuple(shape))
+
+
+def _affine_bounds(
+    axis: AxisAffine, ranges: dict[str, tuple[int, int]]
+) -> tuple[int, int]:
+    if any(
+        term.scale <= 0 or term.divisor <= 0 or term.modulus < 0
+        for term in axis.terms
+    ):
+        raise InvalidTileMap("affine input axis is not monotonic")
+    values = []
+    for bound in (0, 1):
+        value = axis.offset
+        for term in axis.terms:
+            coordinate = ranges[term.axis][bound] // term.divisor
+            if term.modulus:
+                coordinate %= term.modulus
+            value += coordinate * term.scale
+        values.append(value)
+    return min(values), max(values)
 
 
 def _logical_tile(

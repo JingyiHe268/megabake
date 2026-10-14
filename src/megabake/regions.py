@@ -281,6 +281,7 @@ def _compose_scalar_chain(
                         axes=load.axes,
                         strides=load.strides,
                         dtype=load.dtype,
+                        source_shape=load.source_shape,
                     )
                 )
                 leaf_ids[load.value_id] = leaf_id

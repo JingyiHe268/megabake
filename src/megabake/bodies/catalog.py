@@ -253,8 +253,13 @@ def _layouts(program: Any, alignment_bytes: int | None = None) -> LayoutContract
             axes=tuple(load.axes),
             strides=tuple(load.strides),
             alignment_bytes=alignment_bytes or _DTYPE_BYTES[load.dtype],
-            shape=tuple(
-                1 if isinstance(axis, int) else domain_sizes[axis] for axis in load.axes
+            shape=(
+                tuple(load.source_shape)
+                if load.source_shape is not None
+                else tuple(
+                    1 if isinstance(axis, int) else domain_sizes[axis]
+                    for axis in load.axes
+                )
             ),
         )
         for load in program.loads

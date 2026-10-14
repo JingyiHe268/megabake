@@ -25,7 +25,7 @@ from .codegen import GeneratedCuTeModule, emit_cute
 from .diagnostics import CompilerDiagnostic, CompilerError
 from .frontend import CaptureContext, PreparedFX
 from .graph import ComputeGraph, import_fx
-from .lowering import canonicalize_semantics
+from .lowering import DataIndex, canonicalize_semantics, semantic_coverage
 from .memory import verify_plan
 from .plan import (
     BodySelectionPlan,
@@ -314,6 +314,52 @@ def compile_post_grad(
         cache_hit = cache_result.hit
     else:
         compiled = compile_selected()
+    selected_candidate = next(
+        (
+            candidate
+            for candidate in compiled.search.candidates
+            if candidate.description == compiled.search.selected_description
+            and candidate.measurement is not None
+        ),
+        None,
+    )
+    prepared.context.requirements["generic_coverage"] = {
+        "semantic_support": semantic_coverage(graph),
+        "body_names": tuple(
+            dict.fromkeys(
+                f"{phase.body.provider}/{phase.body.name}"
+                for phase in compiled.plan.phases
+                if phase.body.provider == "generic"
+            )
+        ),
+        "workspace_bytes": compiled.plan.storage.workspace_bytes,
+        "performance": {
+            "median_isolated_launch_us": (
+                selected_candidate.measurement.median_isolated_launch_us
+                if selected_candidate is not None
+                and selected_candidate.measurement is not None
+                else None
+            ),
+            "median_device_event_span_us": (
+                selected_candidate.measurement.median_device_event_span_us
+                if selected_candidate is not None
+                and selected_candidate.measurement is not None
+                else None
+            ),
+            "median_complete_call_us": (
+                selected_candidate.measurement.median_complete_call_us
+                if selected_candidate is not None
+                and selected_candidate.measurement is not None
+                else None
+            ),
+            "median_device_event_span_us": (
+                selected_candidate.measurement.median_device_event_span_us
+                if selected_candidate is not None
+                and selected_candidate.measurement is not None
+                else None
+            ),
+        },
+    }
     parameter_tensors = _current_parameter_tensors(
         compiled, prepared.context, prepared.example_inputs
     )
@@ -716,6 +762,7 @@ def bind_callable(
 
         with runtime_lock:
             input_tensors = _input_tensors(graph, full_inputs)
+            _validate_data_indices(compiled_kernel.plan, input_tensors)
             active_stream = torch.cuda.current_stream(
                 next(iter(input_tensors.values())).device
             )
@@ -1192,6 +1239,40 @@ def _validate_input_metadata(value_id: str, value: Any, tensor: torch.Tensor) ->
                 requirement="guarded input shape, dtype, and strides",
             )
         )
+
+
+def _validate_data_indices(plan: KernelPlan, inputs: Mapping[str, torch.Tensor]) -> None:
+    for selected in plan.selection.selections:
+        for load in selected.program.loads:
+            for dimension, axis in enumerate(load.axes):
+                if not isinstance(axis, DataIndex):
+                    continue
+                index_load = next(
+                    candidate for candidate in selected.program.loads
+                    if candidate.id == axis.load_id
+                )
+                index_tensor = inputs.get(index_load.value_id)
+                if index_tensor is None:
+                    raise CompilerError(
+                        CompilerDiagnostic(
+                            "runtime-binding",
+                            f"gather index {index_load.value_id} is not a runtime input",
+                            selected.source_op_ids,
+                            requirement="runtime gather index",
+                        )
+                    )
+                source_size = (load.source_shape or ())[dimension]
+                if bool((index_tensor < 0).any()) or bool(
+                    (index_tensor >= source_size).any()
+                ):
+                    raise CompilerError(
+                        CompilerDiagnostic(
+                            "runtime-binding",
+                            f"gather index is outside [0, {source_size})",
+                            selected.source_op_ids,
+                            requirement="valid gather index",
+                        )
+                    )
 
 
 def _load_generated_module(generated: GeneratedCuTeModule) -> Any:

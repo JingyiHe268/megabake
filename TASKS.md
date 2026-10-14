@@ -479,16 +479,18 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Implement in:** `lowering.py` and `generic.py`.
 
-- [ ] Express convolution as indexed contraction with padding, stride, dilation, and groups. Avoid a required materialized `im2col` tensor.
-- [ ] Express pooling as indexed reductions. Add the gather and index rules needed by the selected fixtures.
-- [ ] Preserve invalid-index behavior and all required output types. Use conservative dependency domains when indices are data dependent.
-- [ ] Compile a vision block containing convolution, activation, pooling, and a residual through the normal compiler.
-- [ ] Compile unfamiliar norm variants and fork/join graphs with named matchers disabled.
-- [ ] Report generic-body use, workspace, and performance separately from semantic support.
+- [x] Express convolution as indexed contraction with padding, stride, dilation, and groups. Avoid a required materialized `im2col` tensor.
+- [x] Express pooling as indexed reductions. Add the gather and index rules needed by the selected fixtures.
+- [x] Preserve invalid-index behavior and all required output types. Use conservative dependency domains when indices are data dependent.
+- [x] Compile a vision block containing convolution, activation, pooling, and a residual through the normal compiler.
+- [x] Compile unfamiliar norm variants and fork/join graphs with named matchers disabled.
+- [x] Report generic-body use, workspace, and performance separately from semantic support.
 
 **Output:** new compositions of supported primitives compile without a model-specific registration.
 
 **Check:** compare unfamiliar graphs with native execution. Verify that a missed optimization uses a valid generic plan rather than claiming unsupported semantics.
+
+**Evidence:** affine indexed loads now express grouped 2-D convolution and average pooling without `im2col`, with masked padded-window reads. Runtime-input `gather` uses a conservative full source-domain tile and pre-launch bounds checks, so invalid indices fail before device execution. The SM90 integration test compiles convolution, ReLU, average pooling, gather, and residual through the normal backend and compares exactly with native execution. It also covers an unfamiliar norm variant and a fork/join graph with tuned providers disabled. Compiled contexts report semantic support, generic body names, workspace bytes, and measured timing separately. The test disables cuDNN because this container cannot load its runtime sublibrary; the native reference then uses PyTorch's convolution fallback.
 
 ## 24. Add reusable norm, residual, and RoPE schedules
 

@@ -4,7 +4,9 @@ from dataclasses import dataclass, field
 from typing import Mapping
 
 from ..lowering import (
+    AxisAffine,
     AxisIndex,
+    DataIndex,
     Accumulator,
     Binary,
     Cast,
@@ -626,14 +628,8 @@ def _emit_expression(
         if index is None:
             raise UnsupportedMapBody(f"unknown load {expression.load_id}")
         load = loads[index]
-        coordinates = []
-        for axis in load.axes:
-            coordinates.append(
-                axis_coordinates[axis] if isinstance(axis, str) else str(axis)
-            )
-        return _TypedExpression(
-            f"tensor_bindings[{index}][{', '.join(coordinates)}]", load.dtype
-        )
+        return _load_access(load, index, loads, axis_coordinates)
+
     if isinstance(expression, Constant):
         return _TypedExpression(
             f"{_cutlass_type(expression.dtype)}({expression.value!r})",
@@ -707,6 +703,56 @@ def _emit_expression(
             expression.dtype,
         )
     raise UnsupportedMapBody(f"unsupported scalar expression {expression!r}")
+
+
+def _load_access(
+    load: Any,
+    index: int,
+    loads: tuple,
+    axis_coordinates: Mapping[str, str],
+) -> _TypedExpression:
+    coordinates = []
+    bounds = []
+    for axis in load.axes:
+        coordinate = _axis_code(axis, axis_coordinates, loads)
+        coordinates.append(coordinate)
+        if load.source_shape is not None and not isinstance(axis, DataIndex):
+            size = load.source_shape[len(coordinates) - 1]
+            bounds.extend((f"({coordinate}) >= 0", f"({coordinate}) < {size}"))
+    access = f"tensor_bindings[{index}][{', '.join(coordinates)}]"
+    if bounds:
+        zero = f"{_cutlass_type(load.dtype)}(0)"
+        access = f"({access} if {' and '.join(bounds)} else {zero})"
+    return _TypedExpression(access, load.dtype)
+
+
+def _axis_code(
+    axis: Any, axis_coordinates: Mapping[str, str], loads: tuple
+) -> str:
+    if isinstance(axis, str):
+        return axis_coordinates[axis]
+    if isinstance(axis, int):
+        return str(axis)
+    if isinstance(axis, DataIndex):
+        for index, candidate in enumerate(loads):
+            if candidate.id == axis.load_id:
+                return _load_access(
+                    candidate, index, loads, axis_coordinates
+                ).code
+        raise UnsupportedMapBody(f"unknown data index {axis.load_id}")
+    if not isinstance(axis, AxisAffine):
+        raise UnsupportedMapBody(f"unsupported indexed axis {axis!r}")
+    code = str(axis.offset)
+    for term in axis.terms:
+        coordinate = axis_coordinates[term.axis]
+        if term.divisor != 1:
+            coordinate = f"({coordinate} // {term.divisor})"
+        if term.modulus:
+            coordinate = f"({coordinate} % {term.modulus})"
+        if term.scale != 1:
+            coordinate = f"({coordinate} * {term.scale})"
+        code = f"{code} + {coordinate}"
+    return f"({code})"
 
 
 def _unary_code(operator: str, operand: _TypedExpression) -> str:
