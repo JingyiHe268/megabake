@@ -12,6 +12,8 @@ MegaBake turns a captured PyTorch inference workload into a planned, composable 
 
 [TASKS.md](TASKS.md) gives the step-by-step execution plan: get live FX, build the Compute Graph, plan execution, and generate complete CuTe megakernels. Each step names its implementation, inputs, outputs, and checks.
 
+[ELEVATOR_PITCH.md](ELEVATOR_PITCH.md) summarizes the vision, current status, audience value, and contribution asks.
+
 [SCHEDULER_REUSE.md](SCHEDULER_REUSE.md) covers operation variants, generic lowering, explicit fallback, and reusable Mirage components with source references.
 
 Mirage is the main reference architecture for lowering, tile/layout planning, storage, and persistent scheduling. Start from its compatible algorithms and tests. Adapt them for the FX contract, CuTe DSL, and measured target requirements.
