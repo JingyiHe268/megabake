@@ -72,9 +72,21 @@ def _dtype(dtype_name: str) -> torch.dtype:
 def _read_load(program: TensorProgram, load_id: str, coordinates: dict[str, int], values: dict):
     load = next(item for item in program.loads if item.id == load_id)
     offset = 0
+    coordinate_values = []
     for axis, stride in zip(load.axes, load.strides):
-        coordinate = coordinates[axis] if isinstance(axis, str) else axis
+        if isinstance(axis, DataIndex):
+            coordinate = int(_read_load(program, axis.load_id, coordinates, values))
+        elif isinstance(axis, AxisAffine):
+            coordinate = axis_coordinate(axis, coordinates)
+        else:
+            coordinate = coordinates[axis] if isinstance(axis, str) else axis
+        coordinate_values.append(coordinate)
         offset += coordinate * stride
+    if load.source_shape is not None and any(
+        not 0 <= coordinate < size
+        for coordinate, size in zip(coordinate_values, load.source_shape)
+    ):
+        return torch.zeros(1, dtype=_dtype(load.dtype))[0]
     source = values[load.value_id]
     return source.as_strided((1,), (1,), source.storage_offset() + offset)[0]
 
@@ -125,6 +137,7 @@ def _evaluate_expression(
             "exp": torch.exp,
             "cos": torch.cos,
             "sin": torch.sin,
+            "logical_not": torch.logical_not,
         }
         return functions[expression.operator](value)
     if isinstance(expression, AxisIndex):
@@ -329,6 +342,38 @@ def test_dump_lowering_graph_reports_programs_and_unknown_reasons(tmp_path):
     assert "## Output Reconstruction" in text
 
 
+def test_lower_semantics_supports_scalar_attribute_and_lift_fresh_copy():
+    mask = torch.tensor([False, True])
+    zero = torch.tensor(0.0, dtype=torch.bfloat16)
+    fx_graph = torch.fx.Graph()
+    with fx_graph.inserting_after():
+        mask_node = fx_graph.placeholder("mask")
+        mask_node.meta["val"] = mask
+        constant_node = fx_graph.get_attr("zero")
+        constant_node.meta["val"] = zero
+        lifted = fx_graph.call_function(
+            torch.ops.aten.lift_fresh_copy.default, (constant_node,)
+        )
+        lifted.meta["val"] = zero
+        result = fx_graph.call_function(
+            torch.ops.aten.where.self, (mask_node, lifted, constant_node)
+        )
+        result.meta["val"] = torch.where(mask, zero, zero)
+        fx_graph.output(result)
+    module = torch.fx.GraphModule({"zero": zero}, fx_graph)
+    graph = canonicalize_semantics(import_fx(module, _context(module, mask)))
+
+    assert all(operation.tensor_program is not None for operation in graph.ops.values())
+    assert graph.ops["op:zero"].tensor_program.combine == Constant(
+        0.0, "torch.bfloat16"
+    )
+    assert graph.ops["op:lift_fresh_copy_default"].tensor_program.family == "copy"
+
+    torch.testing.assert_close(
+        _evaluate_graph(graph, {"mask": mask}), torch.where(mask, zero, zero)
+    )
+
+
 def test_canonicalize_semantics_supports_shared_targets_and_preserves_programs():
     class Model(torch.nn.Module):
         def forward(self, x, y, ids, weights, mask):
@@ -363,8 +408,8 @@ def test_canonicalize_semantics_supports_shared_targets_and_preserves_programs()
     canonical = canonicalize_semantics(graph)
 
     assert semantic_coverage(canonical) == {
-        "canonical": len(canonical.ops),
-        "generic": 0,
+        "canonical": len(canonical.ops) - 2,
+        "generic": 2,
         "unresolved": 0,
     }
     assert {
@@ -456,15 +501,79 @@ def test_canonicalize_semantics_supports_concat_semantics():
     )
     concat_operation = canonical.ops["op:cat_default"]
     program = concat_operation.tensor_program
-    assert isinstance(program, CanonicalProgram)
+    assert isinstance(program, TensorProgram)
     assert program.family == "concat"
-    assert program.semantics["axis"] == 0
-    assert program.semantics["operands"] == (
+    assert tuple(load.value_id for load in program.loads) == (
         canonical.inputs[0],
         canonical.inputs[0],
     )
     torch.testing.assert_close(
         _evaluate_graph(canonical, {"x": x}), model(x)
+    )
+
+
+def test_lower_semantics_supports_broadcast_advanced_indexing():
+    class Model(torch.nn.Module):
+        def forward(self, source, first, second):
+            return source[first, second]
+
+    torch.manual_seed(43)
+    source = torch.randn(2, 5)
+    first = torch.zeros(1, 1, 1, 1, dtype=torch.int64)
+    second = torch.tensor([[[[0, 1, 2, 3]]]])
+    model = Model().eval()
+    graph = lower_semantics(_import(model, source, first, second))
+
+    assert all(operation.tensor_program is not None for operation in graph.ops.values())
+    torch.testing.assert_close(
+        _evaluate_graph(
+            graph, {"source": source, "first": first, "second": second}
+        ),
+        model(source, first, second),
+    )
+
+
+def test_lower_semantics_supports_smollm_mask_and_scalar_operations():
+    class Model(torch.nn.Module):
+        def forward(self, mask, values):
+            negated = torch.logical_not(mask)
+            any_masked = negated.any(dim=-1, keepdim=True)
+            restored = torch.logical_not(any_masked)
+            return restored, values * 0.25
+
+    torch.manual_seed(44)
+    mask = torch.tensor([[True, False, False, False], [False, False, False, False]])
+    values = torch.randn(2, 4)
+    model = Model().eval()
+    graph = lower_semantics(_import(model, mask, values))
+    targets = {operation.attributes["target"] for operation in graph.ops.values()}
+
+    assert {"aten.logical_not.default", "aten.any.dim"} <= targets
+    assert all(operation.tensor_program is not None for operation in graph.ops.values())
+    torch.testing.assert_close(
+        _evaluate_graph(graph, {"mask": mask, "values": values}),
+        model(mask, values),
+    )
+
+
+def test_lower_semantics_supports_scalar_multiply():
+    class Model(torch.nn.Module):
+        def forward(self, values):
+            return torch.ops.aten.mul.Scalar(values, 0.25)
+
+    torch.manual_seed(45)
+    values = torch.randn(2, 4)
+    model = Model().eval()
+    graph_module = torch.fx.symbolic_trace(model)
+    for node in graph_module.graph.nodes:
+        if node.op == "call_function":
+            node.meta["val"] = model(values)
+    graph = lower_semantics(import_fx(graph_module, _context(graph_module, values)))
+
+    assert graph.ops["op:mul_scalar"].attributes["target"] == "aten.mul.Scalar"
+    assert all(operation.tensor_program is not None for operation in graph.ops.values())
+    torch.testing.assert_close(
+        _evaluate_graph(graph, {"values": values}), model(values)
     )
 
 

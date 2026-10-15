@@ -35,6 +35,7 @@ class Value:
     type_name: str | None = None
     producer: str | None = None
     users: tuple[str, ...] = ()
+    storage_offset: int = 0
 
 
 @dataclass(frozen=True)
@@ -125,6 +126,7 @@ def _tensor_metadata(value: Any) -> dict[str, Any]:
             "dtype": str(value.dtype),
             "device": str(value.device),
             "strides": strides,
+            "storage_offset": int(value.storage_offset()),
             "type_name": "Tensor",
         }
     return {
@@ -326,6 +328,16 @@ def _output_value_ids(
     return tuple(output_ids)
 
 
+def _is_self_copy(node: torch.fx.Node) -> bool:
+    return (
+        node.op == "call_function"
+        and node.target is torch.ops.aten.copy_.default
+        and len(node.args) >= 2
+        and node.args[0] is node.args[1]
+        and not node.kwargs.get("non_blocking", False)
+    )
+
+
 def import_fx(graph: torch.fx.GraphModule, context: Any) -> ComputeGraph:
     graph.graph.lint()
     values: dict[str, Value] = {}
@@ -374,6 +386,12 @@ def import_fx(graph: torch.fx.GraphModule, context: Any) -> ComputeGraph:
         if node.op == "output":
             continue
 
+        if _is_self_copy(node):
+            # Reinplacing leaves copy_(x, x) after an in-place state update;
+            # it writes nothing and returns its destination.
+            node_values[node] = node_values[node.args[0]]
+            continue
+
         metadata = _metadata(node, graph, None)
         result_leaves, result_spec = tree_flatten(metadata)
         result_count = len(result_leaves)
@@ -402,6 +420,7 @@ def import_fx(graph: torch.fx.GraphModule, context: Any) -> ComputeGraph:
                 binding_name=node.target if node.op == "get_attr" else None,
                 type_name=result_metadata["type_name"],
                 producer=f"op:{node.name}",
+                storage_offset=result_metadata.get("storage_offset", 0),
             )
 
         op_id = f"op:{node.name}"
@@ -603,7 +622,7 @@ def verify_compute_graph(graph: ComputeGraph) -> None:
     }
     for source_id, node in graph.source_nodes.items():
         if node.op in {"get_attr", "call_function", "call_method", "call_module"}:
-            if source_id not in operation_source_ids:
+            if source_id not in operation_source_ids and not _is_self_copy(node):
                 raise ValueError(f"FX operation {source_id} was not imported")
 
     _check_cycle(graph.ops, graph.values)

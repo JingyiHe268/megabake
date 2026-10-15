@@ -143,6 +143,81 @@ def _run_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_megakernel(args: argparse.Namespace) -> int:
+    """Compile a Hugging Face causal LM prefill into one megakernel artifact."""
+    import dataclasses
+    import time
+
+    from transformers import AutoModelForCausalLM
+
+    output_dir = Path(args.out)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name,
+        revision=args.revision,
+        attn_implementation="eager",
+        dtype=getattr(torch, args.dtype),
+    ).to("cuda").eval()
+    model.config.use_cache = False
+    input_ids = torch.tensor([args.input_ids], device="cuda")
+    attention_mask = torch.ones_like(input_ids)
+
+    backend = make_backend(
+        mode="prefill",
+        compile_kernel=True,
+        cache=False,
+        dump_dir=output_dir,
+        scheduler="phase",
+    )
+    compiled_model = torch.compile(model, backend=backend, fullgraph=True, dynamic=False)
+    started = time.perf_counter()
+    with torch.no_grad():
+        actual = compiled_model(input_ids, attention_mask=attention_mask).logits
+        compile_seconds = time.perf_counter() - started
+        expected = model(input_ids, attention_mask=attention_mask).logits
+    relative_error = (
+        (actual.float() - expected.float()).norm() / expected.float().norm()
+    ).item()
+
+    compiled = backend.megabake_last_compiled
+    kernel_object = None
+    dump_to_object = getattr(compiled.compiled, "dump_to_object", None)
+    if callable(dump_to_object):
+        kernel_object = output_dir / "megakernel.o"
+        kernel_object.write_bytes(dump_to_object("megabake_kernel"))
+    summary = {
+        "model": args.model_name,
+        "revision": args.revision,
+        "mode": "prefill",
+        "input_ids": args.input_ids,
+        "dtype": args.dtype,
+        "generated_source": str(compiled.generated.source_path),
+        "source_map": str(compiled.generated.source_map_path),
+        "kernel_object": None if kernel_object is None else str(kernel_object),
+        "phases": len(compiled.plan.phases),
+        "graph_operations": len(compiled.plan.graph.ops),
+        "launch_policy": compiled.generated.launch.launch_policy,
+        "resources": dataclasses.asdict(compiled.resources),
+        "compile_and_first_call_seconds": round(compile_seconds, 2),
+        "recurring_gpu_operations": backend.megabake_last_trace[-1].recurring_gpu_operations,
+        "relative_l2_error_vs_eager": relative_error,
+        "argmax_matches_eager": bool(torch.equal(actual.argmax(-1), expected.argmax(-1))),
+    }
+    summary_path = output_dir / "summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2, default=str) + "\n")
+    print(
+        f"megakernel: {summary['phases']} phases, "
+        f"{compiled.resources.body_variant_count} body variants, "
+        f"relative error {relative_error:.4f} vs eager, "
+        f"{compile_seconds:.1f} s"
+    )
+    print(f"generated source: {summary['generated_source']}")
+    if kernel_object is not None:
+        print(f"kernel object: {kernel_object}")
+    print(f"summary: {summary_path}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
@@ -184,6 +259,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--dump-region-graph", action="store_true", default=False
     )
     transformers_parser.set_defaults(handler=_run_transformers)
+
+    megakernel_parser = subparsers.add_parser(
+        "megakernel", help="compile a Hugging Face causal LM prefill into one kernel"
+    )
+    megakernel_parser.add_argument("--model-name", required=True)
+    megakernel_parser.add_argument("--revision")
+    megakernel_parser.add_argument(
+        "--input-ids", type=lambda value: [int(item) for item in value.split(",")],
+        default="1,504,3458,314",
+    )
+    megakernel_parser.add_argument(
+        "--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16"
+    )
+    megakernel_parser.add_argument("--out", default="artifacts/megakernel")
+    megakernel_parser.set_defaults(handler=_run_megakernel)
 
     export_parser = subparsers.add_parser("export", parents=[common])
     export_parser.add_argument("--callable", required=True)

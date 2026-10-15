@@ -108,6 +108,19 @@ def test_emit_map_body_generates_copy_source():
     assert "output[o0, o1] = value" in body.source
 
 
+def test_emit_map_body_generates_zero_rank_scalar_source():
+    class Model(torch.nn.Module):
+        def forward(self, value):
+            return torch.scalar_tensor(4.0)
+
+    region = _regions(Model(), torch.randn(1))[0]
+    config = get_candidates(region, _target(), _policy()).configurations[0]
+    body = emit_map_body(region.tensor_programs[0], config)
+
+    assert body.tile_count == 1
+    assert "output[0] = value" in body.source
+
+
 def test_emit_reduction_body_generates_sum_mean_and_norm_sources():
     class Sum(torch.nn.Module):
         def forward(self, value):
@@ -454,3 +467,17 @@ def test_invalid_participation_and_layout_are_rejected():
         validate_body_config(
             replace(config, layouts=replace(config.layouts, inputs=bad_inputs))
         )
+
+
+def test_emit_map_body_binds_each_load_once():
+    class Model(torch.nn.Module):
+        def forward(self, left, right):
+            return left * right + left
+
+    region = _regions(Model(), torch.randn(4, 8), torch.randn(4, 8))[0]
+    config = get_candidates(region, _target(), _policy()).configurations[0]
+    body = emit_map_body(region.tensor_programs[0], config)
+
+    for index, _ in enumerate(region.tensor_programs[0].loads):
+        assert body.source.count(f"load_{index} = ") == 1
+    assert "value = " in body.source and "tensor_bindings[0][o0, o1]" in body.source

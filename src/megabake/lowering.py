@@ -592,6 +592,41 @@ def _constant_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> Tenso
     )
 
 
+def _attribute_constant_program(
+    node: torch.fx.Node, op: Op, graph: ComputeGraph
+) -> TensorProgram:
+    result = _result_value(op, graph)
+    value = node.meta.get("val")
+    scalar = value.item() if isinstance(value, torch.Tensor) else None
+    if not isinstance(scalar, (bool, int, float)):
+        source_graph = getattr(graph.runtime_context, "graph", None)
+        value = getattr(source_graph, node.target, None)
+        scalar = value.item() if isinstance(value, torch.Tensor) else None
+    if not isinstance(value, torch.Tensor):
+        raise UnsupportedLowering("tensor attribute value is unavailable")
+    if not isinstance(scalar, (bool, int, float)):
+        raise UnsupportedLowering("tensor attribute is not a concrete scalar")
+    if result.shape is None or result.shape != ():
+        raise UnsupportedLowering("only scalar tensor attributes are supported")
+    domains = _domains("o", result.shape)
+    return TensorProgram(
+        family="elementwise",
+        source_target=str(node.target),
+        decomposition="scalar tensor attribute",
+        iteration_domains=domains,
+        reduction_axes=(),
+        loads=(),
+        init=None,
+        combine=_typed_constant(scalar, result.dtype or ""),
+        post=None,
+        accumulator_dtype=None,
+        store=TensorStore(
+            result.id, result.shape, result.dtype or "", result.strides, True
+        ),
+        predicates=_predicates(domains),
+    )
+
+
 def _iota_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorProgram:
     result = _result_value(op, graph)
     length = node.args[0]
@@ -908,7 +943,7 @@ def _normalized_dimension(dimension: int, rank: int) -> int:
 
 def _concat_program(
     node: torch.fx.Node, op: Op, graph: ComputeGraph
-) -> CanonicalProgram:
+) -> TensorProgram:
     result = _result_value(op, graph)
     if result.shape is None:
         raise UnsupportedLowering("concat result lacks a shape")
@@ -916,56 +951,177 @@ def _concat_program(
     if not isinstance(operand_nodes, Sequence) or not operand_nodes:
         raise UnsupportedLowering("concat requires a nonempty operand list")
     axis = _normalized_dimension(node.args[1], len(result.shape))
-    return CanonicalProgram(
+    operands = tuple(_node_value(operand_node, graph) for operand_node in operand_nodes)
+    if any(value.shape is None or value.strides is None for value in operands):
+        raise UnsupportedLowering("concat operands need static shapes and strides")
+    if any(len(value.shape) != len(result.shape) for value in operands):
+        raise UnsupportedLowering("concat operands must share the result rank")
+    for value in operands:
+        for dimension, size in enumerate(value.shape or ()):
+            if dimension != axis and size != result.shape[dimension]:
+                raise UnsupportedLowering("concat operand shape does not match the result")
+    if sum(value.shape[axis] for value in operands) != result.shape[axis]:
+        raise UnsupportedLowering("concat operand extents do not cover the result")
+
+    output_axes = tuple(f"o{index}" for index in range(len(result.shape)))
+    offsets: list[int] = []
+    offset = 0
+    for value in operands:
+        offsets.append(offset)
+        offset += value.shape[axis]
+    loads = tuple(
+        _load(
+            value,
+            tuple(
+                AxisAffine(
+                    (AxisTerm(output_axes[dimension]),),
+                    offset=-offsets[index],
+                )
+                if dimension == axis
+                else output_axes[dimension]
+                for dimension in range(len(output_axes))
+            ),
+            index,
+        )
+        for index, value in enumerate(operands)
+    )
+    expression: ScalarExpression = Load(loads[-1].id, loads[-1].dtype)
+    for (value, load), offset in reversed(list(zip(zip(operands, loads), offsets))):
+        coordinate = AxisIndex(axis=output_axes[axis], dtype="torch.int64")
+        condition = Binary(
+            "bitwise_and",
+            Binary("ge", coordinate, _constant(offset), "torch.bool"),
+            Binary(
+                "lt",
+                coordinate,
+                _constant(offset + value.shape[axis]),
+                "torch.bool",
+            ),
+            "torch.bool",
+        )
+        expression = Where(
+            condition,
+            Load(load.id, load.dtype),
+            expression,
+            result.dtype or "",
+        )
+
+    domains = _domains("o", result.shape)
+    return TensorProgram(
         family="concat",
         source_target=str(node.target),
         decomposition="ordered multi-source materializing copy",
-        result_roles=("result",),
-        semantics={
-            "axis": axis,
-            "operands": tuple(_node_value(operand_node, graph).id for operand_node in operand_nodes),
-        },
+        iteration_domains=domains,
+        reduction_axes=(),
+        loads=loads,
+        init=None,
+        combine=expression,
+        post=None,
+        accumulator_dtype=None,
+        store=TensorStore(
+            result.id, result.shape, result.dtype or "", result.strides, True
+        ),
+        predicates=_predicates(domains),
+    )
+
+
+def _broadcast_shape(shapes: Sequence[tuple[int, ...]]) -> tuple[int, ...]:
+    rank = len(shapes[0])
+    if any(len(shape) != rank for shape in shapes):
+        raise UnsupportedLowering("gather index tensors must have the same rank")
+    result: list[int] = []
+    for dimension in range(rank):
+        sizes = {shape[dimension] for shape in shapes}
+        if len(sizes) > 2 or (len(sizes) == 2 and 1 not in sizes):
+            raise UnsupportedLowering("gather index tensors are not broadcastable")
+        result.append(max(sizes))
+    return tuple(result)
+
+
+def _indexed_gather_program(
+    node: torch.fx.Node,
+    op: Op,
+    graph: ComputeGraph,
+    data: Value,
+    index_values: tuple[Value, ...],
+) -> TensorProgram:
+    result = _result_value(op, graph)
+    if data.shape is None or result.shape is None:
+        raise UnsupportedLowering("gather operands need static shapes")
+    if any(value.shape is None for value in index_values):
+        raise UnsupportedLowering("gather indices need static shapes")
+    if not index_values or len(index_values) > len(data.shape):
+        raise UnsupportedLowering("gather index count does not match the source rank")
+
+    index_shape = _broadcast_shape(tuple(value.shape for value in index_values))
+    trailing_shape = data.shape[len(index_values) :]
+    if result.shape != (*index_shape, *trailing_shape):
+        raise UnsupportedLowering("gather result shape does not match its operands")
+
+    output_axes = tuple(f"o{index}" for index in range(len(result.shape)))
+    index_axes = output_axes[: len(index_shape)]
+    index_loads = tuple(
+        IndexedLoad(
+            id=f"gather:index:{index}",
+            value_id=index_value.id,
+            axes=_broadcast_axes(index_value, index_shape),
+            strides=index_value.strides or (),
+            dtype=index_value.dtype or "",
+            source_shape=index_value.shape,
+        )
+        for index, index_value in enumerate(index_values)
+    )
+    data_axes: tuple[str | int | AxisAffine | DataIndex, ...] = tuple(
+        DataIndex(load.id) for load in index_loads
+    ) + output_axes[len(index_shape) :]
+    data_load = IndexedLoad(
+        id="gather:data",
+        value_id=data.id,
+        axes=data_axes,
+        strides=data.strides or (),
+        dtype=data.dtype or "",
+        source_shape=data.shape,
+    )
+    domains = tuple(
+        IterationDomain(axis, size) for axis, size in zip(output_axes, result.shape)
+    )
+    return TensorProgram(
+        family="gather",
+        source_target=str(node.target),
+        decomposition="source elements selected by broadcast integer indices",
+        iteration_domains=domains,
+        reduction_axes=(),
+        loads=(*index_loads, data_load),
+        init=None,
+        combine=Load(data_load.id, data_load.dtype),
+        post=None,
+        accumulator_dtype=None,
+        store=TensorStore(
+            result.id, result.shape, result.dtype or "", result.strides, True
+        ),
+        predicates=_predicates(domains),
     )
 
 
 def _embedding_program(
     node: torch.fx.Node, op: Op, graph: ComputeGraph
-) -> CanonicalProgram:
+) -> TensorProgram:
     weight = _node_value(node.args[0], graph)
     indices = _node_value(node.args[1], graph)
-    result = _result_value(op, graph)
-    if weight.shape is None or indices.shape is None or result.shape is None:
-        raise UnsupportedLowering("embedding operands need static shapes")
-    if result.shape != (*indices.shape, *weight.shape[1:]):
-        raise UnsupportedLowering("embedding result shape does not match its operands")
-    return CanonicalProgram(
-        family="gather",
-        source_target=str(node.target),
-        decomposition="weight rows selected by integer indices",
-        result_roles=("result",),
-        semantics={
-            "data": weight.id,
-            "indices": indices.id,
-            "index_axis": 0,
-            "trailing_shape": weight.shape[1:],
-        },
-    )
+    return _indexed_gather_program(node, op, graph, weight, (indices,))
 
 
-def _index_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> CanonicalProgram:
+def _index_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorProgram:
     source = _node_value(node.args[0], graph)
     index_nodes = node.args[1]
     if not isinstance(index_nodes, Sequence) or not index_nodes:
         raise UnsupportedLowering("index requires a nonempty index list")
-    return CanonicalProgram(
-        family="gather",
-        source_target=str(node.target),
-        decomposition="source elements selected by advanced index operands",
-        result_roles=("result",),
-        semantics={
-            "source": source.id,
-            "indices": tuple(_node_value(index_node, graph).id for index_node in index_nodes),
-        },
+    return _indexed_gather_program(
+        node,
+        op,
+        graph,
+        source,
+        tuple(_node_value(index_node, graph) for index_node in index_nodes),
     )
 
 
@@ -1021,6 +1177,8 @@ def _reduction_program(
     graph: ComputeGraph,
     is_mean: bool,
     operator: str = "add",
+    accumulator_dtype: str | None = None,
+    post: ScalarExpression | None = None,
 ) -> TensorProgram:
     if not node.args:
         raise UnsupportedLowering("reduction has no arguments")
@@ -1064,7 +1222,7 @@ def _reduction_program(
         raise UnsupportedLowering("reduction output shape does not match its dimensions")
 
     load = _load(source, axes, 0)
-    accumulator_dtype = result.dtype or ""
+    accumulator_dtype = accumulator_dtype or result.dtype or ""
     accumulator_load = _cast_load(Load(load.id, load.dtype), accumulator_dtype)
     combine = Binary(
         operator,
@@ -1075,7 +1233,8 @@ def _reduction_program(
     reduction_size = 1
     for domain in reduction_domains:
         reduction_size *= domain.size
-    if is_mean:
+    decomposition = "ordered add reduction"
+    if post is None and is_mean:
         post: ScalarExpression = Binary(
             "div",
             Cast(
@@ -1087,7 +1246,7 @@ def _reduction_program(
             accumulator_dtype,
         )
         decomposition = "sum divided by the reduction extent"
-    else:
+    elif post is None:
         post = Cast(
             Accumulator(accumulator_dtype),
             accumulator_dtype,
@@ -1120,6 +1279,25 @@ def _reduction_program(
 
 def _amax_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorProgram:
     return _reduction_program(node, op, graph, is_mean=False, operator="maximum")
+
+
+def _any_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorProgram:
+    source = _node_value(node.args[0], graph)
+    if source.dtype != "torch.bool":
+        raise UnsupportedLowering("any.dim currently supports boolean tensors")
+    return _reduction_program(
+        node,
+        op,
+        graph,
+        is_mean=False,
+        accumulator_dtype="torch.int32",
+        post=Binary(
+            "gt",
+            Accumulator("torch.int32"),
+            _zero("torch.int32"),
+            "torch.bool",
+        ),
+    )
 
 
 def _reduction_identity(dtype: str, operator: str) -> Constant:
@@ -1558,6 +1736,7 @@ LOWERERS: dict[Any, LoweringRule] = {
     torch.ops.aten.add.Scalar: lambda node, op, graph: _binary_program(node, op, graph, "add"),
     torch.ops.aten.sub.Tensor: lambda node, op, graph: _binary_program(node, op, graph, "sub"),
     torch.ops.aten.mul.Tensor: lambda node, op, graph: _binary_program(node, op, graph, "mul"),
+    torch.ops.aten.mul.Scalar: lambda node, op, graph: _binary_program(node, op, graph, "mul"),
     torch.ops.aten.div.Tensor: lambda node, op, graph: _binary_program(node, op, graph, "div"),
     torch.ops.aten.pow.Tensor_Scalar: lambda node, op, graph: _binary_program(
         node, op, graph, "pow"
@@ -1580,6 +1759,9 @@ LOWERERS: dict[Any, LoweringRule] = {
     torch.ops.aten.where.self: _where_program,
     torch.ops.aten.relu.default: lambda node, op, graph: _unary_program(node, op, graph, "relu"),
     torch.ops.aten.neg.default: lambda node, op, graph: _unary_program(node, op, graph, "neg"),
+    torch.ops.aten.logical_not.default: lambda node, op, graph: _unary_program(
+        node, op, graph, "logical_not"
+    ),
     torch.ops.aten.abs.default: lambda node, op, graph: _unary_program(node, op, graph, "abs"),
     torch.ops.aten.sigmoid.default: lambda node, op, graph: _unary_program(node, op, graph, "sigmoid"),
     torch.ops.aten.tanh.default: lambda node, op, graph: _unary_program(node, op, graph, "tanh"),
@@ -1596,6 +1778,7 @@ LOWERERS: dict[Any, LoweringRule] = {
     torch.ops.aten.unsqueeze.default: _view_program,
     torch.ops.aten.slice.Tensor: _view_program,
     torch.ops.aten.clone.default: _copy_program,
+    torch.ops.aten.lift_fresh_copy.default: _copy_program,
     torch.ops.aten.t.default: _view_program,
     torch.ops.aten.transpose.int: _view_program,
     torch.ops.aten.permute.default: _view_program,
@@ -1612,6 +1795,7 @@ LOWERERS: dict[Any, LoweringRule] = {
     torch.ops.aten.sum.default: lambda node, op, graph: _reduction_program(node, op, graph, False),
     torch.ops.aten.mean.default: lambda node, op, graph: _reduction_program(node, op, graph, True),
     torch.ops.aten.amax.default: _amax_program,
+    torch.ops.aten.any.dim: _any_program,
     operator.getitem: _tuple_projection_program,
     torch.ops.aten.cat.default: _concat_program,
     torch.ops.aten.embedding.default: _embedding_program,
@@ -1722,7 +1906,11 @@ def _verify_tensor_program(program: TensorProgram, op: Op, graph: ComputeGraph) 
         source_extent = 1
         for size, stride in zip(source.shape or (), source.strides or ()):
             source_extent += max(size - 1, 0) * abs(stride)
-        if source_extent and maximum_address >= source_extent:
+        if (
+            program.family != "concat"
+            and source_extent
+            and maximum_address >= source_extent
+        ):
             raise UnsupportedLowering(f"load {load.id} may read outside its source storage")
     if _expression_loads(program.combine) - load_ids:
         raise UnsupportedLowering("combine expression uses an unknown load")
@@ -1853,7 +2041,11 @@ def lower_semantics(graph: ComputeGraph) -> ComputeGraph:
         source_id = operation.source_fx_ids[0]
         node = graph.source_nodes[source_id]
         target = node.target
-        rule = LOWERERS.get(target) or LOWERERS.get(str(target))
+        rule = (
+            _attribute_constant_program
+            if node.op == "get_attr"
+            else LOWERERS.get(target) or LOWERERS.get(str(target))
+        )
         stateful_attention = target == KV_ATTENTION_OP
         unsupported_effects = not stateful_attention and bool(
             operation.effects.get("unknown")
@@ -1906,11 +2098,9 @@ CANONICAL_TARGETS = frozenset(
         torch.ops.aten.cat.default,
         torch.ops.aten.clone.default,
         torch.ops.aten.cos.default,
-        torch.ops.aten.embedding.default,
         torch.ops.aten.exp.default,
         torch.ops.aten.expand.default,
         torch.ops.aten.full.default,
-        torch.ops.aten.index.Tensor,
         torch.ops.prims.iota.default,
         torch.ops.aten.pow.Tensor_Scalar,
         "prims.prepare_softmax_online.default",

@@ -1451,6 +1451,8 @@ class G0RangeBodyProvider:
 
         if not policy.allow_tuned:
             return reject("tuned providers disabled")
+        if not policy.allow_tma_gemm:
+            return reject("TMA GEMM bodies are disabled for table-driven launches")
         if not region.tensor_programs or len(region.tensor_programs) != 1:
             return reject("region has no single tensor program")
 

@@ -583,3 +583,74 @@ def test_task25_rejects_row_dependent_score_hook_and_preserves_source():
         for candidate in region.fusion_candidates
     )
     assert len(graph.regions) == len(graph.ops)
+
+
+def test_form_regions_rope_reads_each_half_at_its_source_slices():
+    class Model(torch.nn.Module):
+        def forward(self, source, cosine, sine):
+            half = source.shape[-1] // 2
+            first = (
+                source[..., :half] * cosine[..., :half]
+                - source[..., half:] * sine[..., :half]
+            )
+            second = (
+                source[..., half:] * sine[..., :half]
+                + source[..., :half] * cosine[..., :half]
+            )
+            return torch.cat((first, second), dim=-1)
+
+    source = torch.randn(3, 6, dtype=torch.bfloat16)
+    cosine = torch.randn(3, 6, dtype=torch.bfloat16)
+    sine = torch.randn(3, 6, dtype=torch.bfloat16)
+    graph = form_regions(_import(Model(), source, cosine, sine))
+
+    program = next(
+        candidate.tensor_program
+        for region in graph.regions
+        for candidate in region.fusion_candidates
+        if candidate.semantic_facts.get("family") == "rope"
+    )
+
+    def offset(load):
+        axis = load.axes[-1]
+        return 0 if isinstance(axis, str) else axis.offset
+
+    trig_offsets = {
+        (load.value_id, offset(load))
+        for load in program.loads
+        if load.value_id != "value:arg0_1"
+    }
+    # The second half reuses the first-half trig values, so it reads them
+    # half a width earlier than its own output coordinate.
+    assert trig_offsets == {
+        ("value:arg1_1", 0),
+        ("value:arg1_1", -3),
+        ("value:arg2_1", 0),
+        ("value:arg2_1", -3),
+    }
+
+
+def test_task25_feature_axis_cat_is_not_a_cache_append():
+    class Model(torch.nn.Module):
+        def forward(self, source, key, value, mask):
+            half = key.shape[-1] // 2
+            rotated = torch.cat((-key[..., half:], key[..., :half]), dim=-1)
+            output, _ = _grouped_attention(source, rotated, value, mask)
+            return output
+
+    torch.manual_seed(25)
+    source = torch.randn(1, 2, 2, 8, dtype=torch.bfloat16)
+    key = torch.randn(1, 2, 2, 8, dtype=torch.bfloat16)
+    value = torch.randn(1, 2, 2, 8, dtype=torch.bfloat16)
+    mask = torch.randn(1, 1, 2, 2)
+    graph = form_regions(_import(Model(), source, key, value, mask))
+
+    candidate = next(
+        candidate
+        for region in graph.regions
+        for candidate in region.fusion_candidates
+        if candidate.semantic_facts.get("family") == "attention"
+    )
+    effects = candidate.semantic_facts["cache_effects"]
+    assert effects["policy"] == "read_only"
+    assert effects["appends"] == ()

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import replace
-from itertools import product
+from itertools import chain, product
 from math import prod
 from typing import Any
 
@@ -34,7 +34,7 @@ def select_bodies(
 ) -> BodySelectionPlan:
     policy = _validated_policy(graph, policy)
     selections, rejections, unsupported = _enumerate_body_selections(
-        graph, target, policy
+        graph, target, policy, max_plans=1
     )
     if not selections:
         return BodySelectionPlan(
@@ -52,10 +52,13 @@ def enumerate_body_selections(
     graph: ComputeGraph,
     target: TargetFacts,
     policy: SelectionPolicy | None = None,
+    max_plans: int = 8,
 ) -> tuple[BodySelectionPlan, ...]:
+    if max_plans < 1:
+        raise ValueError("max_plans must be positive")
     policy = _validated_policy(graph, policy)
     return _enumerate_body_selections(
-        graph, target, policy
+        graph, target, policy, max_plans=max_plans
     )[0]
 
 
@@ -87,6 +90,7 @@ def _enumerate_body_selections(
     graph: ComputeGraph,
     target: TargetFacts,
     selected_policy: SelectionPolicy,
+    max_plans: int,
 ):
     type Option = tuple[Region, TensorProgram, BodyConfig] | None
     options_by_region: list[list[Option]] = []
@@ -159,7 +163,113 @@ def _enumerate_body_selections(
         options_by_region.append(options)
 
     selections: list[BodySelectionPlan] = []
-    for combination in product(*options_by_region):
+    first_combination = [None] * len(options_by_region)
+    covered_operations = set()
+    all_options = [
+        (index, option)
+        for index, options in enumerate(options_by_region)
+        for option in options
+        if option is not None
+    ]
+    all_options.sort(
+        key=lambda item: len(item[1][0].source_op_ids),
+        reverse=True,
+    )
+    for index, option in all_options:
+        region_operations = set(graph.regions[index].source_op_ids)
+        candidate_operations = set(option[0].source_op_ids)
+        if (
+            not region_operations <= candidate_operations
+            or covered_operations.intersection(candidate_operations)
+        ):
+            continue
+        first_combination[index] = option
+        covered_operations.update(candidate_operations)
+
+    seed_coverage = {
+        operation_id
+        for option in first_combination
+        if option is not None
+        for operation_id in option[0].source_op_ids
+    }
+    seed_is_complete = all(
+        first_combination[index] is not None
+        or set(graph.regions[index].source_op_ids) <= seed_coverage
+        or all(
+            isinstance(program, TensorProgram) and program.family == "view"
+            for program in graph.regions[index].tensor_programs
+        )
+        for index, options in enumerate(options_by_region)
+    )
+    if not seed_is_complete:
+        first_combination = [
+            next(
+                (
+                    option
+                    for option in options
+                    if option is not None and option[0].id == graph.regions[index].id
+                ),
+                None,
+            )
+            for index, options in enumerate(options_by_region)
+        ]
+        operation_indices = {
+            operation_id: index
+            for index, option in enumerate(first_combination)
+            if option is not None
+            for operation_id in option[0].source_op_ids
+        }
+        for index, options in enumerate(options_by_region):
+            if first_combination[index] is not None:
+                continue
+            replacement = next(
+                (
+                    option
+                    for option in options
+                    if option is not None
+                    and set(graph.regions[index].source_op_ids)
+                    <= set(option[0].source_op_ids)
+                ),
+                None,
+            )
+            if replacement is None:
+                continue
+            replacement_operations = set(replacement[0].source_op_ids)
+            replaced_indices = {
+                operation_indices[operation_id]
+                for operation_id in replacement_operations
+            }
+            replaced_operations = {
+                operation_id
+                for replaced_index in replaced_indices
+                if first_combination[replaced_index] is not None
+                for operation_id in first_combination[replaced_index][0].source_op_ids
+            }
+            if not replaced_operations <= replacement_operations:
+                continue
+            for replaced_index in replaced_indices:
+                first_combination[replaced_index] = None
+            first_combination[index] = replacement
+            operation_indices.update(
+                (operation_id, index)
+                for operation_id in replacement_operations
+            )
+
+    combination_limit = max_plans * 16
+    combination_count = 1
+    for options in options_by_region:
+        combination_count *= max(1, len(options))
+        if combination_count > combination_limit:
+            break
+    seed = (tuple(first_combination),)
+    combinations = (
+        seed
+        if combination_count > combination_limit
+        else chain(seed, product(*options_by_region))
+    )
+    examined_combinations = 0
+    for combination in combinations:
+        examined_combinations += 1
         chosen = []
         covered_operations: set[str] = set()
         for option in sorted(
@@ -203,6 +313,7 @@ def _enumerate_body_selections(
                         producer_regions_by_value[value_id]
                         for value_id in selected.inputs
                         if value_id in producer_regions_by_value
+                        and producer_regions_by_value[value_id] != selected.region_id
                     )
                 ),
             )
@@ -220,6 +331,10 @@ def _enumerate_body_selections(
                 target,
             )
         )
+        if len(selections) >= max_plans:
+            break
+        if examined_combinations >= max_plans * 16:
+            break
     return tuple(selections), rejections, unsupported
 
 

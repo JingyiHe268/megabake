@@ -740,7 +740,17 @@ def _rope_candidate(concat: Op, graph: ComputeGraph) -> RegionCandidate | None:
     program = concat.tensor_program
     if program is None or program.family != "concat" or len(concat.operands) != 2:
         return None
-    if program.semantics.get("axis") != len(graph.values[concat.results[0]].shape or ()) - 1:
+    if not isinstance(program, TensorProgram):
+        return None
+    concat_axis = next(
+        (
+            index
+            for index, axis in enumerate(program.loads[0].axes)
+            if isinstance(axis, AxisAffine)
+        ),
+        None,
+    )
+    if concat_axis != len(graph.values[concat.results[0]].shape or ()) - 1:
         return None
     sub = _producer(concat.operands[0], graph)
     add = _producer(concat.operands[1], graph)
@@ -757,13 +767,14 @@ def _rope_candidate(concat: Op, graph: ComputeGraph) -> RegionCandidate | None:
         return None
 
     roots: dict[str, int] = {}
-    for multiply in (
+    multiplies = (
         _producer(sub.operands[0], graph),
         _producer(sub.operands[1], graph),
         _producer(add.operands[0], graph),
         _producer(add.operands[1], graph),
-    ):
-        if multiply is None:
+    )
+    for multiply in multiplies:
+        if multiply is None or len(multiply.operands) != 2:
             return None
         for operand_id in multiply.operands:
             root = _view_root(operand_id, graph)
@@ -818,19 +829,55 @@ def _rope_candidate(concat: Op, graph: ComputeGraph) -> RegionCandidate | None:
     output_axes = tuple(f"o{index}" for index in range(rank))
     final_axis = output_axes[-1]
     leading_axes = output_axes[:-1]
-    trig_axes = tuple(
-        final_axis if index == len(cos.shape) - 1 else f"o{index}"
-        for index in range(len(cos.shape))
-    )
-    plus_axis = AxisAffine((AxisTerm(final_axis),), offset=half_width)
-    minus_axis = AxisAffine((AxisTerm(final_axis),), offset=-half_width)
-    loads = (
-        IndexedLoad("load:0", x_id, output_axes, x.strides or (), x.dtype or "", x.shape),
-        IndexedLoad("load:1", x_id, (*leading_axes, plus_axis), x.strides or (), x.dtype or "", x.shape),
-        IndexedLoad("load:2", x_id, (*leading_axes, minus_axis), x.strides or (), x.dtype or "", x.shape),
-        IndexedLoad("load:3", cos_id, trig_axes, cos.strides or (), cos.dtype or "", cos.shape),
-        IndexedLoad("load:4", sin_id, trig_axes, sin.strides or (), sin.dtype or "", sin.shape),
-    )
+    # Each half reads x and the trig tables at its own source slice; derive
+    # those last-axis starts instead of assuming one indexing convention.
+    first_width = graph.values[concat.operands[0]].shape
+    if first_width is None or first_width[-1] != half_width:
+        return None
+    load_ids: dict[tuple[str, int], str] = {}
+    loads_list: list[IndexedLoad] = []
+
+    def operand_load(operand_id: str, branch_start: int) -> Load | None:
+        located = _last_axis_slice(operand_id, graph)
+        if located is None:
+            return None
+        root_id, start = located
+        root = graph.values[root_id]
+        if root.shape is None or root.strides is None or len(root.shape) != rank:
+            return None
+        offset = start - branch_start
+        key = (root_id, offset)
+        if key not in load_ids:
+            load_ids[key] = f"load:{len(loads_list)}"
+            axis = (
+                final_axis
+                if offset == 0
+                else AxisAffine((AxisTerm(final_axis),), offset=offset)
+            )
+            loads_list.append(
+                IndexedLoad(
+                    load_ids[key],
+                    root_id,
+                    (*leading_axes, axis),
+                    root.strides,
+                    root.dtype or "",
+                    root.shape,
+                )
+            )
+        return Load(load_ids[key], root.dtype or "")
+
+    branch_loads = []
+    for multiply, branch_start in zip(multiplies, (0, 0, half_width, half_width)):
+        operands = tuple(
+            operand_load(operand_id, branch_start) for operand_id in multiply.operands
+        )
+        if any(operand is None for operand in operands):
+            return None
+        branch_loads.append(operands)
+    passthrough = operand_load(x_id, 0)
+    if passthrough is None:
+        return None
+    loads = tuple(loads_list)
     dtype = output.dtype or ""
     compute_dtype = "torch.float32" if dtype in {"torch.bfloat16", "torch.float16"} else dtype
 
@@ -848,24 +895,9 @@ def _rope_candidate(concat: Op, graph: ComputeGraph) -> RegionCandidate | None:
         )
 
     axis_index = AxisIndex(final_axis, "torch.int64")
-    first = source_binary(
-        "sub",
-        source_binary(
-            "mul", Load("load:0", x.dtype or ""), Load("load:3", cos.dtype or "")
-        ),
-        source_binary(
-            "mul", Load("load:1", x.dtype or ""), Load("load:4", sin.dtype or "")
-        ),
-    )
-    second = source_binary(
-        "add",
-        source_binary(
-            "mul", Load("load:0", x.dtype or ""), Load("load:4", sin.dtype or "")
-        ),
-        source_binary(
-            "mul", Load("load:2", x.dtype or ""), Load("load:3", cos.dtype or "")
-        ),
-    )
+    products = [source_binary("mul", *operands) for operands in branch_loads]
+    first = source_binary("sub", products[0], products[1])
+    second = source_binary("add", products[2], products[3])
     expression = Where(
         Binary(
             "lt",
@@ -882,7 +914,7 @@ def _rope_candidate(concat: Op, graph: ComputeGraph) -> RegionCandidate | None:
                 "torch.bool",
             ),
             second,
-            Load("load:0", x.dtype or ""),
+            passthrough,
             dtype,
         ),
         dtype,
@@ -942,6 +974,25 @@ def _rope_candidate(concat: Op, graph: ComputeGraph) -> RegionCandidate | None:
 def _producer(value_id: str, graph: ComputeGraph) -> Op | None:
     operation_id = graph.values[value_id].producer
     return graph.ops.get(operation_id) if operation_id is not None else None
+
+
+def _attention_head_axis(value: Any) -> int | None:
+    if value.strides is None or len(value.strides) != 4:
+        return None
+    head_stride = value.shape[3] * value.strides[3]
+    if value.strides[2] == head_stride:
+        return 2
+    if value.strides[1] == head_stride:
+        return 1
+    return None
+
+
+def _attention_access_axes(
+    head_axis: int, batch_axis: AxisAffine, head: AxisAffine, sequence_axis: str
+) -> tuple[AxisExpression, ...]:
+    if head_axis == 2:
+        return (batch_axis, sequence_axis, head, "d")
+    return (batch_axis, head, sequence_axis, "d")
 
 
 def _attention_candidates(graph: ComputeGraph) -> tuple[RegionCandidate, ...]:
@@ -1005,20 +1056,34 @@ def _attention_candidate(value_bmm: Op, graph: ComputeGraph) -> RegionCandidate 
     v = graph.values[v_root]
     if any(value.shape is None or len(value.shape) != 4 for value in (q, k, v)):
         return None
-    if q.shape[2] % k.shape[2] or q.shape[-1] != k.shape[-1] or q.shape[-1] != v.shape[-1]:
+    q_head_axis = _attention_head_axis(q)
+    k_head_axis = _attention_head_axis(k)
+    v_head_axis = _attention_head_axis(v)
+    if q_head_axis is None or k_head_axis is None or v_head_axis is None:
+        return None
+    query_heads = q.shape[q_head_axis]
+    query_length = q.shape[3 - q_head_axis]
+    kv_heads = k.shape[k_head_axis]
+    kv_length = k.shape[3 - k_head_axis]
+    head_dim = q.shape[-1]
+    if (
+        query_heads % kv_heads
+        or head_dim != k.shape[-1]
+        or head_dim != v.shape[-1]
+        or v.shape[v_head_axis] != kv_heads
+    ):
         return None
 
-    group_size = q.shape[2] // k.shape[2]
-    batch_and_query_head = AxisAffine(
-        (AxisTerm("b", scale=q.shape[2]), AxisTerm("h"))
-    )
-    batch_and_kv_head = AxisAffine(
-        (AxisTerm("b", scale=k.shape[2]), AxisTerm("h", divisor=group_size))
+    group_size = query_heads // kv_heads
+    batch_head = AxisAffine((AxisTerm("bh", divisor=query_heads),))
+    query_head = AxisAffine((AxisTerm("bh", modulus=query_heads),))
+    kv_head = AxisAffine(
+        (AxisTerm("bh", divisor=query_heads, modulus=group_size),)
     )
     q_load = IndexedLoad(
         "attention:q",
         q_root,
-        (batch_and_query_head, "s", "d"),
+        _attention_access_axes(q_head_axis, batch_head, query_head, "s"),
         q.strides or (),
         q.dtype or "",
         q.shape,
@@ -1026,7 +1091,7 @@ def _attention_candidate(value_bmm: Op, graph: ComputeGraph) -> RegionCandidate 
     k_load = IndexedLoad(
         "attention:k",
         k_root,
-        (batch_and_kv_head, "k", "d"),
+        _attention_access_axes(k_head_axis, batch_head, kv_head, "k"),
         k.strides or (),
         k.dtype or "",
         k.shape,
@@ -1034,7 +1099,7 @@ def _attention_candidate(value_bmm: Op, graph: ComputeGraph) -> RegionCandidate 
     v_load = IndexedLoad(
         "attention:v",
         v_root,
-        (batch_and_query_head, "k", "d"),
+        _attention_access_axes(v_head_axis, batch_head, kv_head, "k"),
         v.strides or (),
         v.dtype or "",
         v.shape,
@@ -1046,10 +1111,18 @@ def _attention_candidate(value_bmm: Op, graph: ComputeGraph) -> RegionCandidate 
     if score_expression is None:
         return None
     mask_semantics = _mask_semantics(mask_value, score_dtype, graph)
-    mask_operations = (
-        _transitive_operations(_producer(mask_value, graph), graph)
-        if mask_value is not None and mask_semantics.get("kind") == "typed_where"
-        else ()
+    condition_loads = mask_semantics.get("condition_loads")
+    mask_condition = (
+        condition_loads[0].value_id
+        if isinstance(condition_loads, tuple) and condition_loads
+        else None
+    )
+    attention_mask = (
+        mask_value
+        if mask_semantics.get("kind") == "additive_tensor"
+        else mask_condition
+        if mask_semantics.get("kind") == "typed_where"
+        else None
     )
 
     probability_value = graph.values[value_program.loads[0].value_id]
@@ -1064,7 +1137,6 @@ def _attention_candidate(value_bmm: Op, graph: ComputeGraph) -> RegionCandidate 
             *q_path,
             *k_path,
             *v_path,
-            *mask_operations,
             score_bmm,
             *score_path,
             scale_operation,
@@ -1092,7 +1164,7 @@ def _attention_candidate(value_bmm: Op, graph: ComputeGraph) -> RegionCandidate 
                 q_root,
                 k_root,
                 v_root,
-                *((mask_value,) if mask_semantics.get("kind") == "additive_tensor" else ()),
+                *((attention_mask,) if attention_mask is not None else ()),
             )
         )
     )
@@ -1109,7 +1181,7 @@ def _attention_candidate(value_bmm: Op, graph: ComputeGraph) -> RegionCandidate 
             q,
             k,
             v,
-            mask_value if mask_semantics.get("kind") == "additive_tensor" else None,
+            attention_mask,
             graph,
         ),
         semantic_facts={
@@ -1126,10 +1198,10 @@ def _attention_candidate(value_bmm: Op, graph: ComputeGraph) -> RegionCandidate 
             "v_access": v_load,
             "head_grouping": {
                 "batch": q.shape[0],
-                "query_heads": q.shape[2],
-                "kv_heads": k.shape[2],
+                "query_heads": query_heads,
+                "kv_heads": kv_heads,
                 "group_size": group_size,
-                "head_dim": q.shape[3],
+                "head_dim": head_dim,
             },
             "scale": _scalar_operand(scale_operation, 1),
             "mask": mask_semantics,
@@ -1206,9 +1278,43 @@ def _cache_access(value_id: str, graph: ComputeGraph) -> tuple[str, str | None]:
         operation is not None
         and _matches_target(operation, "aten.cat.default")
         and len(operation.operands) == 2
+        and _is_sequence_append(operation, graph)
     ):
         return operation.operands[0], operation.operands[1]
     return value_id, None
+
+
+def _is_sequence_append(operation: Op, graph: ComputeGraph) -> bool:
+    # A cache append extends a boundary cache along a non-feature axis; a
+    # feature-axis cat (for example rotate-half RoPE) is ordinary computation.
+    cache = graph.values.get(operation.operands[0])
+    if cache is None or cache.shape is None:
+        return False
+    arguments = operation.attributes.get("fx_args", ())
+    dimension = arguments[1] if len(arguments) > 1 else 0
+    if not isinstance(dimension, int):
+        return False
+    if dimension % len(cache.shape) == len(cache.shape) - 1:
+        return False
+    seen: set[str] = set()
+    pending = [cache.id]
+    while pending:
+        current = pending.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        if current in graph.inputs:
+            return True
+        value = graph.values.get(current)
+        if value is None:
+            continue
+        pending.extend(value.storage_relation.aliases)
+        producer = _producer(current, graph)
+        if producer is not None and len(producer.operands) == 1:
+            program = producer.tensor_program
+            if isinstance(program, TensorProgram) and program.family in {"view", "copy"}:
+                pending.append(producer.operands[0])
+    return False
 
 
 def _in_place_cache_update(cache_values: tuple[str, ...], graph: ComputeGraph) -> bool:
@@ -1367,8 +1473,17 @@ def _attention_tensor_program(
         return None
     if q.shape is None or k.shape is None or v.shape is None:
         return None
-    batch, query_length, query_heads, head_dim = q.shape
-    _, kv_length, kv_heads, _ = k.shape
+    q_head_axis = _attention_head_axis(q)
+    k_head_axis = _attention_head_axis(k)
+    v_head_axis = _attention_head_axis(v)
+    if q_head_axis is None or k_head_axis is None or v_head_axis is None:
+        return None
+    batch = q.shape[0]
+    query_heads = q.shape[q_head_axis]
+    query_length = q.shape[3 - q_head_axis]
+    kv_heads = k.shape[k_head_axis]
+    kv_length = k.shape[3 - k_head_axis]
+    head_dim = q.shape[-1]
     group_size = query_heads // kv_heads
     batch_head = AxisAffine((AxisTerm("bh", divisor=query_heads),))
     query_head = AxisAffine((AxisTerm("bh", modulus=query_heads),))
@@ -1380,7 +1495,7 @@ def _attention_tensor_program(
         IndexedLoad(
             "attention:q",
             q_root,
-            (batch_head, "s", query_head, "d"),
+            _attention_access_axes(q_head_axis, batch_head, query_head, "s"),
             q.strides or (),
             q.dtype or "",
             q.shape,
@@ -1388,7 +1503,7 @@ def _attention_tensor_program(
         IndexedLoad(
             "attention:k",
             k_root,
-            (batch_head, "k", kv_head, "d"),
+            _attention_access_axes(k_head_axis, batch_head, kv_head, "k"),
             k.strides or (),
             k.dtype or "",
             k.shape,
@@ -1396,7 +1511,7 @@ def _attention_tensor_program(
         IndexedLoad(
             "attention:v",
             v_root,
-            (batch_head, "k", kv_head, "d"),
+            _attention_access_axes(v_head_axis, batch_head, kv_head, "k"),
             v.strides or (),
             v.dtype or "",
             v.shape,
@@ -1644,6 +1759,19 @@ def _scalar_mask_value(load: IndexedLoad, graph: ComputeGraph) -> float | None:
     operation = _producer(load.value_id, graph)
     if (
         operation is not None
+        and isinstance(operation.tensor_program, TensorProgram)
+        and operation.tensor_program.family == "copy"
+    ):
+        source = _producer(operation.tensor_program.loads[0].value_id, graph)
+        if (
+            source is not None
+            and isinstance(source.tensor_program, TensorProgram)
+            and isinstance(source.tensor_program.combine, Constant)
+        ):
+            value = source.tensor_program.combine.value
+            return value if isinstance(value, (int, float)) else None
+    if (
+        operation is not None
         and _matches_target(operation, "aten.full.default")
         and len(operation.attributes.get("fx_args", ())) >= 2
     ):
@@ -1786,6 +1914,47 @@ def _rope_operations(
     return tuple(
         candidate for candidate in graph.ops.values() if candidate.id in operation_ids
     )
+
+
+def _last_axis_slice(value_id: str, graph: ComputeGraph) -> tuple[str, int] | None:
+    """Return the view root and start offset of a unit-step last-axis slice."""
+    start = 0
+    while True:
+        producer = _producer(value_id, graph)
+        if producer is None:
+            return value_id, start
+        if _matches_target(producer, "aten.unsqueeze.default"):
+            source = graph.values[producer.operands[0]]
+            arguments = producer.attributes.get("fx_args", ())
+            dimension = arguments[1] if len(arguments) > 1 else None
+            if (
+                source.shape is None
+                or not isinstance(dimension, int)
+                or dimension % (len(source.shape) + 1) == len(source.shape)
+            ):
+                return None
+        elif _matches_target(producer, "aten.slice.Tensor"):
+            source = graph.values[producer.operands[0]]
+            arguments = tuple(producer.attributes.get("fx_args", ()))
+            dimension, slice_start, _, step = (
+                *arguments[1:5],
+                *(0, 0, None, 1)[len(arguments[1:5]):],
+            )
+            slice_start = 0 if slice_start is None else slice_start
+            if (
+                source.shape is None
+                or not isinstance(dimension, int)
+                or not isinstance(slice_start, int)
+                or step not in (None, 1)
+            ):
+                return None
+            if dimension % len(source.shape) == len(source.shape) - 1:
+                if slice_start < 0:
+                    slice_start += source.shape[-1]
+                start += max(0, min(slice_start, source.shape[-1]))
+        else:
+            return value_id, start
+        value_id = producer.operands[0]
 
 
 def _view_root(value_id: str, graph: ComputeGraph) -> str | None:

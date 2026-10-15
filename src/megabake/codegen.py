@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 import textwrap
 from typing import Any
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 from .bodies.gemm import HopperWgmmaGemmPersistentKernel
 from .bodies.attention import emit_attention_body
@@ -31,7 +31,7 @@ from .lowering import (
     TensorStore,
 )
 from .memory import verify_plan
-from .plan import ConversionBody, KernelPlan, SelectedBody
+from .plan import ConversionBody, CuTeLayout, KernelPlan, SelectedBody
 from .schedule import EventSchedule
 
 
@@ -93,6 +93,11 @@ class LaunchMetadata:
     body_variant_count: int = 0
     phase_runner_count: int = 0
     source_bytes: int = 0
+    # Table-driven launches read tensor addresses and phase records from
+    # device memory instead of passing one kernel parameter per tensor.
+    phase_table: tuple[tuple[int, ...], ...] = ()
+    dynamic_slots: tuple[int, ...] = ()
+    barrier_epochs: int = 0
 
 
 @dataclass(frozen=True)
@@ -156,7 +161,12 @@ def emit_cute(
     if plan.launch.architecture != "sm90a":
         raise UnsupportedCodegen("codegen currently supports sm90a plans only")
 
-    source, launch, source_map = _emit_generic_module(plan, event_schedule)
+    if event_schedule is None and not any(
+        phase.body.provider == "g0_range" for phase in plan.phases
+    ):
+        source, launch, source_map = _emit_table_module(plan)
+    else:
+        source, launch, source_map = _emit_generic_module(plan, event_schedule)
 
     module_name = (
         f"megabake_{hashlib.sha256((source + repr(launch)).encode()).hexdigest()[:16]}"
@@ -263,8 +273,10 @@ def _emit_generic_module(
                 g0_shared_bytes += phase.body.scratch.size_bytes
             body_symbol, variant_id, _ = variants[variant_key]
 
-            g0_names = []
+            g0_group_index = len(g0_prepared)
+            g0_indices = []
             for value_id in (*selection.inputs, selection.outputs[0]):
+                g0_indices.append(len(g0_tensor_arguments))
                 argument_name = f"g0_tensor_{len(g0_tensor_arguments)}"
                 layout = (
                     phase.body.layouts.inputs.get(value_id)
@@ -282,11 +294,7 @@ def _emit_generic_module(
                         (phase.region_id,),
                     )
                 )
-                g0_names.append(argument_name)
 
-            tensor_bindings = f"_g0_bindings_{phase.index}"
-            epilogue = f"_g0_epilogue_{phase.index}"
-            work_iterator = f"_g0_work_iterator_{phase.index}"
             scratch = g0_scratch_by_body.get(body_symbol)
             if scratch is None:
                 scratch = f"_g0_scratch_{len(g0_scratch)}"
@@ -298,20 +306,15 @@ def _emit_generic_module(
             g0_prepared.append(
                 (
                     body_symbol,
-                    g0_names[0],
-                    g0_names[1],
-                    g0_names[2],
-                    tensor_bindings,
-                    epilogue,
-                    work_iterator,
+                    *g0_indices,
                 )
             )
             runner_lines = [
                 f"        {body_symbol}.run(\n"
-                f"            {work_iterator},\n"
-                f"            {tensor_bindings},\n"
+                f"            g0_values[{g0_group_index}][2],\n"
+                f"            g0_values[{g0_group_index}][0],\n"
                 f"            {scratch},\n"
-                f"            {epilogue},\n"
+                f"            g0_values[{g0_group_index}][1],\n"
                 "        )"
             ]
             phase_runner_symbols[phase.index] = f"_run_variant_{variant_id}"
@@ -351,6 +354,7 @@ def _emit_generic_module(
             body_definitions.append(_nested_body_source(generated.source, body_symbol))
         body_symbol, variant_id, generated = variants[variant_key]
 
+        iterator_index = len(work_iterators)
         iterator_name = f"work_iterator_{phase.index}"
         step = (
             1
@@ -394,6 +398,10 @@ def _emit_generic_module(
                 "output",
             ),
         )
+        tensor_indices = tuple(
+            _tensor_argument_index(tensor_arguments, tensor_name)
+            for tensor_name in tensor_names
+        )
         scratch_name = (
             f"_scratch_{phase.index}"
             if phase.body.scratch.size_bytes
@@ -401,8 +409,11 @@ def _emit_generic_module(
         )
         runner_lines = [
             f"        {body_symbol}(\n"
-            f"            {iterator_name},\n"
-            f"            ({', '.join(tensor_names)},),\n"
+            f"            work_iterators[{iterator_index}],\n"
+            "            _block,\n"
+            "            _thread,\n"
+            "            workers,\n"
+            f"            ({', '.join(f'tensors[{index}]' for index in tensor_indices)},),\n"
             f"            {scratch_name},\n"
             "            None,\n"
             "        )",
@@ -428,6 +439,7 @@ def _emit_generic_module(
             else:
                 conversion_symbol = variants[conversion_key][0]
             conversion_symbols.append(conversion_symbol)
+            conversion_iterator_index = len(work_iterators)
             conversion_iterator_name = (
                 f"work_iterator_{phase.index}_conversion_{conversion_index}"
             )
@@ -457,9 +469,12 @@ def _emit_generic_module(
                 prefer_conversion=True,
             )
             runner_lines.append(
-                f"        {conversion_symbol}(\n"
-                f"            {conversion_iterator_name},\n"
-                f"            ({source_tensor}, {target_tensor},),\n"
+            f"        {conversion_symbol}(\n"
+            f"            work_iterators[{conversion_iterator_index}],\n"
+            "            _block,\n"
+            "            _thread,\n"
+            "            workers,\n"
+            f"            (tensors[{_tensor_argument_index(tensor_arguments, source_tensor)}], tensors[{_tensor_argument_index(tensor_arguments, target_tensor)}],),\n"
                 "            None,\n"
                 "            None,\n"
                 "        )"
@@ -552,50 +567,41 @@ def _emit_generic_module(
         raise UnsupportedCodegen(
             f"generated kernel requires {shared_memory_bytes} shared-memory bytes"
         )
-    g0_kernel_values = tuple(
-        argument
-        for prepared in g0_prepared
-        for argument in prepared[4:]
-    )
-    prepare_lines = [
-        f"    {bindings}, {epilogue}, {work_iterator} = {body_symbol}.prepare(\n"
-        f"        {tensor_a},\n"
-        f"        {tensor_b},\n"
-        f"        {tensor_c},\n"
-        "        max_active_clusters,\n"
-        "    )\n"
-        for body_symbol, tensor_a, tensor_b, tensor_c, bindings, epilogue, work_iterator in g0_prepared
+    g0_prepare_lines = [
+        f"        {body_symbol}.prepare(\n"
+        f"            g0_tensors[{group_index}][0],\n"
+        f"            g0_tensors[{group_index}][1],\n"
+        f"            g0_tensors[{group_index}][2],\n"
+        "            max_active_clusters,\n"
+        "        ),"
+        for group_index, (body_symbol, *rest) in enumerate(g0_prepared)
     ]
+    g0_values_source = (
+        "    g0_values = (\n" + "\n".join(g0_prepare_lines) + "\n    )\n"
+        if g0_prepare_lines
+        else ""
+    )
     launch_smem = "" if has_g0 else f"        smem={shared_memory_bytes},\n"
     runtime_import = (
         "from megabake.runtime import cooperative_event_worker_loop, publish_event, wait_for_event"
         if event_schedule is not None
         else "from megabake.runtime import cooperative_worker_loop, grid_barrier"
     )
-    rope_conversion_import = (
-        "from cutlass.cute.arch.nvvm_wrappers import cvt_f32_bf16\n"
-        if any(
-            selection.program.source_target == "rope"
-            and selection.program.store.dtype == "torch.bfloat16"
-            for selection in plan.selection.selections
-        )
-        else ""
-    )
     kernel_arguments = [
         "ready: cute.Tensor",
         "workers: cutlass.Int32",
         "epoch: cutlass.Int32",
-        *(iterator.name + ": cute.Tensor" for iterator in work_iterators),
-        *(argument.name + ": cute.Tensor" for argument in tensor_arguments),
-        *g0_kernel_values,
+        "work_iterators: tuple[cute.Tensor, ...]",
+        "tensors: tuple[cute.Tensor, ...]",
+        *(("g0_values: tuple[tuple[cute.Tensor, cute.Tensor, cute.Tensor], ...]",) if has_g0 else ()),
     ]
     launch_arguments = [
         "ready: cute.Tensor",
         "workers: cutlass.Int32",
         "epoch: cutlass.Int32",
-        *(iterator.name + ": cute.Tensor" for iterator in work_iterators),
-        *(argument.name + ": cute.Tensor" for argument in tensor_arguments),
-        *(argument.name + ": cute.Tensor" for argument in g0_tensor_arguments),
+        "work_iterators: tuple[cute.Tensor, ...]",
+        "tensors: tuple[cute.Tensor, ...]",
+        *(("g0_tensors: tuple[tuple[cute.Tensor, cute.Tensor, cute.Tensor], ...]",) if has_g0 else ()),
         "stream: cuda.CUstream",
     ]
     if has_g0:
@@ -603,7 +609,7 @@ def _emit_generic_module(
     source = f'''import cutlass
 import cutlass.cute as cute
 from cuda.bindings import driver as cuda
-{rope_conversion_import}
+from cutlass._mlir.dialects import llvm
 
 {runtime_import}
 from megabake.bodies.gemm import HopperWgmmaGemmPersistentKernel
@@ -644,13 +650,13 @@ def megabake_kernel(
 def launch(
 {("," + chr(10)).join(f"    {argument}" for argument in launch_arguments)}
 ):
-{"".join(prepare_lines)}
-    megabake_kernel(
+{g0_values_source}    megabake_kernel(
         ready,
         workers,
         epoch,
-        {("," + chr(10)).join([f"        {argument.name}" for argument in (*work_iterators, *tensor_arguments)] + [f"        {argument}" for argument in g0_kernel_values])}
-    ).launch(
+        work_iterators,
+        tensors{"," if has_g0 else ""}
+{f"        g0_values{chr(10)}" if has_g0 else ""}    ).launch(
         grid=[1, 1, workers],
         block=[{plan.launch.threads_per_block}, 1, 1],
         cooperative=True,
@@ -665,9 +671,8 @@ def launch(
         True,
         shared_memory_bytes,
         plan.launch.architecture,
-        ("ready", "workers", "epoch")
-        + tuple(argument.name for argument in (*work_iterators, *tensor_arguments))
-        + tuple(argument.name for argument in g0_tensor_arguments)
+        ("ready", "workers", "epoch", "work_iterators", "tensors")
+        + (("g0_tensors",) if has_g0 else ())
         + (("max_active_clusters",) if has_g0 else ())
         + ("stream",),
         tuple(work_iterators),
@@ -685,21 +690,460 @@ def launch(
     return source, launch_metadata, _source_map(source, plan, phase_records)
 
 
+_DYNAMIC_BINDING_KINDS = frozenset({"input", "state", "output", "alias"})
+
+
+def _emit_table_module(
+    plan: KernelPlan,
+) -> tuple[str, LaunchMetadata, tuple[SourceMapEntry, ...]]:
+    """Emit one body per variant and drive phases from a device-side table.
+
+    Every tensor becomes an address-table slot rebuilt in the kernel from its
+    static layout, so kernel parameters and generated code stay bounded by the
+    number of distinct bodies rather than by the number of layers.
+    """
+    selected = {
+        selection.region_id: selection for selection in plan.selection.selections
+    }
+    tensor_arguments = tuple(
+        TensorArgument(
+            f"tensor_{index}",
+            binding.value_id,
+            binding.storage_id,
+            binding.kind,
+            binding.layout or _value_layout(plan, binding.value_id),
+            binding.binding_name,
+            binding.region_ids,
+        )
+        for index, binding in enumerate(plan.storage.bindings)
+    )
+    variants: dict[tuple[Any, ...], tuple[str, int, Any]] = {}
+    body_definitions: list[str] = []
+    runner_variants: dict[tuple[Any, ...], tuple[int, int, list[str]]] = {}
+    work_iterators: list[WorkIteratorBinding] = []
+    phase_records: list[PhaseEmission] = []
+    phase_rows: list[tuple[int, ...]] = []
+    representative_phases: list[Any] = []
+    scratch_elements: dict[int, int] = {}
+
+    def body_variant(
+        generated: Any, key: tuple[Any, ...], symbol: str | None = None
+    ) -> tuple[str, int]:
+        if key not in variants:
+            symbol = symbol or f"_body_{len(variants)}"
+            variants[key] = (symbol, len(variants), generated)
+            body_definitions.append(_nested_body_source(generated.source, symbol))
+        symbol, variant_id, _ = variants[key]
+        return symbol, variant_id
+
+    def iterator_index(name: str, phase: Any, generated: Any, step: int) -> int:
+        work_iterators.append(
+            WorkIteratorBinding(
+                name,
+                phase.index,
+                phase.region_id,
+                "torch.int64",
+                generated.tile_count,
+                0,
+                step,
+                generated.work_iterator_encoding,
+            )
+        )
+        return len(work_iterators) - 1
+
+    for phase in plan.phases:
+        selection = selected[phase.region_id]
+        generated = _generate_device_body(selection)
+        if generated.__dataclass_fields__.get("scratch_elements") is not None:
+            scratch_elements[phase.index] = generated.scratch_elements
+        body_symbol, body_variant_id = body_variant(
+            generated, (phase.body.provider, phase.body.name, generated.source)
+        )
+        program_input_ids = tuple(
+            dict.fromkeys(load.value_id for load in selection.program.loads)
+        )
+        slots = [
+            _tensor_argument_index(
+                tensor_arguments,
+                _tensor_name(
+                    tensor_arguments,
+                    value_id,
+                    phase.region_id,
+                    "input",
+                    prefer_conversion=any(
+                        conversion.value_id == value_id
+                        and conversion.target_region_id == phase.region_id
+                        for conversion in phase.conversion_bodies
+                    ),
+                ),
+            )
+            for value_id in program_input_ids
+        ]
+        slots.append(
+            _tensor_argument_index(
+                tensor_arguments,
+                _tensor_name(
+                    tensor_arguments, selection.outputs[0], phase.region_id, "output"
+                ),
+            )
+        )
+        calls: list[tuple[str, tuple[int, ...], Any, int]] = [
+            (
+                body_symbol,
+                tuple(slots),
+                generated,
+                1
+                if selection.program.family in {"reduction", "attention"}
+                else generated.threads_per_cta,
+            )
+        ]
+        conversion_symbols: list[str] = []
+        for conversion_index, conversion in enumerate(phase.conversion_bodies):
+            target_selection = selected[conversion.target_region_id]
+            conversion_generated = _generate_conversion_body(
+                conversion, target_selection.body, target_selection
+            )
+            conversion_symbol, _ = body_variant(
+                conversion_generated,
+                (
+                    "conversion",
+                    f"{conversion.source_layout}:{conversion.target_layout}",
+                    conversion_generated.source,
+                ),
+                f"_conversion_{phase.index}_{conversion_index}",
+            )
+            conversion_symbols.append(conversion_symbol)
+            source_slot = _tensor_argument_index(
+                tensor_arguments,
+                _tensor_name(
+                    tensor_arguments,
+                    conversion.value_id,
+                    conversion.source_region_id,
+                    "output",
+                ),
+            )
+            target_slot = _tensor_argument_index(
+                tensor_arguments,
+                _tensor_name(
+                    tensor_arguments,
+                    conversion.value_id,
+                    conversion.target_region_id,
+                    "input",
+                    prefer_conversion=True,
+                ),
+            )
+            calls.append(
+                (
+                    conversion_symbol,
+                    (source_slot, target_slot),
+                    conversion_generated,
+                    conversion_generated.threads_per_cta,
+                )
+            )
+
+        # Phases share a runner when their bodies, slot layouts, and scratch
+        # agree; only the slot numbers in the phase table differ.
+        runner_key = (
+            tuple(
+                (
+                    symbol,
+                    tuple(_layout_key(tensor_arguments[slot].layout) for slot in call_slots),
+                    step,
+                )
+                for symbol, call_slots, _, step in calls
+            ),
+            phase.body.scratch.size_bytes,
+            scratch_elements.get(phase.index),
+        )
+        if runner_key not in runner_variants:
+            runner_id = len(runner_variants)
+            representative_phases.append(phase)
+            scratch_name = (
+                f"_scratch_{phase.index}" if phase.body.scratch.size_bytes else "None"
+            )
+            lines: list[str] = []
+            column = 0
+            for call_index, (symbol, call_slots, call_generated, step) in enumerate(calls):
+                iterator = iterator_index(
+                    f"work_iterator_variant_{runner_id}_{call_index}",
+                    phase,
+                    call_generated,
+                    step,
+                )
+                tensors = ", ".join(
+                    _slot_tensor_code(column + offset, tensor_arguments[slot].layout)
+                    for offset, slot in enumerate(call_slots)
+                )
+                column += len(call_slots)
+                lines.extend(
+                    (
+                        f"            {symbol}(",
+                        f"                work_iterators[{iterator}],",
+                        "                _block,",
+                        "                _thread,",
+                        "                workers,",
+                        f"                ({tensors},),",
+                        f"                {scratch_name if call_index == 0 else 'None'},",
+                        "                None,",
+                        "            )",
+                    )
+                )
+            runner_variants[runner_key] = (runner_id, column, lines)
+        runner_id, _, _ = runner_variants[runner_key]
+        phase_rows.append(
+            (
+                runner_id,
+                int(phase.barrier is not None),
+                *(slot for _, call_slots, _, _ in calls for slot in call_slots),
+            )
+        )
+        phase_records.append(
+            PhaseEmission(
+                phase.index,
+                phase.region_id,
+                body_symbol,
+                body_variant_id,
+                phase.body.provider,
+                phase.body.name,
+                len(phase.work_items),
+                generated.tile_count,
+                tuple(conversion_symbols),
+                phase.barrier.id if phase.barrier else None,
+            )
+        )
+
+    width = max(len(row) for row in phase_rows)
+    phase_table = tuple(row + (0,) * (width - len(row)) for row in phase_rows)
+    dynamic_slots = tuple(
+        index
+        for index, argument in enumerate(tensor_arguments)
+        if argument.kind in _DYNAMIC_BINDING_KINDS and argument.layout is not None
+    )
+
+    scratch_plan = _representative_scratch_plan(plan, representative_phases)
+    shared_source = _shared_scratch_source(scratch_plan, scratch_elements)
+    scratch_prelude = _scratch_prelude(scratch_plan, scratch_elements)
+    shared_memory_bytes = plan.launch.dynamic_shared_memory_bytes
+    target = plan.selection.target
+    if target is not None and shared_memory_bytes > target.max_shared_memory_per_cta:
+        raise UnsupportedCodegen(
+            f"generated kernel requires {shared_memory_bytes} shared-memory bytes"
+        )
+
+    dispatch = "\n".join(
+        f"        if variant == {runner_id}:\n" + "\n".join(lines)
+        for runner_id, _, lines in runner_variants.values()
+    )
+    dynamic_writes = "\n".join(
+        f"            addresses[{slot}] = dynamic_addresses[{position}]"
+        for position, slot in enumerate(dynamic_slots)
+    ) or "            pass"
+    source = f"""import cutlass
+import cutlass.cute as cute
+from cuda.bindings import driver as cuda
+from cutlass._mlir.dialects import llvm
+from cutlass.cute.tensor import _Tensor
+
+from megabake.runtime import grid_barrier
+
+
+@cute.jit
+def _slot(
+    addresses: cute.Tensor,
+    phase_table: cute.Tensor,
+    phase: cutlass.Int32,
+    column: cutlass.Constexpr,
+    dtype: cutlass.Constexpr,
+    layout: cutlass.Constexpr,
+    alignment: cutlass.Constexpr,
+):
+    address = addresses[phase_table[phase, 2 + column]]
+    if cutlass.const_expr(dtype is cutlass.Boolean):
+        # Boolean tensors are byte-backed, matching DLPack-bound tensors.
+        storage = cute.make_tensor(
+            cute.make_ptr(
+                cutlass.Int8, address, cute.AddressSpace.gmem, assumed_align=alignment
+            ),
+            layout,
+        )
+        return _Tensor(storage, dtype=cutlass.Boolean)
+    return cute.make_tensor(
+        cute.make_ptr(dtype, address, cute.AddressSpace.gmem, assumed_align=alignment),
+        layout,
+    )
+
+
+{shared_source}
+
+@cute.kernel
+def megabake_kernel(
+    ready: cute.Tensor,
+    workers: cutlass.Int32,
+    epoch: cutlass.Int32,
+    addresses: cute.Tensor,
+    phase_table: cute.Tensor,
+    work_iterators: tuple[cute.Tensor, ...],
+    dynamic_addresses: tuple[cutlass.Int64, ...],
+):
+    _, _, _block = cute.arch.block_idx()
+    _thread, _, _ = cute.arch.thread_idx()
+{scratch_prelude}
+{"".join(body_definitions)}
+    # Publish this call's boundary addresses before any phase reads them.
+    if _block == 0:
+        if _thread == 0:
+{dynamic_writes}
+    grid_barrier(ready, workers, epoch)
+    for phase in cutlass.range({len(plan.phases)}, unroll=1):
+        variant = phase_table[phase, 0]
+{dispatch}
+        if phase_table[phase, 1] != 0:
+            grid_barrier(ready, workers, epoch + phase + 1)
+
+
+@cute.jit
+def launch(
+    ready: cute.Tensor,
+    workers: cutlass.Int32,
+    epoch: cutlass.Int32,
+    addresses: cute.Tensor,
+    phase_table: cute.Tensor,
+    work_iterators: tuple[cute.Tensor, ...],
+    dynamic_addresses: tuple[cutlass.Int64, ...],
+    stream: cuda.CUstream,
+):
+    megabake_kernel(
+        ready,
+        workers,
+        epoch,
+        addresses,
+        phase_table,
+        work_iterators,
+        dynamic_addresses,
+    ).launch(
+        grid=[1, 1, workers],
+        block=[{plan.launch.threads_per_block}, 1, 1],
+        cooperative=True,
+        smem={shared_memory_bytes},
+        stream=stream,
+    )
+"""
+    launch_metadata = LaunchMetadata(
+        "megabake_kernel",
+        "launch",
+        plan.launch.grid_size,
+        plan.launch.threads_per_block,
+        True,
+        shared_memory_bytes,
+        plan.launch.architecture,
+        (
+            "ready",
+            "workers",
+            "epoch",
+            "addresses",
+            "phase_table",
+            "work_iterators",
+            "dynamic_addresses",
+            "stream",
+        ),
+        tuple(work_iterators),
+        tensor_arguments,
+        tuple(phase_records),
+        launch_policy="megabake_cooperative_table",
+        body_variant_count=len(body_definitions),
+        phase_runner_count=len(runner_variants),
+        source_bytes=len(source.encode("utf-8")),
+        phase_table=phase_table,
+        dynamic_slots=dynamic_slots,
+        barrier_epochs=len(plan.phases) + 1,
+    )
+    return source, launch_metadata, _source_map(source, plan, phase_records)
+
+
+def _value_layout(plan: KernelPlan, value_id: str) -> CuTeLayout | None:
+    value = plan.graph.values[value_id]
+    if value.shape is None or value.strides is None or value.dtype is None:
+        if value.users:
+            raise UnsupportedCodegen(
+                f"table launch needs a static layout for {value_id}"
+            )
+        # Unused non-tensor inputs such as flags keep an empty slot.
+        return None
+    return CuTeLayout(
+        value.dtype, value.shape, value.strides, _DTYPE_BYTES[value.dtype]
+    )
+
+
+def _layout_key(layout: Any) -> tuple[Any, ...]:
+    return (layout.dtype, tuple(layout.shape), tuple(layout.strides))
+
+
+def _slot_tensor_code(column: int, layout: Any) -> str:
+    dtype = _CUTLASS_TYPES[layout.dtype]
+    shape = tuple(layout.shape)
+    strides = tuple(layout.strides)
+    layout_code = (
+        "cute.make_layout(1)"
+        if not shape
+        else f"cute.make_layout({shape!r}, stride={strides!r})"
+    )
+    alignment = _DTYPE_BYTES[layout.dtype]
+    return (
+        f"_slot(addresses, phase_table, phase, {column}, {dtype}, "
+        f"{layout_code}, {alignment})"
+    )
+
+
+def _representative_scratch_plan(plan: KernelPlan, phases: Sequence[Any]) -> KernelPlan:
+    indices = {phase.index for phase in phases}
+    worker = plan.storage.worker_scratch[0]
+    representative_worker = replace(
+        worker,
+        phases=tuple(
+            layout
+            for layout, phase in zip(worker.phases, plan.phases, strict=True)
+            if phase.index in indices
+        ),
+    )
+    return replace(
+        plan,
+        phases=tuple(phase for phase in plan.phases if phase.index in indices),
+        storage=replace(
+            plan.storage,
+            worker_scratch=(representative_worker, *plan.storage.worker_scratch[1:]),
+        ),
+    )
+
+
 def _phase_runner_source(
     variant_id: int, calls: list[tuple[int, list[str]]]
 ) -> str:
+    ordered_calls = sorted(calls)
+
+    def dispatch(
+        entries: list[tuple[int, list[str]]], indent: str
+    ) -> list[str]:
+        if len(entries) == 1:
+            return [f"{indent}if phase_index == {entries[0][0]}:", *(
+                f"{indent}    {line.strip()}" for line in entries[0][1]
+            )]
+        midpoint = len(entries) // 2
+        return [
+            f"{indent}if phase_index < {entries[midpoint][0]}:",
+            *dispatch(entries[:midpoint], indent + "    "),
+            f"{indent}else:",
+            *dispatch(entries[midpoint:], indent + "    "),
+        ]
+
     lines = [
         "    @cute.jit",
         f"    def _run_variant_{variant_id}(phase_index: cutlass.Int32):",
+        *(
+            ordered_calls[0][1]
+            if len(ordered_calls) == 1
+            else dispatch(ordered_calls, "        ")
+        ),
     ]
-    ordered_calls = sorted(calls)
-    if len(ordered_calls) == 1:
-        lines.extend(ordered_calls[0][1])
-    else:
-        for position, (phase_index, call_lines) in enumerate(ordered_calls):
-            keyword = "if" if position == 0 else "elif"
-            lines.append(f"        {keyword} phase_index == {phase_index}:")
-            lines.extend(f"    {line}" for line in call_lines)
     return "\n".join(lines) + "\n"
 
 
@@ -764,7 +1208,7 @@ def _normalize_generic_selection(
         warp_roles=body.participants.warp_roles * factor,
     )
     family = selection.program.family
-    if family in {"elementwise", "copy", "contraction"}:
+    if family in {"elementwise", "copy", "gather", "concat", "contraction"}:
         output_domains = tuple(
             domain
             for domain in selection.program.iteration_domains
@@ -810,7 +1254,7 @@ def _normalize_generic_selection(
 
 def _generate_device_body(selection: SelectedBody):
     program = selection.program
-    if program.family in {"elementwise", "copy"}:
+    if program.family in {"elementwise", "copy", "gather", "concat"}:
         return emit_map_body(program, selection.body)
     if program.family == "reduction":
         return emit_reduction_body(program, selection.body)
@@ -954,10 +1398,20 @@ def _nested_body_source(source: str, symbol: str) -> str:
     body_source = body_source.replace("@cute.kernel", "@cute.jit", 1)
     body_source = body_source.replace("def run(", f"def {symbol}(", 1)
     body_source = body_source.replace(
-        "    block, _, _ = cute.arch.block_idx()", "    block = _block", 1
+        "    work_iterator: cute.Tensor,",
+        (
+            "        work_iterator: cute.Tensor,\n"
+            "        block: cutlass.Int32,\n"
+            "        thread: cutlass.Int32,"
+            "\n        workers: cutlass.Int32,"
+        ),
+        1,
     )
     body_source = body_source.replace(
-        "    thread, _, _ = cute.arch.thread_idx()", "    thread = _thread", 1
+        "    block, _, _ = cute.arch.block_idx()\n", "", 1
+    )
+    body_source = body_source.replace(
+        "    thread, _, _ = cute.arch.thread_idx()\n", "", 1
     )
     body_source = body_source.replace(
         "    workers, _, _ = cute.arch.grid_dim()\n", "", 1
@@ -1165,6 +1619,14 @@ def _tensor_name(
     return candidates[0].name
 
 
+def _tensor_argument_index(
+    arguments: tuple[TensorArgument, ...], name: str
+) -> int:
+    return next(
+        index for index, argument in enumerate(arguments) if argument.name == name
+    )
+
+
 def _source_map(
     source: str,
     plan: KernelPlan,
@@ -1225,11 +1687,19 @@ def _source_map(
                 )
             )
         if record.barrier:
+            source_lines = source.splitlines()
             line = next(
+                (
+                    index
+                    for index, line in enumerate(source_lines, 1)
+                    if "grid_barrier(ready, workers, epoch + " in line
+                    and f"epoch + {record.index})" in line
+                ),
+                None,
+            ) or next(
                 index
-                for index, line in enumerate(source.splitlines(), 1)
-                if "grid_barrier(ready, workers, epoch + " in line
-                and f"epoch + {record.index}" in line
+                for index, line in enumerate(source_lines, 1)
+                if "grid_barrier(ready, workers, epoch + phase + 1)" in line
             )
             entries.append(
                 SourceMapEntry(

@@ -229,3 +229,119 @@ class StatefulTransformerBlock(TransformerBlock):
         )
         mlp_output, gate, activated, fused = self._mlp(normalized_hidden)
         return mlp_output + attention_hidden, gate, activated, fused
+
+
+SMOLLM_MODEL_NAME = "HuggingFaceTB/SmolLM-135M"
+SMOLLM_REVISION = "1d461723eec654e65efdc40cf49301c89c0c92f4"
+
+
+class StatefulSmolLM(torch.nn.Module):
+    def __init__(self, model: torch.nn.Module):
+        super().__init__()
+        self.model = model.model
+        self.lm_head = model.lm_head
+        self.query_heads = model.config.num_attention_heads
+        self.key_value_heads = model.config.num_key_value_heads
+        self.head_dim = model.config.hidden_size // self.query_heads
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        *state: torch.Tensor,
+    ):
+        layer_count = len(self.model.layers)
+        key_caches = state[:layer_count]
+        value_caches = state[layer_count : 2 * layer_count]
+        valid_lengths = state[2 * layer_count :]
+        hidden = self.model.embed_tokens(input_ids)
+        position_ids = position_ids.to(torch.int64)
+        for layer, key_cache, value_cache, valid_length in zip(
+            self.model.layers,
+            key_caches,
+            value_caches,
+            valid_lengths,
+            strict=True,
+        ):
+            residual = hidden
+            normalized = layer.input_layernorm(hidden)
+            attention = layer.self_attn
+            batch, sequence, _ = normalized.shape
+            query = torch.nn.functional.linear(
+                normalized, attention.q_proj.weight
+            ).view(batch, sequence, self.query_heads, self.head_dim)
+            key = torch.nn.functional.linear(
+                normalized, attention.k_proj.weight
+            ).view(batch, sequence, self.key_value_heads, self.head_dim)
+            value = torch.nn.functional.linear(
+                normalized, attention.v_proj.weight
+            ).view(batch, sequence, self.key_value_heads, self.head_dim)
+            cosine, sine = self.model.rotary_emb(normalized, position_ids)
+            query_cosine = cosine[:, :, None, :].expand(
+                batch, sequence, self.query_heads, self.head_dim
+            )
+            query_sine = sine[:, :, None, :].expand(
+                batch, sequence, self.query_heads, self.head_dim
+            )
+            key_cosine = cosine[:, :, None, :].expand(
+                batch, sequence, self.key_value_heads, self.head_dim
+            )
+            key_sine = sine[:, :, None, :].expand(
+                batch, sequence, self.key_value_heads, self.head_dim
+            )
+            query = rotate_half(query, query_cosine, query_sine)
+            key = rotate_half(key, key_cosine, key_sine)
+            attended = kv_attention(
+                query, key, value, key_cache, value_cache, valid_length
+            )
+            projected = torch.nn.functional.linear(
+                attended.reshape(batch, sequence, -1), attention.o_proj.weight
+            )
+            hidden = residual + projected
+            residual = hidden
+            normalized = layer.post_attention_layernorm(hidden)
+            gate = torch.nn.functional.linear(
+                normalized, layer.mlp.gate_proj.weight
+            )
+            up = torch.nn.functional.linear(normalized, layer.mlp.up_proj.weight)
+            fused = torch.nn.functional.silu(gate) * up
+            hidden = residual + torch.nn.functional.linear(
+                fused, layer.mlp.down_proj.weight
+            )
+        logits = self.lm_head(self.model.norm(hidden))
+        return logits
+
+
+def SmolLMArchitecture(
+    layers: int = 30,
+    *,
+    device: str | torch.device = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.nn.Module:
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    config = LlamaConfig(
+        hidden_size=576,
+        intermediate_size=1536,
+        num_attention_heads=9,
+        num_key_value_heads=3,
+        num_hidden_layers=layers,
+        vocab_size=49152,
+        max_position_embeddings=4,
+    )
+    with torch.device(device):
+        model = LlamaForCausalLM(config)
+    model.set_attn_implementation("eager")
+    model.config.use_cache = False
+    return model.to(dtype=dtype).eval()
+
+
+def StatefulSmolLMArchitecture(
+    layers: int = 30,
+    *,
+    device: str | torch.device = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+) -> StatefulSmolLM:
+    return StatefulSmolLM(
+        SmolLMArchitecture(layers=layers, device=device, dtype=dtype)
+    ).eval()

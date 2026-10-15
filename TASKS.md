@@ -620,16 +620,18 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Implement in:** existing compiler components; add missing primitive rules through the common importer.
 
-- [ ] Capture embedding, every layer, final norm, vocabulary projection, masks, outputs, and requested state updates.
-- [ ] Lower embedding/index operations with exact source semantics. Keep model dimensions and layer count as specialization data.
-- [ ] Build one KernelPlan for the complete invocation. Preserve dependencies between all regions and state operations.
-- [ ] Emit, compile, and admit the full mixed kernel. Recheck occupancy, code size, workspace, and collective participation.
-- [ ] Return the original output structure and state through the normal wrappers.
-- [ ] Trace the complete call and account for every recurring GPU operation.
+- [x] Capture embedding, every layer, final norm, vocabulary projection, masks, outputs, and requested state updates.
+- [x] Lower embedding/index operations with exact source semantics. Keep model dimensions and layer count as specialization data.
+- [x] Build one KernelPlan for the complete invocation. Preserve dependencies between all regions and state operations.
+- [x] Emit, compile, and admit the full mixed kernel. Recheck occupancy, code size, workspace, and collective participation.
+- [x] Return the original output structure and state through the normal wrappers.
+- [x] Trace the complete call and account for every recurring GPU operation.
 
 **Output:** the full declared model invocation executing as one generated CuTe workload kernel where legal.
 
 **Check:** compare full outputs and state with the native model on changed inputs and advancing decode. Retain intermediate diagnostics for failures.
+
+**Evidence:** the 30-layer SmolLM-135M architecture compiles through the normal backend into one table-driven CuTe workload kernel in prefill (1,170 phases) and stateful decode, and so does the pinned checkpoint `HuggingFaceTB/SmolLM-135M@1d461723`, whose tied embedding/vocabulary weight feeds both a gather and a projection. Each compiles in about 100 s on the H200 MIG 3g.71gb slice. The kernel takes one device address table, a phase table, and the per-call boundary addresses; each body variant (46 for 30 layers) is emitted once and dispatched from a dynamic phase loop, following Mirage's task tables. This replaced per-tensor and per-GEMM kernel parameters, which needed 232,431 bytes against CUDA's 32,764-byte limit and took 91 minutes to fail. The TMA GEMM provider is disabled above 1,000 graph operations because its per-phase descriptors are still kernel parameters, so full-model projections run as generic contraction bodies. Accuracy against an fp32 copy matches eager bf16: pinned prefill logits differ from fp32 by 8.17% versus eager's 7.87% (1.57% from eager, identical argmax); 30-layer decode outputs and KV caches stay as close to fp32 as eager's (worst cache layer 1.60% versus 1.62%), with exact valid lengths after four advancing calls. Large table-launched plans therefore use a 2% plan tolerance. The profiler and the call trace both show one recurring CUDA operation per call; the address table is uploaded only when static bindings change. Gather indices and KV capacity are checked by in-kernel traps, replacing per-call host checks. `tools/diff_intermediates.py` compares every intermediate with eager FX execution using distinct workspace (`assign_storage(..., reuse_workspace=False)`). Fixing the GPU path also fixed view storage offsets, GEMM activation views, reinplaced `copy_` self-copies, the stateful decode body, plan search mutating caller KV state, RoPE slice matching, deep map expressions, and graph outputs that viewed reusable workspace. `MEGABAKE_RUN_GPU_TESTS=1 pytest tests/gpu/test_task31_full_model.py` passes all three tests. Not done: TMA GEMMs inside table launches (needs in-kernel descriptor updates, as in CUTLASS grouped GEMM) and any performance comparison, which is step 33.
 
 ## 32. Expose the compiler and a repeatable run command
 

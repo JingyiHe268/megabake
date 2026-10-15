@@ -154,7 +154,11 @@ class LaunchRequirements:
     required_active_blocks: int
 
 
-def assign_storage(plan: PhaseSchedule) -> KernelPlan:
+def assign_storage(
+    plan: PhaseSchedule, *, reuse_workspace: bool = True
+) -> KernelPlan:
+    """Assign storage to every value; ``reuse_workspace=False`` keeps each
+    intermediate in its own slice so diagnostics can read it after the call."""
     if not isinstance(plan, PhaseSchedule):
         raise InvalidStorage("assign_storage expects a PhaseSchedule")
     if plan.selection is None:
@@ -174,11 +178,25 @@ def assign_storage(plan: PhaseSchedule) -> KernelPlan:
     bindings: list[TensorBinding] = []
 
     consumers = _consumers(selection)
+    output_roots = _output_storage_roots(selection.graph)
     for selected in selection.selections:
         for value_id in selected.outputs:
             if value_id in selection.graph.outputs or _aliases_boundary(
                 value_id, selection.graph, _direct_boundary_ids(selection.graph)
             ):
+                continue
+            if value_id in output_roots:
+                # A graph output views this value, so it must not share
+                # reusable workspace; give it per-call output storage.
+                bindings.append(
+                    TensorBinding(
+                        value_id=value_id,
+                        storage_id=value_id,
+                        kind="output",
+                        layout=tile_maps[selected.region_id].output_layout,
+                        region_ids=(selected.region_id, *consumers.get(value_id, ())),
+                    )
+                )
                 continue
 
             source_layout = tile_maps[selected.region_id].output_layout
@@ -245,7 +263,11 @@ def assign_storage(plan: PhaseSchedule) -> KernelPlan:
     bindings.extend(_boundary_bindings(selection, tile_maps))
     bindings = _deduplicate_bindings(bindings)
     worker_scratch = _worker_scratch(plan)
-    offsets, workspace_bytes = _allocate_workspace(workspace_requests)
+    offsets, workspace_bytes = (
+        _allocate_workspace(workspace_requests)
+        if reuse_workspace
+        else _allocate_distinct_workspace(workspace_requests)
+    )
     workspace = tuple(
         GlobalStorageAssignment(
             request.storage_id,
@@ -372,10 +394,47 @@ def _tile_maps(selection: BodySelectionPlan) -> tuple[TileMap, ...]:
 
 def _consumers(selection: BodySelectionPlan) -> dict[str, tuple[str, ...]]:
     consumers: dict[str, list[str]] = {}
+    graph = selection.graph
     for selected in selection.selections:
         for value_id in selected.inputs:
-            consumers.setdefault(value_id, []).append(selected.region_id)
+            for consumer_id in _storage_value_ids(value_id, graph):
+                consumers.setdefault(consumer_id, []).append(selected.region_id)
     return {value_id: tuple(region_ids) for value_id, region_ids in consumers.items()}
+
+
+def _storage_value_ids(value_id: str, graph: ComputeGraph, seen: set[str] | None = None) -> tuple[str, ...]:
+    seen = seen or set()
+    if value_id in seen:
+        return ()
+    seen.add(value_id)
+    value = graph.values.get(value_id)
+    if value is None:
+        return (value_id,)
+    relation = value.storage_relation
+    related_ids = (value_id, relation.storage_id, *relation.aliases)
+    return tuple(
+        dict.fromkeys(
+            related_id
+            for related_id in related_ids
+            if related_id is not None
+            for related_id in (related_id, *_storage_value_ids(related_id, graph, seen))
+        )
+    )
+
+
+def _output_storage_roots(graph: ComputeGraph) -> frozenset[str]:
+    roots: set[str] = set()
+    pending = list(graph.outputs)
+    while pending:
+        value = graph.values.get(pending.pop())
+        if value is None:
+            continue
+        relation = value.storage_relation
+        for related in (*relation.aliases, relation.storage_id):
+            if related is not None and related != value.id and related not in roots:
+                roots.add(related)
+                pending.append(related)
+    return frozenset(roots)
 
 
 def _direct_boundary_ids(graph: ComputeGraph) -> frozenset[str]:
@@ -462,6 +521,17 @@ def _make_workspace_request(
             "phase_barrier" if release_phase.barrier is not None else "body_completion",
         ),
     )
+
+
+def _allocate_distinct_workspace(
+    requests: Sequence[_WorkspaceRequest],
+) -> tuple[Mapping[str, int], int]:
+    offsets: dict[str, int] = {}
+    end = 0
+    for request in requests:
+        offsets[request.storage_id] = _round_up(end, request.alignment_bytes)
+        end = offsets[request.storage_id] + request.size_bytes
+    return offsets, end
 
 
 def _allocate_workspace(

@@ -28,6 +28,45 @@ class UnsupportedAttentionBody(ValueError):
     pass
 
 
+def _attention_sequence_length(load: Any) -> int | None:
+    if load.source_shape is None:
+        return None
+    for index, axis in enumerate(load.axes):
+        if axis in {"s", "k"}:
+            return load.source_shape[index]
+    return None
+
+
+def _attention_shape_is_valid(
+    load: Any, batch: int, length: int, heads: int, head_dim: int
+) -> bool:
+    return load.source_shape in {
+        (batch, length, heads, head_dim),
+        (batch, heads, length, head_dim),
+    }
+
+
+def _attention_access(
+    load: Any, head_variable: str, binding_index: int, dimension_variable: str = "d"
+) -> str:
+    indices = []
+    for axis in load.axes:
+        if isinstance(axis, str):
+            if axis == "k":
+                indices.append("key")
+            elif axis == "d":
+                indices.append(dimension_variable)
+            else:
+                indices.append(axis)
+        elif isinstance(axis, int):
+            indices.append(str(axis))
+        elif axis.terms[0].modulus == 0:
+            indices.append("b")
+        else:
+            indices.append(head_variable)
+    return f"tensor_bindings[{binding_index}][{', '.join(indices)}]"
+
+
 @dataclass(frozen=True)
 class GeneratedAttentionBody:
     source: str
@@ -116,11 +155,22 @@ class AttentionBodyProvider:
         q_load = loads["attention:q"]
         k_load = loads["attention:k"]
         v_load = loads["attention:v"]
+        query_length = _attention_sequence_length(q_load)
+        kv_length = _attention_sequence_length(k_load)
         if (
-            q_load.source_shape != (batch, q_load.source_shape[1], query_heads, head_dim)
-            or k_load.source_shape != (batch, k_load.source_shape[1], kv_heads, head_dim)
-            or v_load.source_shape != (batch, v_load.source_shape[1], kv_heads, head_dim)
-            or program.store.shape != (batch * query_heads, q_load.source_shape[1], head_dim)
+            query_length is None
+            or kv_length is None
+            or not _attention_shape_is_valid(
+                q_load, batch, query_length, query_heads, head_dim
+            )
+            or not _attention_shape_is_valid(
+                k_load, batch, kv_length, kv_heads, head_dim
+            )
+            or not _attention_shape_is_valid(
+                v_load, batch, kv_length, kv_heads, head_dim
+            )
+            or program.store.shape
+            != (batch * query_heads, query_length, head_dim)
         ):
             return reject("attention shapes do not match the captured access maps")
 
@@ -135,11 +185,14 @@ class AttentionBodyProvider:
                 return reject("stateful causal mask has no KV state contract")
         elif mask.get("kind") == "typed_where":
             if (
-                mask.get("causal_offset") is None
-                or mask.get("window_offsets") is not None
+                mask.get("window_offsets") is not None
                 or not isinstance(mask.get("false_value"), (int, float))
             ):
                 return reject("provider supports additive tensors and causal masks only")
+            if mask.get("causal_offset") is None and (
+                "attention:mask" not in loads or mask.get("true_value") not in (0, 0.0)
+            ):
+                return reject("typed mask lacks a bound boolean condition and zero true value")
         else:
             return reject("unsupported attention mask hook")
 
@@ -153,7 +206,7 @@ class AttentionBodyProvider:
             or (not stateful and cache_effects.get("updates") != ())
         ):
             return reject("provider supports read-only or bounded stateful KV caches only")
-        if stateful and q_load.source_shape[1] != 1:
+        if stateful and query_length != 1:
             return reject("stateful KV attention supports one-token decode only")
 
         if target.architecture != "sm90a" or not target.supports_wgmma:
@@ -162,7 +215,7 @@ class AttentionBodyProvider:
             "attention_stateful_decode_rows"
             if stateful
             else "attention_decode_rows"
-            if q_load.source_shape[1] == 1
+            if query_length == 1
             else "attention_prefill_rows"
         )
         return CandidateSet(
@@ -249,7 +302,15 @@ def _attention_config(region: Region, program: Any, name: str) -> BodyConfig:
             cluster_shape=(1, 1, 1),
             work_partition="one query row per thread",
             mma_family=None,
-            reduction_tile=(next(load.source_shape[1] for load in program.loads if load.id == "attention:k"),),
+            reduction_tile=(
+                next(
+                    length
+                    for load in program.loads
+                    if load.id == "attention:k"
+                    for length in (_attention_sequence_length(load),)
+                    if length is not None
+                ),
+            ),
             tail_policy="predicated",
         ),
         participants=ParticipantContract(
@@ -338,8 +399,8 @@ def emit_attention_body(program: Any, config: BodyConfig) -> GeneratedAttentionB
         raise UnsupportedAttentionBody("attention body lacks Q/K/V bindings")
     query_load = next(load for load in program.loads if load.id == "attention:q")
     key_load = next(load for load in program.loads if load.id == "attention:k")
-    query_length = query_load.source_shape[1]
-    kv_length = key_load.source_shape[1]
+    query_length = _attention_sequence_length(query_load)
+    kv_length = _attention_sequence_length(key_load)
     if not isinstance(query_length, int) or not isinstance(kv_length, int):
         raise UnsupportedAttentionBody("attention sequence lengths must be static")
 
@@ -357,12 +418,18 @@ def emit_attention_body(program: Any, config: BodyConfig) -> GeneratedAttentionB
         threads = config.participants.participating_threads
         row_count = batch * query_heads
         tile_count = (row_count + threads - 1) // threads
+        if tile_count != 1:
+            # One CTA owns every row so the length publish can follow a CTA barrier.
+            raise UnsupportedAttentionBody(
+                "stateful attention requires every query row in one CTA"
+            )
         scale = facts.get("scale")
         if not isinstance(scale, (int, float)):
             raise UnsupportedAttentionBody("attention scale must be static")
         binding_type = ", ".join("cute.Tensor" for _ in range(len(program.loads) + 1))
         source = f'''import cutlass
 import cutlass.cute as cute
+from cutlass._mlir.dialects import llvm
 
 
 @cute.kernel
@@ -377,6 +444,10 @@ def run(
     workers, _, _ = cute.arch.grid_dim()
     row_count = {row_count}
     current_length = tensor_bindings[{loads['attention:valid_length']}][0].to(cutlass.Int32)
+    if current_length < 0:
+        llvm.intr_trap()
+    if current_length + cutlass.Int32(1) > cutlass.Int32({kv_length}):
+        llvm.intr_trap()
     for tile in cutlass.range(block, cute.size(work_iterator), workers):
         row = work_iterator[tile] + thread
         if row < row_count:
@@ -391,32 +462,27 @@ def run(
                 score = cutlass.Float32(0.0)
                 if key <= current_length:
                     for d in cutlass.range({head_dim}):
+                        key_value = tensor_bindings[{loads['attention:new_k']}][b, 0, kv_head, d]
                         if key < current_length:
                             key_value = tensor_bindings[{loads['attention:k']}][b, key, kv_head, d]
-                        else:
-                            key_value = tensor_bindings[{loads['attention:new_k']}][b, 0, kv_head, d]
                         score = score + tensor_bindings[{loads['attention:q']}][b, s, h, d].to(cutlass.Float32) * key_value.to(cutlass.Float32)
                     score = score.to(cutlass.BFloat16).to(cutlass.Float32)
-                    score = (score * cutlass.Float32({scale!r})).to(cutlass.BFloat16)
-                    score = score.to(cutlass.Float32)
+                    score = score * cutlass.Float32({scale!r})
                 else:
                     score = cutlass.Float32(-1.0e30)
-                maximum = maximum if maximum >= score else score
+                maximum = cute.arch.fmax(maximum, score, nan=True)
             for key in cutlass.range({kv_length}):
                 score = cutlass.Float32(0.0)
+                probability = cutlass.Float32(0.0)
                 if key <= current_length:
                     for d in cutlass.range({head_dim}):
+                        key_value = tensor_bindings[{loads['attention:new_k']}][b, 0, kv_head, d]
                         if key < current_length:
                             key_value = tensor_bindings[{loads['attention:k']}][b, key, kv_head, d]
-                        else:
-                            key_value = tensor_bindings[{loads['attention:new_k']}][b, 0, kv_head, d]
                         score = score + tensor_bindings[{loads['attention:q']}][b, s, h, d].to(cutlass.Float32) * key_value.to(cutlass.Float32)
                     score = score.to(cutlass.BFloat16).to(cutlass.Float32)
-                    score = (score * cutlass.Float32({scale!r})).to(cutlass.BFloat16)
-                    score = score.to(cutlass.Float32)
+                    score = score * cutlass.Float32({scale!r})
                     probability = cute.exp(score - maximum)
-                else:
-                    probability = cutlass.Float32(0.0)
                 total = total + probability
             denominator = total
             if total <= cutlass.Float32(0.0):
@@ -427,28 +493,26 @@ def run(
                     score = cutlass.Float32(0.0)
                     if key <= current_length:
                         for dd in cutlass.range({head_dim}):
+                            key_value = tensor_bindings[{loads['attention:new_k']}][b, 0, kv_head, dd]
                             if key < current_length:
                                 key_value = tensor_bindings[{loads['attention:k']}][b, key, kv_head, dd]
-                            else:
-                                key_value = tensor_bindings[{loads['attention:new_k']}][b, 0, kv_head, dd]
                             score = score + tensor_bindings[{loads['attention:q']}][b, s, h, dd].to(cutlass.Float32) * key_value.to(cutlass.Float32)
                         score = score.to(cutlass.BFloat16).to(cutlass.Float32)
-                        score = (score * cutlass.Float32({scale!r})).to(cutlass.BFloat16)
-                        score = score.to(cutlass.Float32)
+                        score = score * cutlass.Float32({scale!r})
                         probability = cute.exp(score - maximum)
                         probability = (probability / denominator).to(cutlass.BFloat16).to(cutlass.Float32)
+                        value_element = tensor_bindings[{loads['attention:new_v']}][b, 0, kv_head, d]
                         if key < current_length:
                             value_element = tensor_bindings[{loads['attention:v']}][b, key, kv_head, d]
-                        else:
-                            value_element = tensor_bindings[{loads['attention:new_v']}][b, 0, kv_head, d]
                         value = value + probability * value_element.to(cutlass.Float32)
                 tensor_bindings[{len(program.loads)}][bh, s, d] = value.to(cutlass.BFloat16)
             if h % {group_size} == 0:
                 for d in cutlass.range({head_dim}):
                     tensor_bindings[{loads['attention:k']}][b, current_length, kv_head, d] = tensor_bindings[{loads['attention:new_k']}][b, 0, kv_head, d]
                     tensor_bindings[{loads['attention:v']}][b, current_length, kv_head, d] = tensor_bindings[{loads['attention:new_v']}][b, 0, kv_head, d]
-            if block == 0 and thread == 0 and tile == 0:
-                tensor_bindings[{loads['attention:valid_length']}][0] = current_length + cutlass.Int32(1)
+        cute.arch.sync_threads()
+        if thread == 0:
+            tensor_bindings[{loads['attention:valid_length']}][0] = current_length + cutlass.Int32(1)
 '''
         return GeneratedAttentionBody(
             source=source,
@@ -476,11 +540,24 @@ def run(
     elif mask.get("kind") == "typed_where":
         causal_offset = mask.get("causal_offset")
         masked_value = mask.get("false_value")
-        if not isinstance(causal_offset, int) or not isinstance(masked_value, (int, float)):
-            raise UnsupportedAttentionBody("causal mask lacks a static offset and fill value")
-        mask_code = (
-            f"score = (score.to(cutlass.Float32) + cutlass.Float32({masked_value!r})).to(cutlass.BFloat16) if key > s + {causal_offset} else score"
-        )
+        if not isinstance(masked_value, (int, float)):
+            raise UnsupportedAttentionBody("attention mask lacks a fill value")
+        if isinstance(causal_offset, int):
+            mask_code = (
+                f"score = (score.to(cutlass.Float32) + cutlass.Float32({masked_value!r})).to(cutlass.BFloat16) if key > s + {causal_offset} else score"
+            )
+        else:
+            if "attention:mask" not in loads:
+                raise UnsupportedAttentionBody("typed attention mask is not bound")
+            mask_load = next(
+                load for load in program.loads if load.id == "attention:mask"
+            )
+            mask_access = _attention_access(
+                mask_load, "h", loads["attention:mask"]
+            )
+            mask_code = (
+                f"score = (score.to(cutlass.Float32) + cutlass.Float32({masked_value!r})).to(cutlass.BFloat16) if not {mask_access} else score"
+            )
     else:
         raise UnsupportedAttentionBody("unsupported attention mask hook")
 
@@ -492,6 +569,16 @@ def run(
         raise UnsupportedAttentionBody("attention scale must be static")
     output_type = "cutlass.BFloat16"
     binding_type = ", ".join("cute.Tensor" for _ in range(len(program.loads) + 1))
+    q_access = _attention_access(query_load, "h", loads["attention:q"])
+    q_value_access = _attention_access(
+        query_load, "h", loads["attention:q"], dimension_variable="dd"
+    )
+    k_access = _attention_access(key_load, "kv_head", loads["attention:k"])
+    k_value_access = _attention_access(
+        key_load, "kv_head", loads["attention:k"], dimension_variable="dd"
+    )
+    value_load = next(load for load in program.loads if load.id == "attention:v")
+    v_access = _attention_access(value_load, "kv_head", loads["attention:v"])
     source = f'''import cutlass
 import cutlass.cute as cute
 
@@ -520,16 +607,16 @@ def run(
             for key in cutlass.range({kv_length}):
                 score = cutlass.Float32(0.0)
                 for d in cutlass.range({head_dim}):
-                    score = score + tensor_bindings[{loads['attention:q']}][b, s, h, d].to(cutlass.Float32) * tensor_bindings[{loads['attention:k']}][b, key, kv_head, d].to(cutlass.Float32)
+                    score = score + {q_access}.to(cutlass.Float32) * {k_access}.to(cutlass.Float32)
                 score = score.to(cutlass.BFloat16).to(cutlass.Float32)
                 score = (score * cutlass.Float32({scale!r})).to(cutlass.BFloat16)
                 {mask_code}
                 score = score.to(cutlass.Float32)
-                maximum = maximum if maximum >= score else score
+                maximum = cute.arch.fmax(maximum, score, nan=True)
             for key in cutlass.range({kv_length}):
                 score = cutlass.Float32(0.0)
                 for d in cutlass.range({head_dim}):
-                    score = score + tensor_bindings[{loads['attention:q']}][b, s, h, d].to(cutlass.Float32) * tensor_bindings[{loads['attention:k']}][b, key, kv_head, d].to(cutlass.Float32)
+                    score = score + {q_access}.to(cutlass.Float32) * {k_access}.to(cutlass.Float32)
                 score = score.to(cutlass.BFloat16).to(cutlass.Float32)
                 score = (score * cutlass.Float32({scale!r})).to(cutlass.BFloat16)
                 {mask_code}
@@ -544,14 +631,14 @@ def run(
                 for key in cutlass.range({kv_length}):
                     score = cutlass.Float32(0.0)
                     for dd in cutlass.range({head_dim}):
-                        score = score + tensor_bindings[{loads['attention:q']}][b, s, h, dd].to(cutlass.Float32) * tensor_bindings[{loads['attention:k']}][b, key, kv_head, dd].to(cutlass.Float32)
+                        score = score + {q_value_access}.to(cutlass.Float32) * {k_value_access}.to(cutlass.Float32)
                     score = score.to(cutlass.BFloat16).to(cutlass.Float32)
                     score = (score * cutlass.Float32({scale!r})).to(cutlass.BFloat16)
                     {mask_code}
                     score = score.to(cutlass.Float32)
                     probability = cute.exp(score - maximum)
                     probability = (probability / denominator).to(cutlass.BFloat16).to(cutlass.Float32)
-                    value = value + probability * tensor_bindings[{loads['attention:v']}][b, key, kv_head, d].to(cutlass.Float32)
+                    value = value + probability * {v_access}.to(cutlass.Float32)
                 tensor_bindings[{len(program.loads)}][bh, s, d] = value.to({output_type})
 '''
     return GeneratedAttentionBody(

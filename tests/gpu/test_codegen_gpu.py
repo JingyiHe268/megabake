@@ -113,12 +113,25 @@ def _run_generic(generated, source):
         for iterator in generated.launch.work_iterators
     ]
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    iterator_views = tuple(_view(iterator) for iterator in work_iterators)
+    assert generated.launch.launch_policy == "megabake_cooperative_table"
+    addresses = torch.tensor(
+        [tensor.data_ptr() for tensor in tensors], dtype=torch.int64, device="cuda"
+    )
+    phase_table = torch.tensor(
+        generated.launch.phase_table, dtype=torch.int32, device="cuda"
+    )
     views = [
         _view(ready),
         cutlass.Int32(generated.launch.grid_size),
         cutlass.Int32(0),
-        *(_view(iterator) for iterator in work_iterators),
-        *(_view(tensor) for tensor in tensors),
+        _view(addresses),
+        _view(phase_table),
+        iterator_views,
+        tuple(
+            cutlass.Int64(tensors[slot].data_ptr())
+            for slot in generated.launch.dynamic_slots
+        ),
     ]
     compiled = cute.compile(module.launch, *views, stream)
     compiled(*views, stream)
@@ -237,14 +250,19 @@ def test_generated_g0_kernel_matches_existing_g0_executable(tmp_path):
         dtype=torch.int32,
         device="cuda",
     )
-    views = [
-        _view(ready),
-        cutlass.Int32(generated.launch.grid_size),
-        cutlass.Int32(0),
+    tensor_views = (
         *(_view(tensor) for tensor in (gpu_source, gpu_weight, output, gpu_weight.t())),
         tensor_a,
         tensor_b,
         tensor_c,
+    )
+    views = [
+        _view(ready),
+        cutlass.Int32(generated.launch.grid_size),
+        cutlass.Int32(0),
+        (),
+        tensor_views,
+        ((tensor_a, tensor_b, tensor_c),),
     ]
     compiled = cute.compile(
         module.launch, *views, max_clusters, stream
@@ -293,20 +311,23 @@ def _run_mixed(generated, source, weight, output_shape):
         _view(ready),
         cutlass.Int32(generated.launch.grid_size),
         cutlass.Int32(0),
-        _view(work_iterator),
-        *(
-            _view(tensor)
-            for tensor in (
-                workspace,
-                gpu_source,
-                gpu_weight,
-                output,
-                gpu_weight.t(),
-            )
+        (_view(work_iterator),),
+        (
+            *(
+                _view(tensor)
+                for tensor in (
+                    workspace,
+                    gpu_source,
+                    gpu_weight,
+                    output,
+                    gpu_weight.t(),
+                )
+            ),
+            tensor_a,
+            tensor_b,
+            tensor_c,
         ),
-        tensor_a,
-        tensor_b,
-        tensor_c,
+        ((tensor_a, tensor_b, tensor_c),),
     ]
     compiled = cute.compile(module.launch, *views, max_clusters, stream)
     compiled(*views, stream)

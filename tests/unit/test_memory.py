@@ -120,6 +120,26 @@ def test_assign_storage_adds_worker_barriers_and_descriptors_for_gemm():
     assert plan.launch.dynamic_shared_memory_bytes == plan.storage.worker_scratch_bytes
 
 
+def test_assign_storage_extends_producer_lifetime_through_aliased_reader():
+    class Model(torch.nn.Module):
+        def forward(self, source, weight):
+            projected = source @ weight.T
+            return projected.view(4, 4, 16, 144).relu()
+
+    source = torch.randn(4, 16, 576, dtype=torch.bfloat16)
+    weight = torch.randn(576, 576, dtype=torch.bfloat16)
+    plan = _kernel_plan(Model(), source, weight)
+    verify_plan(plan)
+
+    (producer,) = plan.storage.workspace
+    reader_phase = next(
+        phase.index for phase in plan.phases if phase.region_id == "region:relu"
+    )
+    assert producer.value_id == "value:mm"
+    assert producer.lifetime.reader_region_ids == ("region:relu",)
+    assert producer.lifetime.end_phase == reader_phase + 1
+
+
 def test_workspace_allocator_reuses_nonoverlapping_lifetimes():
     class Model(torch.nn.Module):
         def forward(self, value):
@@ -273,3 +293,45 @@ def test_verify_plan_rejects_incompatible_worker_scratch():
     )
     with pytest.raises(InvalidStorage, match="scratch is undersized"):
         verify_plan(broken)
+
+
+def test_assign_storage_keeps_output_viewed_values_out_of_workspace():
+    class Model(torch.nn.Module):
+        def forward(self, value):
+            first = torch.relu(value)
+            second = torch.neg(first)
+            third = torch.exp(second)
+            return first.view(-1), third
+
+    plan = _kernel_plan(Model(), torch.randn(4, 8))
+    verify_plan(plan)
+
+    assert "value:relu" not in {
+        assignment.value_id for assignment in plan.storage.workspace
+    }
+    assert any(
+        binding.value_id == "value:relu" and binding.kind == "output"
+        for binding in plan.storage.bindings
+    )
+
+
+def test_assign_storage_can_keep_every_intermediate_distinct():
+    class Model(torch.nn.Module):
+        def forward(self, value):
+            first = torch.relu(value)
+            second = torch.neg(first)
+            third = torch.exp(second)
+            return torch.sin(third)
+
+    selection = select_bodies(_graph(Model(), torch.randn(4, 8)), _target())
+    schedule = make_phase_schedule(selection, derive_dependencies(selection))
+    reused = assign_storage(schedule)
+    distinct = assign_storage(schedule, reuse_workspace=False)
+    verify_plan(distinct)
+
+    slices = sorted(
+        (assignment.offset_bytes, assignment.offset_bytes + assignment.size_bytes)
+        for assignment in distinct.storage.workspace
+    )
+    assert all(end <= start for (_, end), (start, _) in zip(slices, slices[1:]))
+    assert distinct.storage.workspace_bytes >= reused.storage.workspace_bytes

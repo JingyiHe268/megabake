@@ -26,6 +26,9 @@ class SelectionPolicy:
     mode: str = "prefill"
     allow_generic: bool = True
     allow_tuned: bool = True
+    # TMA GEMM bodies carry per-phase descriptors as kernel parameters, so
+    # they cannot join the table-driven launch used for large graphs.
+    allow_tma_gemm: bool = True
     numerical_policy: str = "source_semantics"
     require_measured: bool = False
 
@@ -213,7 +216,7 @@ def validate_body_config(
         ("input", config.layouts.inputs),
         ("output", config.layouts.outputs),
     ):
-        if not layouts:
+        if not layouts and label == "output":
             raise InvalidBodyConfig(f"body has no {label} layouts")
         for value_id, layout in layouts.items():
             if not value_id or not layout.dtype:

@@ -49,13 +49,20 @@ def _assert_block_plan(backend):
     assert compiled.resources.body_variant_count < len(compiled.plan.phases)
 
 
+def _inference_call(item):
+    # Grad mode is thread-local, so worker threads must disable it themselves.
+    function, arguments = item
+    with torch.no_grad():
+        return function(*arguments)
+
+
 def _assert_one_kernel(function):
     with torch.profiler.profile(
         activities=[
             torch.profiler.ProfilerActivity.CPU,
             torch.profiler.ProfilerActivity.CUDA,
         ]
-    ) as profiler:
+    ) as profiler, torch.no_grad():
         result = function()
         torch.cuda.synchronize()
     assert len(
@@ -110,12 +117,12 @@ def test_task29_compiles_complete_prefill_block(tmp_path):
         expected = model(*inputs)
         second_actual = optimized(*second_inputs)
         second_expected = model(*second_inputs)
-        optimized.megabake_runtime_state.poison_workspace()
+        backend.megabake_last_callable.megabake_runtime_state.poison_workspace()
         poisoned_actual = optimized(*inputs)
         with ThreadPoolExecutor(max_workers=2) as executor:
             concurrent_results = list(
                 executor.map(
-                    lambda item: item[0](*item[1]),
+                    _inference_call,
                     ((optimized, inputs), (optimized, second_inputs)),
                 )
             )

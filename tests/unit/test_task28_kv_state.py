@@ -218,3 +218,30 @@ def test_task28_normal_torch_compile_frontend_preserves_state_mutation():
     torch.testing.assert_close(inputs[3], expected_inputs[3], rtol=0, atol=0)
     torch.testing.assert_close(inputs[4], expected_inputs[4], rtol=0, atol=0)
     torch.testing.assert_close(inputs[5], expected_inputs[5], rtol=0, atol=0)
+
+
+def test_task28_backend_graph_drops_reinplaced_self_copies():
+    inputs = _inputs(capacity=3)
+    backend = make_backend(mode="decode", compile_kernel=False, cache=False)
+    optimized = torch.compile(
+        StatefulAttention(), backend=backend, fullgraph=True, dynamic=False
+    )
+    with torch.no_grad():
+        optimized(*inputs)
+
+    prepared = backend.megabake_last_prepared
+    self_copies = [
+        node
+        for node in prepared.graph.graph.nodes
+        if node.target is torch.ops.aten.copy_.default
+        and node.args[0] is node.args[1]
+    ]
+    assert self_copies
+    graph = form_regions(
+        canonicalize_semantics(import_fx(prepared.graph, prepared.context))
+    )
+    assert not any(
+        operation.attributes.get("target") == "aten.copy_.default"
+        for operation in graph.ops.values()
+    )
+    _plan(graph)

@@ -938,6 +938,15 @@ def _tile_dependency(
         raise InvalidSchedule(
             f"{consumer_region_id} has no mapped access to {value_id}"
         )
+    if all(not tile.origin for tile in producer_output_tiles):
+        return RegionDependency(
+            producer_region_id,
+            consumer_region_id,
+            value_id,
+            DependencyKind.PRODUCER_TO_CONSUMER,
+            ((),),
+            tuple(sorted(access.output.origin for access in consumer_accesses)),
+        )
 
     producer_origins: set[tuple[int, ...]] = set()
     consumer_tiles: set[tuple[int, ...]] = set()

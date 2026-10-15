@@ -534,6 +534,7 @@ def make_backend(**options: Any) -> Callable[..., Any]:
             backend.megabake_last_compiled = None
             backend.megabake_last_compile_us = None
             backend.megabake_last_trace = None
+            backend.megabake_last_callable = None
             try:
                 compiled = compile_post_grad(
                     prepared,
@@ -570,6 +571,7 @@ def make_backend(**options: Any) -> Callable[..., Any]:
             backend.megabake_last_compiled = compiled.megabake_compiled
             backend.megabake_last_compile_us = forward.megabake_compile_us
             backend.megabake_last_trace = forward.megabake_trace
+            backend.megabake_last_callable = forward
         return forward
 
     backend.megabake_cache = cache

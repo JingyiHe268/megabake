@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Mapping
 
@@ -120,6 +121,10 @@ UnsupportedReductionBody = UnsupportedMapBody
 UnsupportedContractionBody = UnsupportedMapBody
 
 
+_HOISTED_LOADS: ContextVar[Mapping[str, str]] = ContextVar(
+    "megabake_hoisted_loads", default={}
+)
+
 _CUTLASS_TYPES = {
     "torch.bool": "cutlass.Boolean",
     "torch.int8": "cutlass.Int8",
@@ -157,29 +162,49 @@ def emit_map_body(program: TensorProgram, config: BodyConfig) -> GeneratedMapBod
     input_value_ids = tuple(dict.fromkeys(load.value_id for load in program.loads))
     binding_indices = {value_id: index for index, value_id in enumerate(input_value_ids)}
     load_indices = {load.id: binding_indices[load.value_id] for load in program.loads}
-    value = _emit_expression(
-        program.combine, load_indices, axis_coordinates, program.loads
+    # Bind each load once so deep expressions stay within the DSL
+    # preprocessor's recursion limit.
+    hoisted_names = {load.id: f"load_{index}" for index, load in enumerate(program.loads)}
+    index_load_ids = {
+        axis.load_id
+        for load in program.loads
+        for axis in load.axes
+        if isinstance(axis, DataIndex)
+    }
+    ordered_loads = sorted(
+        program.loads, key=lambda load: load.id not in index_load_ids
     )
+    hoisted_lines = ""
+    for load in ordered_loads:
+        if load.id not in index_load_ids:
+            hoisted_lines += _gather_bounds_lines(load, hoisted_names)
+        hoisted_lines += (
+            f"            {hoisted_names[load.id]} = "
+            f"{_load_access(load, load_indices[load.id], program.loads, axis_coordinates).code}\n"
+        )
+    token = _HOISTED_LOADS.set(hoisted_names)
+    try:
+        value = _emit_expression(
+            program.combine, load_indices, axis_coordinates, program.loads
+        )
+    finally:
+        _HOISTED_LOADS.reset(token)
     value = _cast_expression(value, program.store.dtype)
 
     coordinate_lines = _coordinate_lines(program.store.shape, program.store.strides)
     output_coordinates = ", ".join(
         axis_coordinates[domain.axis] for domain in program.iteration_domains
     )
-    if program.source_target == "rope":
-        return _emit_rope_map_body(
-            program,
-            threads,
-            axis_coordinates,
-            coordinate_lines,
-            output_coordinates,
-        )
+    output_index = output_coordinates or "0"
     binding_type = ", ".join(
         "cute.Tensor" for _ in range(len(input_value_ids) + 1)
     )
+    trap_import = (
+        "from cutlass._mlir.dialects import llvm\n" if index_load_ids else ""
+    )
     source = f'''import cutlass
 import cutlass.cute as cute
-
+{trap_import}
 
 @cute.kernel
 def run(
@@ -196,90 +221,8 @@ def run(
     for tile in cutlass.range(block, cute.size(work_iterator), workers):
         linear_index = work_iterator[tile] + thread
         if linear_index < output_count:
-{coordinate_lines}            value = {value.code}
-            output[{output_coordinates}] = value
-'''
-    element_count = 1
-    for size in program.store.shape:
-        element_count *= size
-    tile_count = (element_count + threads - 1) // threads
-    return GeneratedMapBody(
-        source=source,
-        threads_per_cta=threads,
-        tile_elements=threads,
-        tile_count=tile_count,
-    )
-
-
-def _emit_rope_map_body(
-    program: TensorProgram,
-    threads: int,
-    axis_coordinates: Mapping[str, str],
-    coordinate_lines: str,
-    output_coordinates: str,
-) -> GeneratedMapBody:
-    final_axis = program.iteration_domains[-1].axis
-    final_coordinate = axis_coordinates[final_axis]
-    rotary_width = program.loads[3].source_shape[-1] if program.loads[3].source_shape else None
-    if rotary_width is None:
-        domain_sizes = {
-            domain.axis: domain.size for domain in program.iteration_domains
-        }
-        rotary_width = domain_sizes[final_axis]
-    half_width = rotary_width // 2
-    current = _load_access(program.loads[0], 0, program.loads, axis_coordinates)
-    plus = _load_access(program.loads[1], 0, program.loads, axis_coordinates)
-    minus = _load_access(program.loads[2], 0, program.loads, axis_coordinates)
-    cosine = _load_access(program.loads[3], 1, program.loads, axis_coordinates)
-    sine = _load_access(program.loads[4], 2, program.loads, axis_coordinates)
-    output_type = _cutlass_type(program.store.dtype)
-    round_call = (
-        "cvt_f32_bf16"
-        if program.store.dtype == "torch.bfloat16"
-        else "cutlass.Float32"
-    )
-    conversion_import = (
-        "from cutlass.cute.arch.nvvm_wrappers import cvt_f32_bf16\n"
-        if program.store.dtype == "torch.bfloat16"
-        else ""
-    )
-    source = f'''import cutlass
-import cutlass.cute as cute
-{conversion_import}
-
-
-@cute.kernel
-def run(
-    work_iterator: cute.Tensor,
-    tensor_bindings: tuple[cute.Tensor, cute.Tensor, cute.Tensor, cute.Tensor],
-    scratch,
-    epilogue,
-):
-    block, _, _ = cute.arch.block_idx()
-    thread, _, _ = cute.arch.thread_idx()
-    workers, _, _ = cute.arch.grid_dim()
-    output = tensor_bindings[3]
-    output_count = cute.size(output)
-    for tile in cutlass.range(block, cute.size(work_iterator), workers):
-        linear_index = work_iterator[tile] + thread
-        if linear_index < output_count:
-{coordinate_lines}            current_value = {current.code}
-            plus_value = {plus.code}
-            minus_value = {minus.code}
-            cosine_value = {cosine.code}
-            sine_value = {sine.code}
-            value = current_value
-            if {final_coordinate} < {half_width}:
-                left_product = {round_call}(cutlass.Float32(current_value * cosine_value).ir_value())
-                right_product = {round_call}(cutlass.Float32(plus_value * sine_value).ir_value())
-                value = {round_call}(cutlass.Float32(left_product - right_product).ir_value())
-            elif {final_coordinate} < {rotary_width}:
-                left_product = {round_call}(cutlass.Float32(current_value * sine_value).ir_value())
-                right_product = {round_call}(cutlass.Float32(minus_value * cosine_value).ir_value())
-                value = {round_call}(cutlass.Float32(left_product + right_product).ir_value())
-            else:
-                value = current_value
-            output[{output_coordinates}] = {output_type}(value)
+{coordinate_lines}{hoisted_lines}            value = {value.code}
+            output[{output_index}] = value
 '''
     element_count = 1
     for size in program.store.shape:
@@ -493,9 +436,9 @@ def run(
 
 def _validate_map_body(program: TensorProgram, config: BodyConfig) -> None:
     validate_body_config(config)
-    if program.family not in {"elementwise", "copy"}:
+    if program.family not in {"elementwise", "copy", "gather", "concat"}:
         raise UnsupportedMapBody(
-            f"map body generator supports elementwise and copy, not {program.family}"
+            f"map body generator supports elementwise, copy, and gather, not {program.family}"
         )
     if config.semantic.operation_family != program.family:
         raise UnsupportedMapBody("body config and tensor program families differ")
@@ -516,8 +459,8 @@ def _validate_map_body(program: TensorProgram, config: BodyConfig) -> None:
     if config.scratch.owner != "none" or config.scratch.size_bytes != 0:
         raise UnsupportedMapBody("map body does not use scratch")
 
-    if not program.store.shape or any(size <= 0 for size in program.store.shape):
-        raise UnsupportedMapBody("map body requires a nonempty positive-rank output")
+    if any(size <= 0 for size in program.store.shape):
+        raise UnsupportedMapBody("map body requires positive output extents")
     if any(stride < 0 for stride in program.store.strides):
         raise UnsupportedMapBody("negative output strides are not supported")
 
@@ -778,6 +721,9 @@ def _emit_expression(
         load = next(
             candidate for candidate in loads if candidate.id == expression.load_id
         )
+        hoisted = _HOISTED_LOADS.get().get(expression.load_id)
+        if hoisted is not None:
+            return _TypedExpression(hoisted, load.dtype)
         return _load_access(load, index, loads, axis_coordinates)
 
     if isinstance(expression, Constant):
@@ -857,6 +803,24 @@ def _emit_expression(
     raise UnsupportedMapBody(f"unsupported scalar expression {expression!r}")
 
 
+def _gather_bounds_lines(load: Any, hoisted_names: Mapping[str, str]) -> str:
+    # Out-of-range gathers trap inside the workload kernel, matching the
+    # device-side assert of the eager source instead of a per-call host check.
+    lines = ""
+    for position, axis in enumerate(load.axes):
+        if not isinstance(axis, DataIndex) or load.source_shape is None:
+            continue
+        index = hoisted_names[axis.load_id]
+        size = load.source_shape[position]
+        lines += (
+            f"            if {index} < 0:\n"
+            "                llvm.intr_trap()\n"
+            f"            if {index} >= {size}:\n"
+            "                llvm.intr_trap()\n"
+        )
+    return lines
+
+
 def _load_access(
     load: Any,
     index: int,
@@ -871,7 +835,8 @@ def _load_access(
         if load.source_shape is not None and not isinstance(axis, DataIndex):
             size = load.source_shape[len(coordinates) - 1]
             bounds.append(f"0 <= ({coordinate}) < {size}")
-    access = f"tensor_bindings[{index}][{', '.join(coordinates)}]"
+    coordinate_code = ", ".join(coordinates) or "0"
+    access = f"tensor_bindings[{index}][{coordinate_code}]"
     if bounds:
         zero = f"{_cutlass_type(load.dtype)}(0)"
         access = f"({access} if {' and '.join(bounds)} else {zero})"
@@ -913,6 +878,9 @@ def _unary_code(operator: str, operand: _TypedExpression) -> str:
         return f"(({operand.code}) if (({operand.code}) > {zero}) else {zero})"
     if operator == "neg":
         return f"(-({operand.code}))"
+    if operator == "logical_not":
+        false = f"{_cutlass_type(operand.dtype)}(False)"
+        return f"(({operand.code}) == {false})"
     functions = {
         "abs": "cute.abs",
         "sigmoid": "sigmoid",

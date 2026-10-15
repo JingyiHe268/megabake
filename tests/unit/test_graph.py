@@ -242,3 +242,26 @@ def test_graph_verifier_rejects_cycles():
     )
     with pytest.raises(ValueError, match="contains a cycle"):
         verify_compute_graph(graph)
+
+
+def test_import_fx_records_view_storage_offsets():
+    class Model(torch.nn.Module):
+        def forward(self, x):
+            doubled = x * 2
+            return doubled[..., 4:] + doubled[..., :4]
+
+    value = torch.randn(3, 8)
+    exported = torch.export.export(Model(), (value,))
+    prepared = prepare_fx_graph(
+        exported.graph_module,
+        (value,),
+        output_tree_spec=exported.call_spec.out_spec,
+    )
+    graph = import_fx(prepared.graph, prepared.context)
+
+    offsets = {
+        operation.attributes["fx_args"][2]: graph.values[operation.results[0]].storage_offset
+        for operation in graph.ops.values()
+        if operation.attributes.get("target") == "aten.slice.Tensor"
+    }
+    assert offsets == {0: 0, 4: 4}

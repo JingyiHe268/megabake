@@ -62,12 +62,17 @@ def test_emit_cute_deduplicates_equivalent_bodies_and_saves_diagnostics(tmp_path
     ast.parse(generated.source)
     assert generated.source.count("def _body_0(") == 1
     assert generated.source.count("def _body_1(") == 1
-    assert generated.source.count("_body_0(") == 3
-    assert generated.source.count("def _run_variant_0(") == 1
-    assert "if phase_index == 0:" in generated.source
-    assert "elif phase_index == 1:" in generated.source
-    assert generated.source.count("grid_barrier(ready, workers, epoch +") == 2
-    assert "cooperative_worker_loop(" in generated.source
+    # Both reductions share one body and one table-dispatched call site.
+    assert generated.source.count("_body_0(") == 2
+    assert "for phase in cutlass.range(3, unroll=1):" in generated.source
+    assert "variant = phase_table[phase, 0]" in generated.source
+    assert [row[:2] for row in generated.launch.phase_table] == [
+        (0, 1),
+        (0, 1),
+        (1, 0),
+    ]
+    assert generated.launch.phase_table[0][2:] != generated.launch.phase_table[1][2:]
+    assert generated.launch.barrier_epochs == 4
     assert generated.source_path.exists()
     assert generated.source_map_path.exists()
 
@@ -83,7 +88,7 @@ def test_emit_cute_deduplicates_equivalent_bodies_and_saves_diagnostics(tmp_path
     source_lines = generated.source.splitlines()
     for symbol, expected in (
         ("_body_0", "sync_threads"),
-        ("megabake_kernel", "cooperative_worker_loop("),
+        ("megabake_kernel", "grid_barrier(ready, workers, epoch + phase + 1)"),
         ("launch", ".launch("),
     ):
         entry = next(

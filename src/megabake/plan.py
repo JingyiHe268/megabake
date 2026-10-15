@@ -430,8 +430,6 @@ def search_plans(
     from .planner import enumerate_body_selections, make_tile_maps
     from .schedule import derive_dependencies, make_phase_schedule
 
-    selected_policy = policy or SelectionPolicy()
-    selections = enumerate_body_selections(graph, target, selected_policy)
     if budget is None:
         selected_budget = SearchBudget()
     elif isinstance(budget, int):
@@ -440,6 +438,23 @@ def search_plans(
         selected_budget = SearchBudget(max_plans=budget)
     else:
         selected_budget = budget
+
+    selected_policy = policy or SelectionPolicy()
+    selections = enumerate_body_selections(
+        graph, target, selected_policy, max_plans=selected_budget.max_plans
+    )
+    unique_selections: list[BodySelectionPlan] = []
+    seen_selections: set[tuple[Any, ...]] = set()
+    for selection in selections:
+        identity = tuple(
+            (selected.region_id, selected.body.name)
+            for selected in selection.selections
+        )
+        if identity in seen_selections:
+            continue
+        seen_selections.add(identity)
+        unique_selections.append(selection)
+    selections = tuple(unique_selections)
 
     rejections = tuple(
         dict.fromkeys(
