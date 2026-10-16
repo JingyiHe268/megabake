@@ -211,6 +211,10 @@ class AttentionBodyProvider:
 
         if target.architecture != "sm90a" or not target.supports_wgmma:
             return reject("provider targets WGMMA-capable sm90a only")
+        if attention_scratch_rows(kv_length) < 1:
+            return reject(
+                f"a {kv_length}-key FP32 score row exceeds {ATTENTION_SCRATCH_BYTES} scratch bytes"
+            )
         body_name = (
             "attention_stateful_decode_rows"
             if stateful
@@ -243,11 +247,29 @@ def attention_candidates(
     return CandidateSet(tuple(configurations), tuple(rejections))
 
 
+# Each warp owns one query row at a time and keeps that row's FP32 scores in
+# shared scratch; the scratch holds at most this many rows and this many bytes.
+ATTENTION_SCRATCH_ROWS = 16
+ATTENTION_SCRATCH_BYTES = 32 * 1024
+
+
+def attention_scratch_rows(kv_length: int) -> int:
+    return min(ATTENTION_SCRATCH_ROWS, ATTENTION_SCRATCH_BYTES // (kv_length * 4))
+
+
 def _attention_config(region: Region, program: Any, name: str) -> BodyConfig:
     facts = region.semantic_facts
     stateful = region.semantic_facts.get("kv_state") is not None
     threads = 128
-    warp_roles = ("32 independent query-row score, softmax, and value pipelines",) * 4
+    warp_roles = ("one query row at a time: lanes split keys, then head dimensions",) * 4
+    kv_capacity = next(
+        length
+        for load in program.loads
+        if load.id == "attention:k"
+        for length in (_attention_sequence_length(load),)
+        if length is not None
+    )
+    scratch_bytes = attention_scratch_rows(kv_capacity) * kv_capacity * 4
     layouts = {
         load.value_id: TensorLayout(
             load.dtype,
@@ -300,7 +322,9 @@ def _attention_config(region: Region, program: Any, name: str) -> BodyConfig:
         tiles=TileContract(
             cta_shape=(1, 1, next(load.source_shape[3] for load in program.loads if load.id == "attention:q")),
             cluster_shape=(1, 1, 1),
-            work_partition="one query row per thread",
+            work_partition=(
+                "one query row per warp in one CTA" if stateful else "one query row per warp"
+            ),
             mma_family=None,
             reduction_tile=(
                 next(
@@ -330,11 +354,11 @@ def _attention_config(region: Region, program: Any, name: str) -> BodyConfig:
             ),
         ),
         scratch=ScratchContract(
-            owner="none",
-            size_bytes=0,
+            owner="cta",
+            size_bytes=scratch_bytes,
             alignment_bytes=16,
-            initial_state="empty",
-            reuse_rule="no scratch is owned",
+            initial_state="unspecified; each row writes its scores first",
+            reuse_rule="each warp's score row is reused after its sync_warp",
         ),
         completion=CompletionContract(
             outputs_ready=(
@@ -363,7 +387,7 @@ def _attention_config(region: Region, program: Any, name: str) -> BodyConfig:
             ),
             resources={
                 "threads": threads,
-                "shared_bytes": 0,
+                "shared_bytes": scratch_bytes,
                 "registers_per_thread": 48,
                 "active_blocks_per_sm": 10,
             },
@@ -426,6 +450,11 @@ def emit_attention_body(program: Any, config: BodyConfig) -> GeneratedAttentionB
         scale = facts.get("scale")
         if not isinstance(scale, (int, float)):
             raise UnsupportedAttentionBody("attention scale must be static")
+        warps = min(threads // 32, config.scratch.size_bytes // (kv_length * 4))
+        if warps < 1:
+            raise UnsupportedAttentionBody(
+                "stateful attention scratch must hold one score row per warp"
+            )
         binding_type = ", ".join("cute.Tensor" for _ in range(len(program.loads) + 1))
         source = f'''import cutlass
 import cutlass.cute as cute
@@ -448,68 +477,61 @@ def run(
         llvm.intr_trap()
     if current_length + cutlass.Int32(1) > cutlass.Int32({kv_length}):
         llvm.intr_trap()
+    # One CTA owns every query row so the length publish can follow a CTA
+    # barrier. Each of the first {warps} warps takes whole rows: lanes split the
+    # visible keys for scores and the head dimensions for the value sum, and
+    # the row's scores and probabilities stay in that warp's scratch slice.
     for tile in cutlass.range(block, cute.size(work_iterator), workers):
-        row = work_iterator[tile] + thread
-        if row < row_count:
-            bh = row
-            s = 0
-            b = bh // {query_heads}
-            h = bh % {query_heads}
-            kv_head = h // {group_size}
-            maximum = cutlass.Float32(-1.0e30)
-            total = cutlass.Float32(0.0)
-            for key in cutlass.range({kv_length}):
-                score = cutlass.Float32(0.0)
-                if key <= current_length:
-                    for d in cutlass.range({head_dim}):
-                        key_value = tensor_bindings[{loads['attention:new_k']}][b, 0, kv_head, d]
-                        if key < current_length:
-                            key_value = tensor_bindings[{loads['attention:k']}][b, key, kv_head, d]
-                        score = score + tensor_bindings[{loads['attention:q']}][b, s, h, d].to(cutlass.Float32) * key_value.to(cutlass.Float32)
-                    score = score.to(cutlass.BFloat16).to(cutlass.Float32)
-                    score = score * cutlass.Float32({scale!r})
-                else:
-                    score = cutlass.Float32(-1.0e30)
-                maximum = cute.arch.fmax(maximum, score, nan=True)
-            for key in cutlass.range({kv_length}):
-                score = cutlass.Float32(0.0)
-                probability = cutlass.Float32(0.0)
-                if key <= current_length:
-                    for d in cutlass.range({head_dim}):
-                        key_value = tensor_bindings[{loads['attention:new_k']}][b, 0, kv_head, d]
-                        if key < current_length:
-                            key_value = tensor_bindings[{loads['attention:k']}][b, key, kv_head, d]
-                        score = score + tensor_bindings[{loads['attention:q']}][b, s, h, d].to(cutlass.Float32) * key_value.to(cutlass.Float32)
-                    score = score.to(cutlass.BFloat16).to(cutlass.Float32)
-                    score = score * cutlass.Float32({scale!r})
-                    probability = cute.exp(score - maximum)
-                total = total + probability
-            denominator = total
-            if total <= cutlass.Float32(0.0):
-                denominator = cutlass.Float32(1.0)
-            for d in cutlass.range({head_dim}):
-                value = cutlass.Float32(0.0)
-                for key in cutlass.range({kv_length}):
+        warp = thread // 32
+        lane = thread % 32
+        if warp < {warps}:
+            for bh in cutlass.range(warp, row_count, {warps}):
+                s = 0
+                b = bh // {query_heads}
+                h = bh % {query_heads}
+                kv_head = h // {group_size}
+                base = warp * {kv_length}
+                maximum = cutlass.Float32(-1.0e30)
+                for key in cutlass.range(lane, current_length + cutlass.Int32(1), 32):
                     score = cutlass.Float32(0.0)
-                    if key <= current_length:
-                        for dd in cutlass.range({head_dim}):
-                            key_value = tensor_bindings[{loads['attention:new_k']}][b, 0, kv_head, dd]
-                            if key < current_length:
-                                key_value = tensor_bindings[{loads['attention:k']}][b, key, kv_head, dd]
-                            score = score + tensor_bindings[{loads['attention:q']}][b, s, h, dd].to(cutlass.Float32) * key_value.to(cutlass.Float32)
-                        score = score.to(cutlass.BFloat16).to(cutlass.Float32)
-                        score = score * cutlass.Float32({scale!r})
-                        probability = cute.exp(score - maximum)
-                        probability = (probability / denominator).to(cutlass.BFloat16).to(cutlass.Float32)
-                        value_element = tensor_bindings[{loads['attention:new_v']}][b, 0, kv_head, d]
-                        if key < current_length:
-                            value_element = tensor_bindings[{loads['attention:v']}][b, key, kv_head, d]
-                        value = value + probability * value_element.to(cutlass.Float32)
-                tensor_bindings[{len(program.loads)}][bh, s, d] = value.to(cutlass.BFloat16)
-            if h % {group_size} == 0:
-                for d in cutlass.range({head_dim}):
-                    tensor_bindings[{loads['attention:k']}][b, current_length, kv_head, d] = tensor_bindings[{loads['attention:new_k']}][b, 0, kv_head, d]
-                    tensor_bindings[{loads['attention:v']}][b, current_length, kv_head, d] = tensor_bindings[{loads['attention:new_v']}][b, 0, kv_head, d]
+                    if key < current_length:
+                        for d in cutlass.range_constexpr({head_dim}):
+                            score = score + tensor_bindings[{loads['attention:q']}][b, s, h, d].to(cutlass.Float32) * tensor_bindings[{loads['attention:k']}][b, key, kv_head, d].to(cutlass.Float32)
+                    else:
+                        for d in cutlass.range_constexpr({head_dim}):
+                            score = score + tensor_bindings[{loads['attention:q']}][b, s, h, d].to(cutlass.Float32) * tensor_bindings[{loads['attention:new_k']}][b, 0, kv_head, d].to(cutlass.Float32)
+                    score = score.to(cutlass.BFloat16).to(cutlass.Float32)
+                    score = score * cutlass.Float32({scale!r})
+                    scratch[base + key] = score
+                    maximum = cute.arch.fmax(maximum, score, nan=True)
+                maximum = cute.arch.warp_reduction_max(maximum)
+                total = cutlass.Float32(0.0)
+                for key in cutlass.range(lane, current_length + cutlass.Int32(1), 32):
+                    probability = cute.exp(scratch[base + key] - maximum)
+                    scratch[base + key] = probability
+                    total = total + probability
+                total = cute.arch.warp_reduction_sum(total)
+                denominator = total
+                if total <= cutlass.Float32(0.0):
+                    denominator = cutlass.Float32(1.0)
+                for key in cutlass.range(lane, current_length + cutlass.Int32(1), 32):
+                    scratch[base + key] = (scratch[base + key] / denominator).to(cutlass.BFloat16).to(cutlass.Float32)
+                cute.arch.sync_warp()
+                for d in cutlass.range(lane, {head_dim}, 32):
+                    value = cutlass.Float32(0.0)
+                    # Cached keys first, then the new key: the source key order,
+                    # with no per-key branch so the unrolled loads overlap.
+                    for key in cutlass.range(current_length, unroll=8):
+                        value = value + scratch[base + key] * tensor_bindings[{loads['attention:v']}][b, key, kv_head, d].to(cutlass.Float32)
+                    value = value + scratch[base + current_length] * tensor_bindings[{loads['attention:new_v']}][b, 0, kv_head, d].to(cutlass.Float32)
+                    tensor_bindings[{len(program.loads)}][bh, s, d] = value.to(cutlass.BFloat16)
+                # Keys before current_length come from the cache and the new
+                # key from new_k, so appending here cannot race with readers.
+                if h % {group_size} == 0:
+                    for d in cutlass.range(lane, {head_dim}, 32):
+                        tensor_bindings[{loads['attention:k']}][b, current_length, kv_head, d] = tensor_bindings[{loads['attention:new_k']}][b, 0, kv_head, d]
+                        tensor_bindings[{loads['attention:v']}][b, current_length, kv_head, d] = tensor_bindings[{loads['attention:new_v']}][b, 0, kv_head, d]
+                cute.arch.sync_warp()
         cute.arch.sync_threads()
         if thread == 0:
             tensor_bindings[{loads['attention:valid_length']}][0] = current_length + cutlass.Int32(1)
@@ -563,22 +585,19 @@ def run(
 
     threads = config.participants.participating_threads
     row_count = batch * query_heads * query_length
-    tile_count = (row_count + threads - 1) // threads
     scale = facts.get("scale")
     if not isinstance(scale, (int, float)):
         raise UnsupportedAttentionBody("attention scale must be static")
     output_type = "cutlass.BFloat16"
     binding_type = ", ".join("cute.Tensor" for _ in range(len(program.loads) + 1))
     q_access = _attention_access(query_load, "h", loads["attention:q"])
-    q_value_access = _attention_access(
-        query_load, "h", loads["attention:q"], dimension_variable="dd"
-    )
     k_access = _attention_access(key_load, "kv_head", loads["attention:k"])
-    k_value_access = _attention_access(
-        key_load, "kv_head", loads["attention:k"], dimension_variable="dd"
-    )
     value_load = next(load for load in program.loads if load.id == "attention:v")
     v_access = _attention_access(value_load, "kv_head", loads["attention:v"])
+    warps = min(threads // 32, config.scratch.size_bytes // (kv_length * 4))
+    if warps < 1:
+        raise UnsupportedAttentionBody("attention scratch must hold one score row per warp")
+    tile_count = (row_count + warps - 1) // warps
     source = f'''import cutlass
 import cutlass.cute as cute
 
@@ -590,56 +609,56 @@ def run(
     scratch: cute.Tensor,
     epilogue,
 ):
+    # Each CTA tile covers {warps} query rows, one per warp: lanes split the keys
+    # for scores and the head dimensions for the value sum, with the row's
+    # scores and probabilities in that warp's scratch slice. Rounding points
+    # match the captured program; the value sum runs in key order.
     block, _, _ = cute.arch.block_idx()
     thread, _, _ = cute.arch.thread_idx()
     workers, _, _ = cute.arch.grid_dim()
+    warp = thread // 32
+    lane = thread % 32
     row_count = {row_count}
     for tile in cutlass.range(block, cute.size(work_iterator), workers):
-        row = work_iterator[tile] + thread
-        if row < row_count:
-            bh = row // {query_length}
-            s = row % {query_length}
-            b = bh // {query_heads}
-            h = bh % {query_heads}
-            kv_head = h // {group_size}
-            maximum = cutlass.Float32(-1.0e30)
-            total = cutlass.Float32(0.0)
-            for key in cutlass.range({kv_length}):
-                score = cutlass.Float32(0.0)
-                for d in cutlass.range({head_dim}):
-                    score = score + {q_access}.to(cutlass.Float32) * {k_access}.to(cutlass.Float32)
-                score = score.to(cutlass.BFloat16).to(cutlass.Float32)
-                score = (score * cutlass.Float32({scale!r})).to(cutlass.BFloat16)
-                {mask_code}
-                score = score.to(cutlass.Float32)
-                maximum = cute.arch.fmax(maximum, score, nan=True)
-            for key in cutlass.range({kv_length}):
-                score = cutlass.Float32(0.0)
-                for d in cutlass.range({head_dim}):
-                    score = score + {q_access}.to(cutlass.Float32) * {k_access}.to(cutlass.Float32)
-                score = score.to(cutlass.BFloat16).to(cutlass.Float32)
-                score = (score * cutlass.Float32({scale!r})).to(cutlass.BFloat16)
-                {mask_code}
-                score = score.to(cutlass.Float32)
-                probability = cute.exp(score - maximum)
-                total = total + probability
-            denominator = total
-            if total <= cutlass.Float32(0.0):
-                denominator = cutlass.Float32(1.0)
-            for d in cutlass.range({head_dim}):
-                value = cutlass.Float32(0.0)
-                for key in cutlass.range({kv_length}):
+        row = work_iterator[tile] * {warps} + warp
+        if warp < {warps}:
+            if row < row_count:
+                bh = row // {query_length}
+                s = row % {query_length}
+                b = bh // {query_heads}
+                h = bh % {query_heads}
+                kv_head = h // {group_size}
+                base = warp * {kv_length}
+                maximum = cutlass.Float32(-1.0e30)
+                for key in cutlass.range(lane, {kv_length}, 32):
                     score = cutlass.Float32(0.0)
-                    for dd in cutlass.range({head_dim}):
-                        score = score + {q_value_access}.to(cutlass.Float32) * {k_value_access}.to(cutlass.Float32)
+                    for d in cutlass.range_constexpr({head_dim}):
+                        score = score + {q_access}.to(cutlass.Float32) * {k_access}.to(cutlass.Float32)
                     score = score.to(cutlass.BFloat16).to(cutlass.Float32)
                     score = (score * cutlass.Float32({scale!r})).to(cutlass.BFloat16)
                     {mask_code}
                     score = score.to(cutlass.Float32)
-                    probability = cute.exp(score - maximum)
-                    probability = (probability / denominator).to(cutlass.BFloat16).to(cutlass.Float32)
-                    value = value + probability * {v_access}.to(cutlass.Float32)
-                tensor_bindings[{len(program.loads)}][bh, s, d] = value.to({output_type})
+                    scratch[base + key] = score
+                    maximum = cute.arch.fmax(maximum, score, nan=True)
+                maximum = cute.arch.warp_reduction_max(maximum)
+                total = cutlass.Float32(0.0)
+                for key in cutlass.range(lane, {kv_length}, 32):
+                    probability = cute.exp(scratch[base + key] - maximum)
+                    scratch[base + key] = probability
+                    total = total + probability
+                total = cute.arch.warp_reduction_sum(total)
+                denominator = total
+                if total <= cutlass.Float32(0.0):
+                    denominator = cutlass.Float32(1.0)
+                for key in cutlass.range(lane, {kv_length}, 32):
+                    scratch[base + key] = (scratch[base + key] / denominator).to(cutlass.BFloat16).to(cutlass.Float32)
+                cute.arch.sync_warp()
+                for d in cutlass.range(lane, {head_dim}, 32):
+                    value = cutlass.Float32(0.0)
+                    for key in cutlass.range({kv_length}, unroll=8):
+                        value = value + scratch[base + key] * {v_access}.to(cutlass.Float32)
+                    tensor_bindings[{len(program.loads)}][bh, s, d] = value.to({output_type})
+                cute.arch.sync_warp()
 '''
     return GeneratedAttentionBody(
         source=source,

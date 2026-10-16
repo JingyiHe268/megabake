@@ -7,6 +7,7 @@ import torch
 from torch.autograd import DeviceType
 
 from megabake import make_backend
+from megabake.bodies.attention import attention_scratch_rows
 
 
 pytestmark = pytest.mark.skipif(
@@ -134,7 +135,12 @@ def test_task26_compiles_attention_with_partial_rows(tmp_path):
     selection = backend.megabake_last_compiled.plan.selection.selections[0]
     assert selection.body.pipeline.stage_count == 3
     assert "score-maximum" in selection.body.pipeline.drain_rule
-    assert selection.body.scratch.size_bytes == 0
+    # One FP32 score row per warp-owned query row.
+    key_length = selection.body.tiles.reduction_tile[0]
+    assert selection.body.scratch.owner == "cta"
+    assert selection.body.scratch.size_bytes == (
+        attention_scratch_rows(key_length) * key_length * 4
+    )
     resources = backend.megabake_last_compiled.resources
     assert resources.registers_per_thread > 0
     assert resources.active_blocks_per_sm >= 1

@@ -26,9 +26,11 @@ class SelectionPolicy:
     mode: str = "prefill"
     allow_generic: bool = True
     allow_tuned: bool = True
-    # TMA GEMM bodies carry per-phase descriptors as kernel parameters, so
-    # they cannot join the table-driven launch used for large graphs.
     allow_tma_gemm: bool = True
+    # Large graphs use a table-driven launch: tensors come from a device
+    # address table and TMA GEMM descriptors are written per phase in the
+    # kernel prologue, so bodies must share one GEMM shared-memory layout.
+    table_launch: bool = False
     numerical_policy: str = "source_semantics"
     require_measured: bool = False
 

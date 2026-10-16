@@ -519,17 +519,17 @@ def search_plans(
             )
             continue
 
-        worker_variants.append(
-            (
-                selection,
-                tuple(
-                    sorted(
-                        worker_counts,
-                        reverse=selected_policy.mode != "decode",
-                    )
-                ),
-            )
+        counts = tuple(
+            sorted(worker_counts, reverse=selected_policy.mode != "decode")
         )
+        if min(selected_budget.max_plans, selected_budget.max_compilations) < len(counts):
+            # A budget too small to measure every count selects the first one
+            # unmeasured; decode's ascending order then left three quarters of
+            # the GPU idle. Try the full-machine default first.
+            counts = (default_workers,) + tuple(
+                count for count in counts if count != default_workers
+            )
+        worker_variants.append((selection, counts))
 
     worker_search_selections = max(1, selected_budget.max_compilations // 3)
     search_variants = []
