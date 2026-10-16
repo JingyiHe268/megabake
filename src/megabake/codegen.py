@@ -12,6 +12,7 @@ from collections.abc import Mapping, Sequence
 
 from .bodies.gemm import HopperWgmmaGemmPersistentKernel
 from .bodies.attention import emit_attention_body
+from .bodies.blackwell import emit_blackwell_gemm
 from .bodies.generic import (
     emit_contraction_body,
     emit_map_body,
@@ -171,8 +172,8 @@ def emit_cute(
     descriptors as kernel parameters.
     """
     verify_plan(plan)
-    if plan.launch.architecture != "sm90a":
-        raise UnsupportedCodegen("codegen currently supports sm90a plans only")
+    if plan.launch.architecture not in {"sm90a", "sm100", "sm103", "sm120", "sm121"}:
+        raise UnsupportedCodegen("codegen supports SM90 and Blackwell plans only")
 
     if event_schedule is None and (
         table or not any(phase.body.provider == "g0_range" for phase in plan.phases)
@@ -372,6 +373,7 @@ def _emit_generic_module(
         step = (
             1
             if selection.program.family in {"reduction", "attention"}
+            or selection.body.provider == "blackwell_mma"
             else generated.threads_per_cta
         )
         work_iterators.append(
@@ -902,6 +904,7 @@ def _emit_table_module(
                 generated,
                 1
                 if selection.program.family in {"reduction", "attention"}
+                or selection.body.provider == "blackwell_mma"
                 else generated.threads_per_cta,
             )
         ]
@@ -1477,6 +1480,8 @@ def _normalize_generic_selection(
 
 def _generate_device_body(selection: SelectedBody):
     program = selection.program
+    if selection.body.provider == "blackwell_mma":
+        return emit_blackwell_gemm(program, selection.body)
     if program.family in {"elementwise", "copy", "gather", "concat"}:
         return emit_map_body(program, selection.body)
     if program.family == "reduction":

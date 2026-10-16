@@ -18,7 +18,8 @@ from megabake.regions import form_regions
 
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="GEMM range body requires CUDA"
+    not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (9, 0),
+    reason="Hopper WGMMA range body requires SM90"
 )
 
 

@@ -78,11 +78,11 @@ def _target() -> TargetFacts:
 def _schedule():
     class Model(torch.nn.Module):
         def forward(self, value):
-            left = torch.relu(value)
-            right = torch.neg(value)
+            left = value.sum(dim=-1)
+            right = value.amax(dim=-1)
             return left + right
 
-    value = torch.randn(2, 3)
+    value = torch.randn(1, 3)
     exported = torch.export.export(Model(), (value,))
     prepared = prepare_fx_graph(exported.graph_module, (value,))
     graph = form_regions(
@@ -104,6 +104,8 @@ def test_event_runtime_publishes_and_waits_across_ctas():
     device = torch.device("cuda")
     stream = torch.cuda.Stream(device=device)
     schedule = _schedule()
+    assert len(schedule.events) == 2
+    assert all(event.trigger_count == 1 for event in schedule.events)
     events = torch.zeros(len(schedule.events), device=device, dtype=torch.int32)
     with torch.cuda.stream(stream):
         compiled = cute.compile(

@@ -593,7 +593,7 @@ def _can_auto_compile(example_inputs: Sequence[Any]) -> bool:
         capability = torch.cuda.get_device_capability(tensors[0].device)
     except Exception:
         return False
-    return capability == (9, 0)
+    return capability in {(9, 0), (10, 0), (10, 3), (12, 0), (12, 1)}
 
 
 def prepare_fx_graph(

@@ -442,6 +442,7 @@ def _contraction_body_order(
     small_tile = config.tiles.cta_shape[-1] <= 64
     return (
         0 if config.evidence.measured else 1,
+        0 if config.tiles.mma_family else 1,
         0 if small_tile == small_m else 1,
         mode_priority,
         *_body_cost(config),

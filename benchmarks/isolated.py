@@ -1,7 +1,8 @@
 """Time the final kernels in isolation: launch plus device execution only.
 
-Every mode is reduced to a prebuilt launch with fixed tensors, so no Python
-argument binding, dispatcher work, or output allocation is inside a sample.
+Graph replay and megabake_fast use prebuilt launches with fixed tensors.
+megabake_call additionally includes CuTe argument marshalling; megabake_bound
+includes the complete public-call binding and allocation overhead.
 
     eager_graph      CUDA Graph replay of the eager kernels
     inductor_graph   CUDA Graph replay of the torch.compile (Inductor) kernels
@@ -28,7 +29,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from megabake import make_backend
-from megabake.compiler import _input_tensors, _RuntimeState
+from megabake.compiler import _initial_ready, _input_tensors, _RuntimeState
 from benchmarks.measure import kernel_trace
 from benchmarks.workloads import mlp
 
@@ -136,15 +137,13 @@ def _graph_ordered_inputs(compiled, inputs):
     """
     parameters = inspect.signature(mlp).parameters
     positions = {name: index for index, name in enumerate(parameters)}
-    ordered = [None] * len(inputs)
-    for graph_name, tensor in zip(compiled.input_order, inputs, strict=False):
+    ordered = []
+    for graph_name in compiled.input_order:
         name = graph_name.removeprefix("l_").removesuffix("_")
         if name not in positions:
-            raise ValueError(
-                f"cannot map graph input {graph_name!r} to a parameter of mlp"
-            )
-        ordered[positions[name]] = tensor
-    if any(tensor is None for tensor in ordered):
+            raise ValueError(f"cannot map graph input {graph_name!r} to mlp")
+        ordered.append(inputs[positions[name]])
+    if len(ordered) != len(inputs):
         raise ValueError("could not map every graph input to an mlp parameter")
     return tuple(ordered)
 
@@ -160,16 +159,17 @@ class _MegaBakeKernel:
             plan,
             kernel.generated,
             _input_tensors(plan.graph, graph_inputs),
-            ready=kernel.ready,
+            ready=_initial_ready(kernel, inputs[0].device),
+            max_active_clusters=kernel.max_active_clusters,
             work_iterators=kernel.work_iterators,
         )
         self.output = self.state.tensor_for_value(plan.graph.outputs[0])
         self.stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         if kernel.event_schedule is not None:
-            kernel.ready.zero_()
+            self.state.ready.zero_()
             self.stride = 1
         else:
-            kernel.ready.fill_(-1)
+            self.state.ready.fill_(-1)
             self.stride = max(
                 max(
                     (phase.index for phase in plan.phases if phase.barrier is not None),
@@ -272,12 +272,14 @@ def main() -> None:
             inductor_result, reference
         )
 
-        backend = make_backend(scheduler=arguments.scheduler)
+        backend = make_backend(scheduler=arguments.scheduler, compile_kernel=True)
         bound = torch.compile(mlp, backend=backend, fullgraph=True, dynamic=False)
-        bound(*inputs)
+        bound_result = bound(*inputs)
+        bound_error = _relative_l2(bound_result, reference)
+        if not bound_error < 0.01:
+            raise RuntimeError(f"MegaBake relative L2 error {bound_error}")
         compiled = backend.megabake_last_compiled
-        # The bound callable is measured first; the isolated launches below
-        # take over the kernel's epoch state and it must not be called again.
+        # The isolated launcher below owns private buffers and epoch state.
         modes["megabake_bound"] = _measure(
             "megabake_bound",
             lambda _: bound(*inputs),
@@ -286,6 +288,8 @@ def main() -> None:
             traces,
             batch_size,
         )
+
+        modes["megabake_bound"]["relative_l2_error"] = bound_error
 
         graph_inputs = _graph_ordered_inputs(compiled, inputs)
         megabake = _MegaBakeKernel(compiled, inputs, graph_inputs)
@@ -312,6 +316,10 @@ def main() -> None:
         modes["megabake_call"]["relative_l2_error"] = _relative_l2(
             megabake.output, reference
         )
+
+        for name, mode in modes.items():
+            if not mode["relative_l2_error"] < 0.01:
+                raise RuntimeError(f"{name} relative L2 error {mode['relative_l2_error']}")
 
         artifact = root / f"m{batch_size}-megabake-kernel"
         artifact.mkdir(parents=True, exist_ok=True)
