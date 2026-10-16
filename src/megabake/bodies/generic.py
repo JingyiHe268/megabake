@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Mapping
+from math import prod
+from typing import Any, Mapping, Sequence
 
 from ..lowering import (
     AxisAffine,
     AxisIndex,
     DataIndex,
+    IndexedLoad,
     Accumulator,
     Binary,
     Cast,
@@ -150,6 +152,8 @@ _BINARY_SYMBOLS = {
     "gt": ">",
     "ge": ">=",
 }
+_ARITHMETIC = frozenset({"add", "sub", "mul", "div"})
+_HALF_DTYPES = frozenset({"torch.bfloat16", "torch.float16"})
 
 
 def emit_map_body(program: TensorProgram, config: BodyConfig) -> GeneratedMapBody:
@@ -280,6 +284,18 @@ def emit_reduction_body(
     )
     accumulator_type = _cutlass_type(program.accumulator_dtype or "")
     reduction_operator = _ordered_reduction_operator(program.combine)
+    # Output axes that only the post-reduction expression reads (the feature
+    # axis of a norm) share one row reduction: reduce each row once, then let
+    # every thread write that row's outputs.
+    reduced_axes = _expression_axes(program.combine, program.loads)
+    if reduced_axes is not None:
+        reduced_axes |= _expression_axes(program.init, program.loads) or set()
+    row_domains = [
+        domain
+        for domain in output_domains
+        if reduced_axes is None or domain.axis in reduced_axes
+    ]
+    post_domains = [domain for domain in output_domains if domain not in row_domains]
     warp_reduction = (
         "cute.arch.warp_reduction(accumulator, exact_maximum)"
         if reduction_operator == "maximum"
@@ -290,6 +306,21 @@ def emit_reduction_body(
         if reduction_operator == "maximum"
         else "accumulator = accumulator + scratch[block, warp_index]"
     )
+    if post_domains:
+        return _emit_row_reduction_body(
+            program,
+            threads,
+            row_domains,
+            post_domains,
+            axis_coordinates,
+            reduction_coordinate,
+            reduction_domain,
+            input_value_ids,
+            load_indices,
+            accumulator,
+            combine,
+            reduction_operator,
+        )
     source = f'''import cutlass
 import cutlass.cute as cute
 
@@ -340,6 +371,164 @@ def run(
         threads_per_cta=threads,
         reduction_tile=threads,
         tile_count=output_count,
+        scratch_elements=warps,
+    )
+
+
+def _expression_axes(expression: Any, loads: Sequence[IndexedLoad]) -> set[str] | None:
+    """Iteration axes an expression reads; None when an index is data dependent."""
+    by_id = {load.id: load for load in loads}
+    axes: set[str] = set()
+    pending = [expression]
+    while pending:
+        node = pending.pop()
+        if node is None or isinstance(node, (Constant, Accumulator)):
+            continue
+        if isinstance(node, Load):
+            for axis in by_id[node.load_id].axes:
+                if isinstance(axis, str):
+                    axes.add(axis)
+                elif isinstance(axis, AxisAffine):
+                    axes.update(term.axis for term in axis.terms)
+                elif not isinstance(axis, int):
+                    return None
+        elif isinstance(node, AxisIndex):
+            axes.add(node.axis)
+        elif isinstance(node, (Unary, Cast)):
+            pending.append(node.operand)
+        elif isinstance(node, Binary):
+            pending.extend((node.lhs, node.rhs))
+        elif isinstance(node, Where):
+            pending.extend((node.condition, node.true_value, node.false_value))
+        else:
+            return None
+    return axes
+
+
+def _row_major_lines(domains: Sequence[Any], names: Mapping[str, str], value: str, indent: str) -> str:
+    # Each coordinate comes straight from the index; a remainder variable
+    # reassigned once per axis sends the DSL preprocessor into unbounded
+    # recursion at three axes.
+    lines = []
+    stride = 1
+    for domain in reversed(domains):
+        lines.append(f"{indent}{names[domain.axis]} = ({value} // {stride}) % {domain.size}")
+        stride *= domain.size
+    return "\n".join(lines) + "\n"
+
+
+def _emit_row_reduction_body(
+    program: TensorProgram,
+    threads: int,
+    row_domains: Sequence[Any],
+    post_domains: Sequence[Any],
+    axis_coordinates: Mapping[str, str],
+    reduction_coordinate: str,
+    reduction_domain: Any,
+    input_value_ids: Sequence[str],
+    load_indices: Mapping[str, int],
+    accumulator: Any,
+    combine: Any,
+    reduction_operator: str,
+) -> GeneratedReductionBody:
+    warps = threads // 32
+    # Bind each post-reduction load once, as map bodies do: several bounds-
+    # checked loads in one statement inside these loops exceed the DSL
+    # preprocessor's recursion limit.
+    post_load_ids = []
+    pending = [program.post]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, Load):
+            post_load_ids.append(node.load_id)
+        elif isinstance(node, (Unary, Cast)):
+            pending.append(node.operand)
+        elif isinstance(node, Binary):
+            pending.extend((node.lhs, node.rhs))
+        elif isinstance(node, Where):
+            pending.extend((node.condition, node.true_value, node.false_value))
+    hoisted_names = {
+        load_id: f"post_load_{index}"
+        for index, load_id in enumerate(dict.fromkeys(post_load_ids))
+    }
+    load_lines = "".join(
+        f"                {name} = "
+        f"{_load_access(load, load_indices[load.id], program.loads, axis_coordinates).code}\n"
+        for load in program.loads
+        for name in (hoisted_names.get(load.id),)
+        if name is not None
+    )
+    token = _HOISTED_LOADS.set(hoisted_names)
+    try:
+        post = _emit_expression(program.post, load_indices, axis_coordinates, program.loads)
+    finally:
+        _HOISTED_LOADS.reset(token)
+    row_count = prod(domain.size for domain in row_domains)
+    post_count = prod(domain.size for domain in post_domains)
+    output_coordinates = ", ".join(
+        axis_coordinates[domain.axis]
+        for domain in program.iteration_domains
+        if domain.axis not in program.reduction_axes
+    )
+    binding_type = ", ".join("cute.Tensor" for _ in range(len(input_value_ids) + 1))
+    accumulator_type = _cutlass_type(program.accumulator_dtype or "")
+    warp_reduction = (
+        "cute.arch.warp_reduction(accumulator, exact_maximum)"
+        if reduction_operator == "maximum"
+        else "cute.arch.warp_reduction_sum(accumulator)"
+    )
+    merge_partial = (
+        "accumulator = exact_maximum(accumulator, scratch[block, warp_index])"
+        if reduction_operator == "maximum"
+        else "accumulator = accumulator + scratch[block, warp_index]"
+    )
+    source = f'''import cutlass
+import cutlass.cute as cute
+
+
+def exact_maximum(left, right):
+    return cute.arch.fmax(left, right, nan=True)
+
+
+@cute.kernel
+def run(
+    work_iterator: cute.Tensor,
+    tensor_bindings: tuple[{binding_type}],
+    scratch: cute.Tensor,
+    epilogue,
+):
+    # One CTA tile per reduced row: the reduction runs once and every thread
+    # then evaluates the post-reduction expression for that row's outputs.
+    block, _, _ = cute.arch.block_idx()
+    thread, _, _ = cute.arch.thread_idx()
+    workers, _, _ = cute.arch.grid_dim()
+    warp = thread // 32
+    lane = thread % 32
+    warps = {warps}
+    output = tensor_bindings[{len(input_value_ids)}]
+    for tile in cutlass.range(block, cute.size(work_iterator), workers):
+        row_index = work_iterator[tile]
+        if row_index < {row_count}:
+{_row_major_lines(row_domains, axis_coordinates, "row_index", "            ")}            accumulator = {accumulator_type}({accumulator.code})
+            for reduction_index in cutlass.range(thread, {reduction_domain.size}, {threads}):
+                {reduction_coordinate} = reduction_index
+                accumulator = {combine.code}
+            warp_partial = {warp_reduction}
+            if lane == 0:
+                scratch[block, warp] = warp_partial
+            cute.arch.sync_threads()
+            accumulator = {accumulator_type}({accumulator.code})
+            for warp_index in cutlass.range(warps):
+                {merge_partial}
+            for post_index in cutlass.range(thread, {post_count}, {threads}):
+{_row_major_lines(post_domains, axis_coordinates, "post_index", "                ")}{load_lines}                output[{output_coordinates}] = {post.code}
+            cute.arch.sync_threads()
+'''
+    return GeneratedReductionBody(
+        source=source,
+        threads_per_cta=threads,
+        reduction_tile=threads,
+        tile_count=row_count,
         scratch_elements=warps,
     )
 
@@ -770,6 +959,19 @@ def _emit_expression(
                 raise UnsupportedMapBody(
                     f"unsupported binary operator {expression.operator}"
                 )
+            if expression.dtype in _HALF_DTYPES and expression.operator in _ARITHMETIC:
+                # PyTorch computes half-precision arithmetic in float32 and
+                # rounds each result. Doing the same keeps every source
+                # rounding point when operations are fused, where native half
+                # arithmetic could contract a multiply-add and skip one.
+                left = _cast_expression(left, "torch.float32")
+                right = _cast_expression(right, "torch.float32")
+                return _cast_expression(
+                    _TypedExpression(
+                        f"({left.code} {symbol} {right.code})", "torch.float32"
+                    ),
+                    expression.dtype,
+                )
             code = f"({left.code} {symbol} {right.code})"
         return _TypedExpression(code, expression.dtype)
     if isinstance(expression, Where):
@@ -789,8 +991,10 @@ def _emit_expression(
             ),
             expression.dtype,
         )
+        # Parenthesized as a whole: a select nested in a larger expression
+        # must not absorb its neighbours (`a if c else b * x`).
         return _TypedExpression(
-            f"({true_value.code}) if ({condition.code}) else ({false_value.code})",
+            f"(({true_value.code}) if ({condition.code}) else ({false_value.code}))",
             expression.dtype,
         )
     if isinstance(expression, Cast):

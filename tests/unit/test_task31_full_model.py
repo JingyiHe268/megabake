@@ -83,13 +83,18 @@ def test_task31_builds_and_emits_complete_smollm_architecture_plan(tmp_path):
     )
     assert selection.unsupported_regions == ()
     body_names = {selection.body.name for selection in selection.selections}
-    assert {"generic_gather", "generic_concat", "generic_reduction"} <= body_names
+    assert {"generic_gather", "generic_reduction"} <= body_names
+    # Hugging Face's RMSNorm and rotate_half RoPE each fuse into one region;
+    # RoPE absorbs the concat.
+    region_kinds = {selected.region_id.rsplit(":", 1)[-1] for selected in selection.selections}
+    assert {"rms_norm", "rope"} <= region_kinds
 
     plan = assign_storage(
         make_phase_schedule(selection, derive_dependencies(selection))
     )
     verify_plan(plan)
-    assert len(plan.phases) > 80
+    # At least one phase per Q/K/V/O, gate/up/down, and vocabulary projection.
+    assert len(plan.phases) >= 7 * 2 + 1
     assert plan.storage.workspace_bytes > 0
 
     generated = emit_cute(plan, tmp_path)

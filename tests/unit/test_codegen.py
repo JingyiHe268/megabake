@@ -66,8 +66,9 @@ def test_emit_cute_deduplicates_equivalent_bodies_and_saves_diagnostics(tmp_path
     assert generated.source.count("_body_0(") == 2
     assert "for phase in cutlass.range(3, unroll=1):" in generated.source
     assert "variant = phase_table[phase, 0]" in generated.source
+    # The independent reductions share a barrier interval before the join.
     assert [row[:2] for row in generated.launch.phase_table] == [
-        (0, 1),
+        (0, 0),
         (0, 1),
         (1, 0),
     ]

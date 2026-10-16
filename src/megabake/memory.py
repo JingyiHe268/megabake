@@ -502,10 +502,16 @@ def _make_workspace_request(
             key=lambda phase: phase.index,
         )
     )
-    end_phase = producer.index + 1
-    for reader in readers:
-        end_phase = max(end_phase, reader.index + 1)
-    release_phase = readers[-1] if readers else producer
+    last_use = max((reader.index for reader in readers), default=producer.index)
+    last_use = max(last_use, producer.index)
+    # Phases between grid barriers may run concurrently on different CTAs, so
+    # storage is released at the barrier that closes its last use, not after
+    # the using phase.
+    end_index = last_use
+    while end_index + 1 < len(phases) and phases[end_index].barrier is None:
+        end_index += 1
+    end_phase = end_index + 1
+    release_phase = phases[end_index]
     return _WorkspaceRequest(
         storage_id,
         value_id,

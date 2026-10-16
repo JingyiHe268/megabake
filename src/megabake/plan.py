@@ -654,14 +654,23 @@ def search_plans(
         if candidate.status == "measured"
         and candidate.measurement is not None
     )
-    selected = (
-        min(
-            measured,
-            key=lambda candidate: _measurement_rank(candidate.measurement),
+    selected = None
+    if measured:
+        fastest = min(_measurement_rank(candidate.measurement) for candidate in measured)
+        # Plans within measurement noise of the fastest are equivalent; prefer
+        # the one with the fewest phases (fewer barriers and body transitions).
+        close = [
+            candidate
+            for candidate in measured
+            if _measurement_rank(candidate.measurement) <= fastest * (1 + _TIE_TOLERANCE)
+        ]
+        selected = min(
+            close,
+            key=lambda candidate: (
+                len(candidate.plan.phases) if candidate.plan is not None else float("inf"),
+                _measurement_rank(candidate.measurement),
+            ),
         )
-        if measured
-        else None
-    )
     return PlanSearchResult(
         None if selected is None else selected.plan,
         None if selected is None else selected.measurement.compiled,
@@ -680,6 +689,10 @@ def _selection_description(
         for selected in selection.selections
     )
     return f"workers={worker_count};bodies={bodies}"
+
+
+# Relative timing difference treated as measurement noise when ranking plans.
+_TIE_TOLERANCE = 0.05
 
 
 def _measurement_rank(measurement: PlanMeasurement) -> float:

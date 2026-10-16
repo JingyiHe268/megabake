@@ -512,7 +512,7 @@ class HopperWgmmaGemmPersistentKernel:
         )
 
     @cute.jit
-    def run_table(self, prepared, scratch, tma_descs):
+    def run_table(self, prepared, scratch, tma_descs, rotated_block=None):
         """Run one table-launched phase whose TMA descriptors live in global
         memory. ``prepared`` is this variant's ``prepare`` result; the kernel
         prologue has written ``tma_descs`` (A, B, C) for this phase's tensors."""
@@ -544,6 +544,7 @@ class HopperWgmmaGemmPersistentKernel:
             scratch,
             cute.arch.grid_dim(),
             tma_descs,
+            rotated_block,
         )
 
     @cute.kernel
@@ -598,6 +599,7 @@ class HopperWgmmaGemmPersistentKernel:
         scratch,
         schedule_grid_dim,
         tma_descs=None,
+        rotated_block=None,
     ):
         """
         GPU device kernel performing the batched GEMM computation.
@@ -631,6 +633,13 @@ class HopperWgmmaGemmPersistentKernel:
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
+
+        # MegaBake: phases sharing a barrier interval start their tiles on
+        # different CTAs, so the scheduler sees a rotated block index.
+        schedule_block = cute.arch.block_idx()
+        if cutlass.const_expr(rotated_block is not None):
+            block_x, block_y, block_z = schedule_block
+            schedule_block = (block_x, block_y, rotated_block)
 
         # MegaBake: table launches pass per-phase descriptors in global
         # memory; copies then name them through tma_desc_ptr.
@@ -786,7 +795,7 @@ class HopperWgmmaGemmPersistentKernel:
 
         if warp_idx == self.load_warp_id:
             tile_sched = utils.StaticPersistentTileScheduler.create(
-                tile_sched_params, cute.arch.block_idx(), schedule_grid_dim
+                tile_sched_params, schedule_block, schedule_grid_dim
             )
             work_tile = tile_sched.initial_work_tile_info()
 
@@ -857,7 +866,7 @@ class HopperWgmmaGemmPersistentKernel:
                 if warp_idx == self.epi_store_warp_id:
                     cute.nvgpu.cpasync.fence_tma_desc_acquire(desc_c)
             tile_sched = utils.StaticPersistentTileScheduler.create(
-                tile_sched_params, cute.arch.block_idx(), schedule_grid_dim
+                tile_sched_params, schedule_block, schedule_grid_dim
             )
             work_tile = tile_sched.initial_work_tile_info()
 

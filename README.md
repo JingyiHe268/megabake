@@ -28,20 +28,71 @@ The compilation path is:
 
 The design preserves the tuned pipeline inside each body. It starts with ordered phases and refines tile readiness where measurements justify it. The frontend accepts `--mode prefill|decode`, validates the captured state contract, and uses mode-specific bounded search priorities while actual dimensions select the body family. Bounded contiguous one-token decode KV state is supported through an explicit cache contract; broader Hugging Face cache formats remain later work. On an SM90 CUDA device, `make_backend()` compiles supported post-grad graphs into one cooperative CuTe workload kernel and rebinds current inputs and parameters on every call. Pass `compile_kernel=False` to retain the FX reference path for CPU-only capture work.
 
-A complete-model request includes all requested outputs and state updates. Named region matchers enable optimizations. Unfamiliar combinations of supported primitives use generic lowering. Unknown operator semantics or an illegal composition produce an explicit failure. The proposed `fallback=inductor` option can delegate the whole invocation and report that result as external fallback. Strict megakernel compilation defaults to `fallback=error`. These paths are not implemented yet.
+A complete-model request includes all requested outputs and state updates. Named region matchers enable optimizations. Unfamiliar combinations of supported primitives use generic lowering. Unknown operator semantics or an illegal composition produce an explicit failure before any device work. Strict megakernel compilation is the default (`fallback=error`); `fallback=inductor` delegates the whole invocation to Inductor and labels the result `inductor_fallback`.
 
-The first frontend-to-kernel compiler path is implemented for supported SM90 workloads, including complete transformer blocks in prefill and grouped-query stateful decode modes. Complete-model coverage, broader Hugging Face cache formats, and measured optimization work remain open in later TASKS.md steps.
+## Current status
+
+The complete pinned SmolLM-135M checkpoint (`HuggingFaceTB/SmolLM-135M@1d461723`) compiles through the normal backend into one cooperative CuTe kernel in both prefill and stateful decode. The kernel covers the embedding, all 30 layers, the final norm, the tied vocabulary projection, and the KV-cache updates. Bodies by kind:
+
+- **Projections:** every Q/K/V/O, gate/up/down, and vocabulary projection (211 per call) runs the tuned Hopper TMA/WGMMA GEMM body.
+- **Norms and RoPE:** each RMSNorm and each RoPE is fused into one generated region.
+- **Attention:** warp-per-row CuTe bodies.
+- **Everything else:** other elementwise work runs generated generic bodies.
+
+Phases are grouped by dependency level, so independent work shares one grid barrier: 364 barriers per prefill call and 333 per decode call.
+
+Decode logits and all KV caches match eager bf16 exactly over advancing calls. Prefill matches eager exactly after the first call. The first call differs by 1.8% with the same argmax, within the 2% full-model tolerance.
+
+Support is limited to SM90 GPUs, bf16, and models with Llama-style blocks. Decode needs the explicit one-token KV-cache contract (`megabake::kv_attention`), currently captured through the hand-written `StatefulSmolLM` wrapper in `tests/fixtures.py` rather than Hugging Face's own cache classes.
 
 ## Current performance
 
-The compiled MLP is correct and runs as one kernel, but it is 12.5x to 15x slower than CUDA Graph replay. [PERFORMANCE_REPORT.md](PERFORMANCE_REPORT.md) gives the measurements, causes, and ordered fixes. Most of that gap is per-call Python binding, not the kernel and not compilation. `benchmarks/isolated.py` times each mode's final kernels with launch and device execution only; use it to judge the kernel.
+SmolLM-135M on an H200 MIG `3g.71gb` slice (60 SMs), bf16, 40 warm calls each, decode KV capacity 128. Times are medians in milliseconds. "Complete call" is what a caller waits for: host work, launches, and GPU execution. "GPU kernel time" is the sum of kernel durations in one profiled call. The machine is shared, so the eager and Inductor numbers also vary by 5–10% between runs.
 
-On an SM90 device, measure a complete block in either mode:
+| | Prefill, 4 tokens | Decode, 1 token | GPU kernel time (prefill / decode) | Kernels per call | First call (prefill / decode) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Eager | 19.4 | 32.8 | 2.54 / 2.67 | 1,446 / 1,780 | <1 s |
+| `torch.compile` (Inductor) | 7.4 | 13.0 | **1.07 / 1.37** | 512 / 632 | 6 s / 3 s |
+| Inductor with CUDA graphs (`mode="reduce-overhead"`) | **2.0** | n/a* | 1.13 / – | 1 graph | 5 s / 5 s |
+| MegaBake | 3.0 | **3.7** | 1.48 / 2.22 | **1** | 127 s / 79 s |
+
+\* Inductor skips CUDA graphs for decode because the KV caches are mutated inputs, so its decode run is plain Inductor. There is no CUDA-graph decode baseline yet.
+
+What this means:
+
+- **End to end:** MegaBake beats eager and default `torch.compile` in both modes, because one launch replaces 500–1,800.
+- **Against CUDA Graph replay:** prefill is still 1.5x slower (3.0 ms vs 2.0 ms). Two gaps remain, and both have to close:
+  - **GPU work:** 1.48 ms vs 1.13 ms.
+  - **Host work:** MegaBake spends about 1.5 ms outside the kernel per call; CUDA-graph replay spends about 0.9 ms.
+- **GPU kernel time:** MegaBake's kernel takes 1.4x Inductor's kernel time in prefill and 1.6x in decode, down from 2.8–3x. Its decode attention cost still grows with context length.
+- **Compilation** takes 79–127 s per mode.
+
+Where the kernel time goes, from per-phase GPU timestamps. Phases in one barrier interval overlap, so the attribution is approximate.
+
+| Phase type | Prefill | Decode, about 40 cached tokens |
+| --- | ---: | ---: |
+| 211 tuned GEMM phases | 0.77 ms | 0.98 ms |
+| 30 attention phases | 0.14 ms | 0.66 ms |
+| 61 fused RMSNorm reductions | 0.21 ms | 0.21 ms |
+| ~200–300 other elementwise and copy phases | 0.36 ms | 0.34 ms |
+
+The next fixes, in order:
+
+1. Split K, or use stream-K, for GEMMs with fewer output tiles than workers. The K/V projections fill 3 of 60 CTAs, and every GEMM phase pays its pipeline start-up.
+2. Split decode attention across the context, with a softmax merge, so its cost stops growing with the number of cached tokens.
+3. Fuse each residual add into the following norm, and the elementwise work around GEMMs into their epilogues.
+4. Cut per-call host work, and find why prefill compilation grew to 127 s.
+
+[PERFORMANCE_REPORT.md](PERFORMANCE_REPORT.md) has the full-model analysis, the history of each fix, and the earlier MLP report.
+
+Reproduce on an SM90 device:
 
 ```bash
-.venv/bin/python benchmarks/run.py --workload transformer-block --mode prefill
-.venv/bin/python benchmarks/run.py --workload transformer-block --mode decode --sequence 1
+.venv/bin/python benchmarks/full_model.py                               # 40 calls, decode capacity 128; writes artifacts/full_model/report.json
+.venv/bin/python tools/dump_megakernels.py --checkpoint                  # correctness check plus generated source and phase tables
 ```
+
+`benchmarks/run.py --workload mlp|transformer-block` and `benchmarks/isolated.py` measure the smaller fixtures.
 
 ## Current frontend
 
@@ -96,7 +147,7 @@ nvcc --version  # should report release 13.0
 Activate the environment again in new shells with `source .venv/bin/activate`.
 
 ```bash
-.venv/bin/python -m megabake.main transformers \  
+.venv/bin/python -m megabake.main transformers \
   --model-name HuggingFaceTB/SmolLM-135M \
   --device cuda \
   --dump-dir fx_traces/smollm \

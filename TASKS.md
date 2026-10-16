@@ -633,6 +633,29 @@ Graph:  values, ops, regions, inputs, outputs, runtime context
 
 **Evidence:** the 30-layer SmolLM-135M architecture compiles through the normal backend into one table-driven CuTe workload kernel in prefill (1,170 phases) and stateful decode, and so does the pinned checkpoint `HuggingFaceTB/SmolLM-135M@1d461723`, whose tied embedding/vocabulary weight feeds both a gather and a projection. Each compiles in about 100 s on the H200 MIG 3g.71gb slice. The kernel takes one device address table, a phase table, and the per-call boundary addresses; each body variant (46 for 30 layers) is emitted once and dispatched from a dynamic phase loop, following Mirage's task tables. This replaced per-tensor and per-GEMM kernel parameters, which needed 232,431 bytes against CUDA's 32,764-byte limit and took 91 minutes to fail. The TMA GEMM provider is disabled above 1,000 graph operations because its per-phase descriptors are still kernel parameters, so full-model projections run as generic contraction bodies. Accuracy against an fp32 copy matches eager bf16: pinned prefill logits differ from fp32 by 8.17% versus eager's 7.87% (1.57% from eager, identical argmax); 30-layer decode outputs and KV caches stay as close to fp32 as eager's (worst cache layer 1.60% versus 1.62%), with exact valid lengths after four advancing calls. Large table-launched plans therefore use a 2% plan tolerance. The profiler and the call trace both show one recurring CUDA operation per call; the address table is uploaded only when static bindings change. Gather indices and KV capacity are checked by in-kernel traps, replacing per-call host checks. `tools/diff_intermediates.py` compares every intermediate with eager FX execution using distinct workspace (`assign_storage(..., reuse_workspace=False)`). Fixing the GPU path also fixed view storage offsets, GEMM activation views, reinplaced `copy_` self-copies, the stateful decode body, plan search mutating caller KV state, RoPE slice matching, deep map expressions, and graph outputs that viewed reusable workspace. `MEGABAKE_RUN_GPU_TESTS=1 pytest tests/gpu/test_task31_full_model.py` passes all three tests. Not done: TMA GEMMs inside table launches (needs in-kernel descriptor updates, as in CUTLASS grouped GEMM) and any performance comparison, which is step 33.
 
+**Update, 2026-10-16 (`a538d68`):** table launches now run the tuned TMA GEMM.
+- The kernel prologue writes three TMA descriptors per GEMM phase from the address table. Each GEMM shape variant passes one template, using CUTLASS's grouped-GEMM descriptor pattern.
+- All 211 full-model projections use the tuned body, with one 64x64 tile and an eight-stage shared-memory layout.
+- The GEMM body now waits for its TMA stores to complete and fences proxies. It previously returned once shared memory had been read, which the faster barrier exposed as a race.
+- Other changes in the same commit:
+  - a counter-based grid barrier;
+  - full-grid worker selection under a one-compile budget;
+  - warp-per-row prefill and decode attention;
+  - per-call boundary addresses through one host-mapped buffer, with root/offset rebinding.
+- Results: decode output and KV caches match eager exactly, and prefill matches after its first call. The complete call fell from 64 ms to 4.5 ms in prefill and from about 100 ms to 5.2 ms in decode. Both now beat default `torch.compile`, but not Inductor with CUDA graphs. See [PERFORMANCE_REPORT.md](PERFORMANCE_REPORT.md).
+- `tests/gpu/test_table_gemm.py` covers the table GEMM path on a two-layer model, and the task 31 tests assert that every projection uses it.
+- **Round 2 (uncommitted at the time of writing):**
+  - RMSNorm and `rotate_half` RoPE fuse on the real Hugging Face graph.
+  - Reductions with a feature axis reduce each row once.
+  - Phases are grouped by dependency level, with workspace lifetimes ending at barriers.
+  - Concurrent phases start on different CTAs.
+  - Decode attention spreads over CTAs, publishing the KV length after the closing barrier.
+
+  Results: barriers per call fall from about 1,170 to 364 in prefill and 333 in decode; the complete call is 3.0 ms in prefill and 3.7 ms in decode; GPU kernel time is 1.4x Inductor's in prefill and 1.6x in decode. Two-layer intermediates match eager bit for bit. See [PERFORMANCE_REPORT.md](PERFORMANCE_REPORT.md).
+- Two GPU tests fail identically before and after this change, so they are not regressions:
+  - `test_event_runtime_publishes_and_waits_across_ctas` hits an illegal address, and its sticky CUDA error fails every later test in the same session.
+  - `test_phase_runtime_ports_delay_idle_rebinding_and_largest_grid` asserts a barrier count of 2 but admission reports 0.
+
 ## 32. Expose the compiler and a repeatable run command
 
 **Input:** the working full-model compiler.

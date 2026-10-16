@@ -253,6 +253,10 @@ ATTENTION_SCRATCH_ROWS = 16
 ATTENTION_SCRATCH_BYTES = 32 * 1024
 
 
+# Value-sum keys loaded together before accumulation in the decode body.
+_VALUE_BLOCK = 8
+
+
 def attention_scratch_rows(kv_length: int) -> int:
     return min(ATTENTION_SCRATCH_ROWS, ATTENTION_SCRATCH_BYTES // (kv_length * 4))
 
@@ -403,7 +407,17 @@ def _attention_config(region: Region, program: Any, name: str) -> BodyConfig:
     )
 
 
-def emit_attention_body(program: Any, config: BodyConfig) -> GeneratedAttentionBody:
+def emit_attention_body(
+    program: Any, config: BodyConfig, *, defer_length_publish: bool = False
+) -> GeneratedAttentionBody:
+    """Emit an attention device body.
+
+    With ``defer_length_publish`` the stateful decode body leaves the KV
+    valid-length increment to the enclosing kernel, which must perform it after
+    the grid barrier that ends this phase's barrier interval. Its query rows can
+    then spread across CTAs, because no CTA can observe the new length while
+    another is still reading the old one.
+    """
     if program.family != "attention":
         raise UnsupportedAttentionBody("program is not attention")
     facts = config.semantic.access_effects
@@ -441,12 +455,6 @@ def emit_attention_body(program: Any, config: BodyConfig) -> GeneratedAttentionB
             raise UnsupportedAttentionBody("stateful attention supports one-token decode only")
         threads = config.participants.participating_threads
         row_count = batch * query_heads
-        tile_count = (row_count + threads - 1) // threads
-        if tile_count != 1:
-            # One CTA owns every row so the length publish can follow a CTA barrier.
-            raise UnsupportedAttentionBody(
-                "stateful attention requires every query row in one CTA"
-            )
         scale = facts.get("scale")
         if not isinstance(scale, (int, float)):
             raise UnsupportedAttentionBody("attention scale must be static")
@@ -455,7 +463,38 @@ def emit_attention_body(program: Any, config: BodyConfig) -> GeneratedAttentionB
             raise UnsupportedAttentionBody(
                 "stateful attention scratch must hold one score row per warp"
             )
+        if defer_length_publish:
+            # One warp-sized group of rows per CTA tile.
+            tile_count = (row_count + warps - 1) // warps
+            # A single iteration: this warp's row of the tile, if it exists.
+            row_loop = (
+                f"for bh in cutlass.range(cutlass.Int32(work_iterator[tile]) * {warps} + warp, "
+                f"row_count, {warps * row_count}):"
+            )
+            length_publish = ""
+        else:
+            # One CTA owns every row so the length publish can follow a CTA barrier.
+            tile_count = (row_count + threads - 1) // threads
+            if tile_count != 1:
+                raise UnsupportedAttentionBody(
+                    "stateful attention requires every query row in one CTA"
+                )
+            row_loop = f"for bh in cutlass.range(warp, row_count, {warps}):"
+            length_publish = (
+                "        cute.arch.sync_threads()\n"
+                "        if thread == 0:\n"
+                f"            tensor_bindings[{loads['attention:valid_length']}][0] = current_length + cutlass.Int32(1)\n"
+            )
         binding_type = ", ".join("cute.Tensor" for _ in range(len(program.loads) + 1))
+        VALUE_BLOCK = _VALUE_BLOCK
+        value_loads = "\n                        ".join(
+            f"value_{index} = tensor_bindings[{loads['attention:v']}][b, block_start + {index}, kv_head, d]"
+            for index in range(VALUE_BLOCK)
+        )
+        value_sums = "\n                        ".join(
+            f"value = value + scratch[base + block_start + {index}] * value_{index}.to(cutlass.Float32)"
+            for index in range(VALUE_BLOCK)
+        )
         source = f'''import cutlass
 import cutlass.cute as cute
 from cutlass._mlir.dialects import llvm
@@ -477,15 +516,14 @@ def run(
         llvm.intr_trap()
     if current_length + cutlass.Int32(1) > cutlass.Int32({kv_length}):
         llvm.intr_trap()
-    # One CTA owns every query row so the length publish can follow a CTA
-    # barrier. Each of the first {warps} warps takes whole rows: lanes split the
+    # Each of the first {warps} warps takes whole query rows: lanes split the
     # visible keys for scores and the head dimensions for the value sum, and
     # the row's scores and probabilities stay in that warp's scratch slice.
     for tile in cutlass.range(block, cute.size(work_iterator), workers):
         warp = thread // 32
         lane = thread % 32
         if warp < {warps}:
-            for bh in cutlass.range(warp, row_count, {warps}):
+            {row_loop}
                 s = 0
                 b = bh // {query_heads}
                 h = bh % {query_heads}
@@ -519,9 +557,14 @@ def run(
                 cute.arch.sync_warp()
                 for d in cutlass.range(lane, {head_dim}, 32):
                     value = cutlass.Float32(0.0)
-                    # Cached keys first, then the new key: the source key order,
-                    # with no per-key branch so the unrolled loads overlap.
-                    for key in cutlass.range(current_length, unroll=8):
+                    # Cached keys first, then the new key: the source key order.
+                    # Eight loads are issued before they are accumulated, so
+                    # their latencies overlap; the sum order is unchanged.
+                    blocked = current_length - current_length % {VALUE_BLOCK}
+                    for block_start in cutlass.range(0, blocked, {VALUE_BLOCK}):
+                        {value_loads}
+                        {value_sums}
+                    for key in cutlass.range(blocked, current_length):
                         value = value + scratch[base + key] * tensor_bindings[{loads['attention:v']}][b, key, kv_head, d].to(cutlass.Float32)
                     value = value + scratch[base + current_length] * tensor_bindings[{loads['attention:new_v']}][b, 0, kv_head, d].to(cutlass.Float32)
                     tensor_bindings[{len(program.loads)}][bh, s, d] = value.to(cutlass.BFloat16)
@@ -532,10 +575,7 @@ def run(
                         tensor_bindings[{loads['attention:k']}][b, current_length, kv_head, d] = tensor_bindings[{loads['attention:new_k']}][b, 0, kv_head, d]
                         tensor_bindings[{loads['attention:v']}][b, current_length, kv_head, d] = tensor_bindings[{loads['attention:new_v']}][b, 0, kv_head, d]
                 cute.arch.sync_warp()
-        cute.arch.sync_threads()
-        if thread == 0:
-            tensor_bindings[{loads['attention:valid_length']}][0] = current_length + cutlass.Int32(1)
-'''
+{length_publish}'''
         return GeneratedAttentionBody(
             source=source,
             threads_per_cta=threads,

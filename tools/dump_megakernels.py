@@ -122,16 +122,21 @@ def _write_phase_table(path: Path, compiled: Any) -> None:
     launch = compiled.generated.launch
     tensors = launch.tensors
     lines = [
-        "columns: runner_id, barrier_after, then tensor slots for that phase's body calls",
+        "columns: runner_id, barrier_after, cta_offset, kv_length_slot + 1 (0: none), then the tensor slots of the",
+        "phase's body calls (GEMM phases: their row in the GEMM table instead)",
         "",
     ]
     for index, row in enumerate(launch.phase_table):
-        runner, barrier, *slots = row
+        runner, barrier, offset, length_publish, *slots = row
         emission = launch.phases[index] if index < len(launch.phases) else None
         lines.append(
-            f"[{index:4d}] runner={runner} barrier={barrier} "
+            f"[{index:4d}] runner={runner} barrier={barrier} cta_offset={offset} "
+            f"length_publish={length_publish} "
             f"{emission.region_id if emission else ''} raw={list(row)}"
         )
+        if emission is not None and emission.provider == "g0_range":
+            variant, *slots = launch.gemm_table[slots[0]]
+            lines.append(f"        gemm row {row[4]} variant={variant} (A, B, C slots)")
         for slot in slots:
             if slot == 0 and tensors and tensors[0].layout is None:
                 continue

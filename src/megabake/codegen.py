@@ -653,6 +653,10 @@ def megabake_kernel(
         pass
 
     @cute.jit
+    def _cta_sync(epoch: cutlass.Int32):
+        cute.arch.sync_threads()
+
+    @cute.jit
     def _run_terminal(phase_index: cutlass.Int32):
         pass
 
@@ -750,6 +754,28 @@ def _emit_table_module(
     work_iterators: list[WorkIteratorBinding] = []
     phase_records: list[PhaseEmission] = []
     phase_rows: list[tuple[int, ...]] = []
+    # Work tiles per phase, for spreading concurrent phases across CTAs.
+    phase_tiles: list[int] = []
+    # Stateful attention phase -> address slot of its KV valid length.
+    length_publishes: dict[int, int] = {}
+    # Stateful attention phases whose interval ends in a grid barrier that no
+    # other length publish uses.
+    deferred_publishes: set[int] = set()
+    closing_barriers: set[int] = set()
+    for phase in plan.phases:
+        if not selected[phase.region_id].program.state_accesses:
+            continue
+        closing = next(
+            (
+                position
+                for position in range(phase.index, len(plan.phases))
+                if plan.phases[position].barrier is not None
+            ),
+            None,
+        )
+        if closing is not None and closing not in closing_barriers:
+            closing_barriers.add(closing)
+            deferred_publishes.add(phase.index)
     representative_phases: list[Any] = []
     scratch_elements: dict[int, int] = {}
 
@@ -842,12 +868,16 @@ def _emit_table_module(
                         f"            {body_symbol}.run_table(",
                         f"                gemm_values[{gemm_variant}],",
                         "                _gemm_scratch,",
-                        "                table_descriptors(tma_descriptors, phase_table[phase, 2]),",
+                        "                table_descriptors(tma_descriptors, phase_table[phase, 4]),",
+                        "                _rotated,",
                         "            )",
                     ],
                 )
             runner_id = runner_variants[runner_key][0]
-            phase_rows.append((runner_id, int(phase.barrier is not None), gemm_index))
+            phase_rows.append(
+                (runner_id, int(phase.barrier is not None), 0, 0, gemm_index)
+            )
+            phase_tiles.append(len(phase.work_items))
             phase_records.append(
                 PhaseEmission(
                     phase.index,
@@ -863,7 +893,12 @@ def _emit_table_module(
                 )
             )
             continue
-        generated = _generate_device_body(selection)
+        # The table kernel publishes KV valid lengths after the barrier that
+        # ends the attention's interval (see the phase loop below); without
+        # such a barrier the body publishes from a single CTA itself.
+        generated = _generate_device_body(
+            selection, defer_length_publish=phase.index in deferred_publishes
+        )
         if generated.__dataclass_fields__.get("scratch_elements") is not None:
             scratch_elements[phase.index] = generated.scratch_elements
         body_symbol, body_variant_id = body_variant(
@@ -897,6 +932,13 @@ def _emit_table_module(
                 ),
             )
         )
+        if phase.index in deferred_publishes:
+            length_value = next(
+                load.value_id
+                for load in selection.program.loads
+                if load.id == "attention:valid_length"
+            )
+            length_publishes[phase.index] = slots[program_input_ids.index(length_value)]
         calls: list[tuple[str, tuple[int, ...], Any, int]] = [
             (
                 body_symbol,
@@ -990,7 +1032,7 @@ def _emit_table_module(
                     (
                         f"            {symbol}(",
                         f"                work_iterators[{iterator}],",
-                        "                _block,",
+                        "                _rotated,",
                         "                _thread,",
                         "                workers,",
                         f"                ({tensors},),",
@@ -1005,9 +1047,12 @@ def _emit_table_module(
             (
                 runner_id,
                 int(phase.barrier is not None),
+                0,
+                0,
                 *(slot for _, call_slots, _, _ in calls for slot in call_slots),
             )
         )
+        phase_tiles.append(max(call[2].tile_count for call in calls))
         phase_records.append(
             PhaseEmission(
                 phase.index,
@@ -1023,6 +1068,30 @@ def _emit_table_module(
             )
         )
 
+    # Every body starts its tiles at CTA 0. Phases in one barrier interval run
+    # concurrently, so each starts where the previous phase's tiles ended.
+    offset = 0
+    for index, phase in enumerate(plan.phases):
+        if index == 0 or plan.phases[index - 1].barrier is not None:
+            offset = 0
+        row = phase_rows[index]
+        phase_rows[index] = (*row[:2], offset % plan.launch.grid_size, *row[3:])
+        offset += phase_tiles[index]
+    for index, length_slot in length_publishes.items():
+        closing = next(
+            (
+                position
+                for position in range(index, len(plan.phases))
+                if plan.phases[position].barrier is not None
+            ),
+            None,
+        )
+        if closing is None or phase_rows[closing][3] != 0:
+            raise UnsupportedCodegen(
+                f"KV length of phase {index} has no grid barrier of its own to follow"
+            )
+        row = phase_rows[closing]
+        phase_rows[closing] = (*row[:3], length_slot + 1, *row[4:])
     width = max(len(row) for row in phase_rows)
     phase_table = tuple(row + (0,) * (width - len(row)) for row in phase_rows)
     dynamic_slots = tuple(
@@ -1172,7 +1241,7 @@ def _slot(
     layout: cutlass.Constexpr,
     alignment: cutlass.Constexpr,
 ):
-    address = addresses[phase_table[phase, 2 + column]]
+    address = addresses[phase_table[phase, 4 + column]]
     if cutlass.const_expr(dtype is cutlass.Boolean):
         # Boolean tensors are byte-backed, matching DLPack-bound tensors.
         storage = cute.make_tensor(
@@ -1213,9 +1282,28 @@ def megabake_kernel(
 {gemm_prologue}
     for phase in cutlass.range({len(plan.phases)}, unroll=1):
         variant = phase_table[phase, 0]
+        _rotated = (_block + workers - phase_table[phase, 2]) % workers
 {dispatch}
         if phase_table[phase, 1] != 0:
             grid_barrier(ready, workers, epoch + phase + {phase_epoch_offset})
+            # Every reader of this interval's KV valid length has finished.
+            if phase_table[phase, 3] != 0:
+                if _block == 0:
+                    if _thread == 0:
+                        _length = cute.make_tensor(
+                            cute.make_ptr(
+                                cutlass.Int32,
+                                addresses[phase_table[phase, 3] - 1],
+                                cute.AddressSpace.gmem,
+                                assumed_align=4,
+                            ),
+                            cute.make_layout(1),
+                        )
+                        _length[0] = _length[0] + cutlass.Int32(1)
+        else:
+            # Independent phases share a barrier interval; the CTA still
+            # synchronizes before the next body reuses its shared scratch.
+            cute.arch.sync_threads()
 
 
 @cute.jit
@@ -1384,7 +1472,7 @@ def _event_worker_loop(
         workers,
         epoch,
         (
-{("," + chr(10)).join([f"            ({phase.index}, {phase_runner_symbols[phase.index]}, _no_op, {f'_publish_phase_{phase.index}' if phase.barrier is not None else '_ignore_epoch'})" for phase in plan.phases] + [f"            ({len(plan.phases)}, _run_terminal, _no_op, _ignore_epoch)"])}
+{("," + chr(10)).join([f"            ({phase.index}, {phase_runner_symbols[phase.index]}, _no_op, {f'_publish_phase_{phase.index}' if phase.barrier is not None else ('_cta_sync' if phase.index + 1 < len(plan.phases) else '_ignore_epoch')})" for phase in plan.phases] + [f"            ({len(plan.phases)}, _run_terminal, _no_op, _ignore_epoch)"])}
         ),
     )
 '''
@@ -1478,7 +1566,7 @@ def _normalize_generic_selection(
     )
 
 
-def _generate_device_body(selection: SelectedBody):
+def _generate_device_body(selection: SelectedBody, *, defer_length_publish: bool = False):
     program = selection.program
     if selection.body.provider == "blackwell_mma":
         return emit_blackwell_gemm(program, selection.body)
@@ -1489,7 +1577,9 @@ def _generate_device_body(selection: SelectedBody):
     if program.family == "contraction":
         return emit_contraction_body(program, selection.body)
     if program.family == "attention":
-        return emit_attention_body(program, selection.body)
+        return emit_attention_body(
+            program, selection.body, defer_length_publish=defer_length_publish
+        )
     raise UnsupportedCodegen(f"unsupported device body family {program.family}")
 
 

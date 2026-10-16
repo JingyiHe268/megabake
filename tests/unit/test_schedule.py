@@ -66,7 +66,10 @@ def test_phase_schedule_handles_fork_join_and_keeps_idle_workers_in_barriers():
 
     assert len(dependencies.prerequisites_for(join.region_id)) == 2
     assert len(schedule.phases) == 3
-    assert len(schedule.barriers) == 2
+    # The two independent reductions share one barrier interval.
+    assert len(schedule.barriers) == 1
+    assert schedule.phases[0].barrier is None
+    assert schedule.phases[1].barrier is not None
     assert all(
         barrier.participating_workers == tuple(range(schedule.worker_count))
         for barrier in schedule.barriers
@@ -74,7 +77,7 @@ def test_phase_schedule_handles_fork_join_and_keeps_idle_workers_in_barriers():
 
     simulation = simulate_phase_schedule(schedule)
     assert simulation.phase_order.index(join.region_id) == 2
-    assert len(simulation.barrier_order) == 2
+    assert len(simulation.barrier_order) == 1
 
 
 def test_phase_schedule_allows_aliasing_view_without_an_unscheduled_phase():

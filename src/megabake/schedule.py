@@ -294,7 +294,13 @@ def make_phase_schedule(
                 f"dependency names unscheduled consumer {dependency.consumer_region_id}"
             )
 
-    order = _topological_order(selection.selections, dependencies)
+    order, barrier_after = _level_order(
+        _topological_order(selection.selections, dependencies), dependencies
+    )
+    # Plans list bodies in phase order.
+    selection = replace(
+        selection, selections=tuple(selected_by_region[region_id] for region_id in order)
+    )
     tile_maps = {
         tile_map.region_id: tile_map for tile_map in make_tile_maps(selection)
     }
@@ -327,7 +333,7 @@ def make_phase_schedule(
                 f"phase:{phase_index}:grid",
                 tuple(range(worker_count)),
             )
-            if phase_index + 1 < len(order)
+            if barrier_after[phase_index]
             else None
         )
         phases.append(
@@ -361,13 +367,22 @@ def make_phase_schedule(
 
 
 def simulate_phase_schedule(schedule: PhaseSchedule) -> ScheduleSimulation:
+    # Results become visible to other workers only at a grid barrier; phases
+    # in one barrier interval may run concurrently and must be independent.
     completed: set[str] = set()
+    interval: set[str] = set()
     phase_order: list[str] = []
     barrier_order: list[str] = []
     work_counts: dict[str, int] = {}
     idle_counts: dict[str, int] = {}
 
     for index, phase in enumerate(schedule.phases):
+        concurrent = schedule.prerequisites_for(phase.region_id) & interval
+        if concurrent:
+            raise InvalidSchedule(
+                f"phase {phase.index} shares a barrier interval with its prerequisites "
+                f"{sorted(concurrent)}"
+            )
         missing = schedule.prerequisites_for(phase.region_id) - completed
         if missing:
             raise InvalidSchedule(
@@ -392,10 +407,7 @@ def simulate_phase_schedule(schedule: PhaseSchedule) -> ScheduleSimulation:
             raise InvalidSchedule(f"phase {phase.index} has a worker outside its barrier")
 
         is_final = index + 1 == len(schedule.phases)
-        if phase.barrier is None:
-            if not is_final:
-                raise InvalidSchedule(f"phase {phase.index} is missing its grid barrier")
-        else:
+        if phase.barrier is not None:
             if is_final:
                 raise InvalidSchedule("the final phase has an unnecessary barrier")
             if phase.barrier.kind != "grid":
@@ -411,7 +423,10 @@ def simulate_phase_schedule(schedule: PhaseSchedule) -> ScheduleSimulation:
         idle_counts[phase.region_id] = sum(
             not worker.work_items for worker in phase.workers
         )
-        completed.add(phase.region_id)
+        interval.add(phase.region_id)
+        if phase.barrier is not None or is_final:
+            completed |= interval
+            interval = set()
 
     return ScheduleSimulation(
         tuple(phase_order),
@@ -1208,6 +1223,34 @@ def _dependency_plan(
             for region_id, values in prerequisites.items()
         ),
     )
+
+
+def _level_order(
+    order: tuple[str, ...], dependencies: DependencyPlan
+) -> tuple[tuple[str, ...], tuple[bool, ...]]:
+    """Group regions by dependency level and place one grid barrier per level.
+
+    A region's level is one more than its deepest prerequisite (data, state,
+    and storage-order dependencies alike), so regions in one level never
+    depend on each other and can share a barrier interval. Within a level the
+    topological order is kept. This needs the fewest barriers any phase
+    schedule of this graph can have.
+    """
+    position = {region_id: index for index, region_id in enumerate(order)}
+    prerequisites: dict[str, set[str]] = {region_id: set() for region_id in order}
+    for dependency in dependencies.dependencies:
+        prerequisites[dependency.consumer_region_id].add(dependency.producer_region_id)
+    level: dict[str, int] = {}
+    for region_id in order:
+        level[region_id] = 1 + max(
+            (level[producer] for producer in prerequisites[region_id]), default=-1
+        )
+    leveled = tuple(sorted(order, key=lambda region_id: (level[region_id], position[region_id])))
+    barrier_after = tuple(
+        index + 1 < len(leveled) and level[leveled[index]] != level[leveled[index + 1]]
+        for index in range(len(leveled))
+    )
+    return leveled, barrier_after
 
 
 def _topological_order(

@@ -1,4 +1,4 @@
-"""Time the pinned SmolLM-135M checkpoint: eager vs Inductor vs MegaBake.
+"""Time the pinned SmolLM-135M checkpoint: eager, Inductor, Inductor with CUDA graphs, and MegaBake.
 
 Prefill runs a four-token prompt; decode advances a stateful KV cache one
 token per call. Each variant reports the median complete call (host and GPU,
@@ -97,6 +97,10 @@ def bench_prefill(model, args) -> dict:
     variants = {
         "eager": lambda: model,
         "inductor": lambda: torch.compile(model, fullgraph=True, dynamic=False),
+        # CUDA Graph replay through Inductor: the strongest launch-overhead baseline.
+        "inductor_cudagraphs": lambda: torch.compile(
+            model, mode="reduce-overhead", fullgraph=True, dynamic=False
+        ),
         "megabake": lambda: torch.compile(
             model, backend=_megabake("prefill", args.out), fullgraph=True, dynamic=False
         ),
@@ -131,6 +135,9 @@ def bench_decode(model, args) -> dict:
     variants = {
         "eager": lambda: stateful,
         "inductor": lambda: torch.compile(stateful, fullgraph=True, dynamic=False),
+        "inductor_cudagraphs": lambda: torch.compile(
+            stateful, mode="reduce-overhead", fullgraph=True, dynamic=False
+        ),
         "megabake": lambda: torch.compile(
             stateful, backend=_megabake("decode", args.out), fullgraph=True, dynamic=False
         ),

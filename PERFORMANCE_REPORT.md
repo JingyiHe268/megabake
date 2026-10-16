@@ -1,8 +1,101 @@
 # MegaBake performance report
 
-**Date: 2026-10-13. Branch: `v4-impl` at `2d6e1db`. Workload: the gated MLP in `benchmarks/workloads.py`.**
+Two reports, newest first:
 
-This report states how the current one-kernel MLP performs, where the time goes, what is wrong, and what to do next. It supersedes the attribution in [performance_story.md](performance_story.md), which keeps the raw Task 20 tables.
+- **Full model (2026-10-16).** The pinned SmolLM-135M checkpoint compiled into one kernel in prefill and decode.
+- **Gated MLP (2026-10-13), sections 1–10.** The first one-kernel MLP and its attribution.
+
+## Full model, 2026-10-16
+
+**Branch `v4-impl`: `a538d68` (round 1) plus the round-2 working-tree changes below. Model: `HuggingFaceTB/SmolLM-135M@1d461723`, bf16. GPU: H200 MIG `3g.71gb`, 60 SMs, shared with other jobs.** Reproduce with `benchmarks/full_model.py`: medians of 40 warm calls, decode KV capacity 128. Eager and Inductor also vary by 5–10% between runs on this machine.
+
+### Verdict
+
+MegaBake beats eager and default `torch.compile` end to end in both modes. It does **not** yet beat CUDA Graph replay: Inductor with CUDA graphs runs prefill in 2.0 ms against MegaBake's 3.0 ms. MegaBake's kernel now takes 1.4x Inductor's kernel time in prefill and 1.6x in decode, down from 2.8–3x after round 1.
+
+| ms | Prefill, 4 tokens | Decode, 1 token |
+| --- | ---: | ---: |
+| Eager, complete call | 19.4 | 32.8 |
+| Inductor, complete call | 7.4 | 13.0 |
+| Inductor + CUDA graphs, complete call | **2.0** | not available* |
+| MegaBake, complete call | 3.0 | **3.7** |
+| Inductor GPU kernel time | 1.07 | 1.37 |
+| MegaBake GPU kernel time | 1.48 | 2.22 |
+| MegaBake first call (compile) | 127 s | 79 s |
+
+\* `mode="reduce-overhead"` skips CUDA graphs because the 90 KV-cache inputs are mutated, so that run is plain Inductor. The `kv_attention` reference also reads the cache length on the host, which blocks manual graph capture. There is no CUDA-graph decode baseline yet.
+
+Correctness: decode logits and every KV cache match eager exactly across advancing calls. Prefill matches exactly after the first call, which is 1.8% from eager with the same argmax, inside the 2% full-model tolerance. On the two-layer model, every intermediate value matches eager FX execution bit for bit (`tools/diff_intermediates.py --tolerance 0`).
+
+| Complete call, ms | Task 31 | Round 1 | Round 2 |
+| --- | ---: | ---: | ---: |
+| Prefill | 64.2 | 4.5 | 3.0 |
+| Decode | 100.1 | 5.2 | 3.7 |
+
+### Round 1: make the kernel use real bodies (`a538d68`)
+
+Task 31 compiled the model correctly, but the kernel took 52 ms in prefill and about 100 ms in decode. These changes each had a measured cause:
+
+| Change | Cause found | Effect |
+| --- | --- | --- |
+| Tuned TMA GEMM inside table launches (`codegen.py`, `bodies/gemm.py`) | Above 1,000 graph ops every projection fell back to a one-thread-per-output scalar loop with uncoalesced loads | Kernel writes per-phase TMA descriptors in its prologue from the address table; all 211 projections use the tuned body |
+| Counter grid barrier (`runtime.py`) | Block 0 polled every worker's flag serially: 3.8 µs per barrier at 15 workers, 13.3 µs at 60 | About 1.1 µs per barrier at any worker count |
+| Full-grid worker count (`plan.py`) | Decode sorted worker counts ascending and a one-compile budget kept the smallest unmeasured: 15 of 60 SMs | Starts from the full grid when the budget cannot measure every count |
+| Warp-per-row attention (`bodies/attention.py`) | One thread per query head recomputed every Q·K dot product per output dimension over the whole KV capacity: 723 µs per layer in prefill | Prefill about 4.5 µs per layer |
+| Host-mapped per-call addresses and root/offset rebinding (`compiler.py`) | About 1,200 per-call addresses (mostly weights and their views) went through as separate kernel parameters and were re-derived in Python every call: about 10 ms per call | Host overhead about 1.0–1.5 ms per call |
+| TMA store completion and proxy fences (`bodies/gemm.py`) | The GEMM returned once its stores had *read* shared memory, not once the global writes landed; the faster barrier exposed a wrong result | Store warp waits for completion and fences before the grid barrier |
+
+### Round 2: fewer phases, fewer barriers, better spread
+
+After round 1, the kernel ran about 1,170 phases (2.3x Inductor's kernel count), each ending in a grid barrier.
+
+| Change | Cause found | Effect |
+| --- | --- | --- |
+| RMSNorm matcher accepts Hugging Face's order (`regions.py`) | `weight * hidden.to(dtype)` puts the weight multiply after the output cast; the matcher also kept a non-matching "residual" operation, so it never fired on the real model | Each norm is one region instead of 9 phases |
+| `rotate_half` RoPE matcher (`regions.py`) | Only the decomposed `cat(x1·cos − x2·sin, …)` form was matched, not `x·cos + cat(−x2, x1)·sin` | Each RoPE is one region instead of 5 phases |
+| Row-mode reductions (`bodies/generic.py`) | The generic reduction gave each output element its own row reduction: 576x redundant work for a norm | One reduction per row, then all threads write the row |
+| Dependency-level phase schedule (`schedule.py`, `memory.py`) | Every phase ended in a grid barrier, even between independent projections | One barrier per dependency level: 364 per prefill call, 333 per decode call. Workspace lifetimes end at the interval's barrier |
+| CTA rotation (`codegen.py`, `bodies/gemm.py`) | Every body started its tiles on CTA 0, so concurrent phases queued on the same CTAs | Each phase starts where the previous phase in its interval ended |
+| Multi-CTA decode attention with deferred length publish (`bodies/attention.py`, `codegen.py`) | The body ran on one CTA because it published the new KV length itself | Rows spread across CTAs; the length is published after the closing grid barrier |
+
+Round 2 also fixed four bugs that its changes exposed:
+
+- **Missing parentheses.** A select nested in an expression was emitted without enclosing parentheses, so `a if c else b * x` multiplied only one branch.
+- **Contracted half-precision arithmetic.** bf16 and fp16 arithmetic now runs in fp32 with explicit rounding, PyTorch's opmath. Without it, the compiler contracted multiply-add chains and fused RoPE drifted 0.1% from eager.
+- **DSL recursion.** Several bounds-checked loads in one statement crashed the CuTe DSL preprocessor at rank 4. They are now bound as separate statements.
+- **Single-phase attention.** A stateful attention with no closing barrier keeps the single-CTA, self-publishing body.
+
+### Where the kernel time goes
+
+Measured with global-timer stamps at every phase start (decode at about 40 cached tokens). Phases in one barrier interval overlap, so the attribution is approximate:
+
+| Phase type | Prefill | Decode |
+| --- | ---: | ---: |
+| 211 tuned GEMM phases | 0.77 ms | 0.98 ms |
+| 30 attention phases | 0.14 ms | 0.66 ms |
+| 61 fused RMSNorm reductions | 0.21 ms | 0.21 ms |
+| ~200–300 other elementwise and copy phases | 0.36 ms | 0.34 ms |
+
+- **GEMMs** are now the largest item: 3.6–4.6 µs per phase, close to Inductor's entire GPU time. Small-N projections leave most workers idle (K and V fill 3 of 60 CTAs), and every phase pays its pipeline start-up. Weight streaming alone sets a floor near 0.13 ms for the whole model at this slice's bandwidth.
+- **Decode attention** still grows with context. Rows now spread over CTAs, but each row walks every cached key.
+- **Host work** is about 1.5 ms per prefill call and 1.3 ms per decode call. CUDA-graph replay spends about 0.9 ms outside the kernel, including the same Dynamo and Hugging Face wrapper overhead.
+
+### Next steps
+
+1. Split K, or use stream-K, for GEMMs with fewer output tiles than workers, and overlap GEMM pipeline start-up across phases.
+2. Split decode attention across the context, with a softmax merge.
+3. Fuse residual adds into the following norm, and elementwise work into GEMM epilogues.
+4. Cut per-call host work toward CUDA-graph replay's.
+5. Build a decode CUDA-graph baseline, which needs a capture-safe reference attention.
+6. Find why prefill compilation grew from 80 s to 127 s, then bring both modes toward Inductor's 3–6 s.
+
+---
+
+# Gated MLP report, 2026-10-13
+
+**Branch: `v4-impl` at `2d6e1db`. Workload: the gated MLP in `benchmarks/workloads.py`.**
+
+This report states how the one-kernel MLP performed, where the time went, what was wrong, and what to do next. It supersedes the attribution in [performance_story.md](performance_story.md), which keeps the raw Task 20 tables.
 
 All times are microseconds. Each number is marked by where it came from:
 
