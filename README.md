@@ -2,203 +2,155 @@
   <img src="assets/megabake.png" width="200" />
 </p>
 
-# megabake
+# MegaBake
 
-**New here?** Read the [MegaBake launch post](blog/megabake-launch.md) for a quick introduction and an honest snapshot of the project's current state.
+MegaBake turns a captured PyTorch inference workload into a planned, composable CUDA megakernel. PyTorch and Hugging Face keep the model and runtime interface. MegaBake owns region fusion, CuTe DSL device bodies, scheduling, and execution planning.
 
-MegaBake compiles a **supported** `torch.export` graph into a task schedule
-executed by one cooperative CUDA kernel. This reduces per-operator kernel
-launches; it does not eliminate launch, allocation, or host overhead.
+## Design
 
-If the graph contains an unsupported ATen operation, compilation warns and
-`megabake.run()` executes the original PyTorch module eagerly instead. Check
-that warning and the profiler output before treating a measurement as MegaBake
-performance.
+[north-star.md](north-star.md) defines the scope. [ARCHITECTURE.md](ARCHITECTURE.md) defines the proposed compiler. [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) gives the build gates. [RESEARCH.md](RESEARCH.md) records the source review and GPU experiments behind the design.
 
-## How it works
+[TASKS.md](TASKS.md) gives the step-by-step execution plan: get live FX, build the Compute Graph, plan execution, and generate complete CuTe megakernels. Each step names its implementation, inputs, outputs, and checks.
 
-```text
-PyTorch module
-  ↓ torch.export
-FX graph and supported-pattern matching
-  ↓
-Task schedule and reusable device-memory buffers
-  ↓
-Per-SM task queues and dependency tracking
-  ↓
-One cooperative CUDA-kernel launch
-```
+[ELEVATOR_PITCH.md](ELEVATOR_PITCH.md) summarizes the vision, current status, audience value, and contribution asks.
 
-At runtime, blocks process assigned task tiles and signal dependent tasks when
-they finish. Intermediate tensors live in a planned device-memory arena; shared
-memory is used locally by individual kernels where needed. The current runtime
-uses per-SM queues and dependency counters, not a grid-wide barrier after every
-operation.
+[SCHEDULER_REUSE.md](SCHEDULER_REUSE.md) covers operation variants, generic lowering, explicit fallback, and reusable Mirage components with source references.
 
-Matmul tasks use CuTe/CUTLASS-based kernels, including shape-specific paths.
-Performance depends on the workload and GPU; a single kernel does not guarantee
-that every model is faster.
+Mirage is the main reference architecture for lowering, tile/layout planning, storage, and persistent scheduling. Start from its compatible algorithms and tests. Adapt them for the FX contract, CuTe DSL, and measured target requirements.
 
-## Benchmarks
+The compilation path is:
 
-Checked-in synthetic-workload results from
-`benchmarks/results_post_inductor.json`:
+1. Capture the invocation with Dynamo and preserve the PyTorch runtime contract.
+2. Receive live FX after the pinned AOT/Inductor preparation and post-grad passes, before lowering and scheduling.
+3. Recover tensor semantics and source-backed regions with explicit layouts, dependencies, effects, and numerical requirements.
+4. Generate baseline CuTe bodies from supported tensor primitives and add valid tuned candidates. Plan their execution in one persistent kernel where legal.
+5. Check the complete invocation and measure it against the strongest equivalent baseline: `torch.compile` and CUDA Graph replay.
 
-| Workload | MegaBake | `torch.compile` | Speedup | Kernels (MegaBake / `torch.compile`) | MegaBake max abs diff vs eager |
-|----------|---------:|----------------:|--------:|-------------------------------------:|-------------------------------:|
-| `linear_256x512` | 51.5 µs | 55.8 µs | 1.08× | 1 / 1 | 0 |
-| `linear_512x1024` | 65.7 µs | 64.4 µs | 0.98× | 1 / 1 | 0.000977 |
-| `mlp_silu` | 68.2 µs | 103.5 µs | 1.52× | 1 / 3 | 0.000244 |
-| `mlp_gelu` | 59.6 µs | 97.1 µs | 1.63× | 1 / 3 | 0.000366 |
-| `mlp_3layer` | 60.1 µs | 122.3 µs | 2.04× | 1 / 5 | 0.000069 |
-| `rmsnorm_mlp` | 73.3 µs | 108.8 µs | 1.48× | 1 / 4 | 0.000244 |
-| `layernorm_mlp` | 62.9 µs | 111.9 µs | 1.78× | 1 / 4 | 0.000244 |
-| `llama_decoder` | 133.8 µs | 422.3 µs | 3.16× | 1 / 13 | 0.001953 |
+The design preserves the tuned pipeline inside each body. It starts with ordered phases and refines tile readiness where measurements justify it. The frontend accepts `--mode prefill|decode`, validates the captured state contract, and uses mode-specific bounded search priorities while actual dimensions select the body family. Bounded contiguous one-token decode KV state is supported through an explicit cache contract; broader Hugging Face cache formats remain later work. On an SM90 CUDA device, `make_backend()` compiles supported post-grad graphs into one cooperative CuTe workload kernel and rebinds current inputs and parameters on every call. Pass `compile_kernel=False` to retain the FX reference path for CPU-only capture work.
 
-Speedup is `torch.compile` latency divided by MegaBake latency; kernel counts
-are MegaBake / `torch.compile`.
+A complete-model request includes all requested outputs and state updates. Named region matchers enable optimizations. Unfamiliar combinations of supported primitives use generic lowering. Unknown operator semantics or an illegal composition produce an explicit failure before any device work. Strict megakernel compilation is the default (`fallback=error`); `fallback=inductor` delegates the whole invocation to Inductor and labels the result `inductor_fallback`.
 
-The max-difference column compares MegaBake output with eager PyTorch.
-These are median CUDA-event latencies for built-in workloads, with 10 warmups
-and 100 measured iterations, on an NVIDIA H200 MIG 2g.35gb (32 SMs), CUDA 12.4,
-and PyTorch 2.6.0+cu124. Seven of the eight workloads are faster in this
-snapshot; `linear_512x1024` is slightly slower. These results are not full-model
-Hugging Face decode benchmarks.
+## Current status
 
-Run a Hugging Face model benchmark with:
+The complete pinned SmolLM-135M checkpoint (`HuggingFaceTB/SmolLM-135M@1d461723`) compiles through the normal backend into one cooperative CuTe kernel in both prefill and stateful decode. The kernel covers the embedding, all 30 layers, the final norm, the tied vocabulary projection, and the KV-cache updates. Bodies by kind:
 
-```bash
-python benchmarks/test_harness.py HuggingFaceTB/SmolLM2-135M --mode decode --profile
-```
+- **Projections:** every Q/K/V/O, gate/up/down, and vocabulary projection (211 per call) runs the tuned Hopper TMA/WGMMA GEMM body.
+- **Norms and RoPE:** each RMSNorm and each RoPE is fused into one generated region.
+- **Attention:** warp-per-row CuTe bodies.
+- **Everything else:** other elementwise work runs generated generic bodies.
 
-```
-GPU: NVIDIA H200 MIG 3g.71gb  SMs: 60
-Model: SmolLM2-135M (bs=1, seq=1)
+Phases are grouped by dependency level, so independent work shares one grid barrier: 364 barriers per prefill call and 333 per decode call.
 
------------------------------------------------------------------------------------
-Backend          Compile(ms) Latency(us) GPU Kern(us)  Host(us)  Kernels    MaxDiff
------------------------------------------------------------------------------------
-eager                      —     14272.3       1588.5   12683.8      674          —
-torch.compile         4514.2      6024.0       1055.0    4969.0      402   0.632812
-megabake              8042.6      4850.2       4723.5     126.7        1   0.195312
------------------------------------------------------------------------------------
-megabake vs eager:          2.94x  (1 vs 674 kernels)
-megabake vs torch.compile:  1.24x  (1 vs 402 kernels)
-  GPU kernel only:          0.22x  (megakernel 4723us vs TC kernels 1055us)
+Decode logits and all KV caches match eager bf16 exactly over advancing calls. Prefill matches eager exactly after the first call. The first call differs by 1.8% with the same argmax, within the 2% full-model tolerance.
 
-Model weights: 269.0 MB
-Peak HBM bandwidth: 500 GB/s
-Theoretical floor (weights/peak_bw): 538 us
+Support is limited to SM90 GPUs, bf16, and models with Llama-style blocks. Decode needs the explicit one-token KV-cache contract (`megabake::kv_attention`), currently captured through the hand-written `StatefulSmolLM` wrapper in `tests/fixtures.py` rather than Hugging Face's own cache classes.
 
-BW utilization: eager 3.8%, torch.compile 8.9%, megabake 11.1%
+## Current performance
 
-  [eager] Top kernels (total GPU: 1588.5 us):
-    nvjet_sm90_hsh_16x64_64x16_4x1_v_bz_TNN                                  x90       319.9 us ( 20.1%)
-    nvjet_sm90_hsh_32x64_64x16_4x1_v_bz_TNN                                  x60       210.9 us ( 13.3%)
-    nvjet_sm90_hsh_8x64_64x16_4x1_v_bz_TNN                                   x60       179.4 us ( 11.3%)
-    void pytorch_flash::flash_fwd_kernel<Flash_fwd_kernel_traits<64, 12...   x30       179.3 us ( 11.3%)
-    void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_...   x120      176.9 us ( 11.1%)
-    void at::native::unrolled_elementwise_kernel<at::native::direct_cop...   x62       125.2 us (  7.9%)
-    void at::native::reduce_kernel<512, 1, at::native::ReduceOp<float, ...   x61       120.9 us (  7.6%)
-    void at::native::(anonymous namespace)::CatArrayBatchedCopy<at::nat...   x60        91.6 us (  5.8%)
-    void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_...   x61        73.5 us (  4.6%)
-    void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_...   x60        72.2 us (  4.5%)
-    nvjet_sm90_hsh_64x8_64x16_2x1_v_bz_TNT                                   x1         28.7 us (  1.8%)
-    void at::native::(anonymous namespace)::indexSelectSmallIndex<c10::...   x1          1.5 us (  0.1%)
-    void at_cuda_detail::cub::detail::scan::DeviceScanKernel<at_cuda_de...   x1          1.5 us (  0.1%)
-    void at::native::unrolled_elementwise_kernel<at::native::direct_cop...   x1          1.2 us (  0.1%)
-    void at::native::(anonymous namespace)::CatArrayBatchedCopy_vectori...   x1          1.2 us (  0.1%)
-    ... + 5 more                                                             x5          4.5 us
+SmolLM-135M on an H200 MIG `3g.71gb` slice (60 SMs), bf16, 40 warm calls each, decode KV capacity 128. Times are medians in milliseconds. "Complete call" is what a caller waits for: host work, launches, and GPU execution. "GPU kernel time" is the sum of kernel durations in one profiled call. The machine is shared, so the eager and Inductor numbers also vary by 5–10% between runs.
 
-  [torch.compile] Top kernels (total GPU: 1055.0 us):
-    nvjet_sm90_hsh_16x64_64x16_4x1_v_bz_TNN                                  x90       319.7 us ( 30.3%)
-    nvjet_sm90_hsh_32x64_64x16_4x1_v_bz_TNN                                  x60       212.1 us ( 20.1%)
-    nvjet_sm90_hsh_8x64_64x16_4x1_v_bz_TNN                                   x60       179.2 us ( 17.0%)
-    fmha_cutlassF_f16_aligned_64x64_rf_sm80(PyTorchMemEffAttention::Att...   x30       155.8 us ( 14.8%)
-    triton_poi_fused__scaled_dot_product_efficient_attention__to_copy__...   x30        29.9 us (  2.8%)
-    nvjet_sm90_hsh_64x8_64x16_2x1_v_bz_TNT                                   x1         27.1 us (  2.6%)
-    triton_poi_fused__unsafe_view_mul_silu_7                                 x30        25.7 us (  2.4%)
-    triton_poi_fused__scaled_dot_product_efficient_attention__to_copy__...   x30        23.1 us (  2.2%)
-    triton_per_fused__to_copy__unsafe_view_add_mean_mul_pow_rsqrt_11         x14        17.7 us (  1.7%)
-    triton_per_fused__to_copy__unsafe_view_add_mean_mul_pow_rsqrt_12         x14        17.4 us (  1.6%)
-    triton_per_fused__to_copy__unsafe_view_add_mean_mul_pow_rsqrt_13         x14        17.4 us (  1.6%)
-    triton_per_fused__to_copy__unsafe_view_add_mean_mul_pow_rsqrt_10         x14        16.5 us (  1.6%)
-    triton_poi_fused__scaled_dot_product_efficient_attention__to_copy__...   x7          5.0 us (  0.5%)
-    triton_per_fused__to_copy__unsafe_view_add_embedding_mean_mul_pow_r...   x1          1.5 us (  0.1%)
-    triton_per_fused__to_copy__unsafe_view_add_embedding_mean_mul_pow_r...   x1          1.4 us (  0.1%)
-    ... + 6 more                                                             x6          5.7 us
+| | Prefill, 4 tokens | Decode, 1 token | GPU kernel time (prefill / decode) | Kernels per call | First call (prefill / decode) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Eager | 19.4 | 32.8 | 2.54 / 2.67 | 1,446 / 1,780 | <1 s |
+| `torch.compile` (Inductor) | 7.4 | 13.0 | **1.07 / 1.37** | 512 / 632 | 6 s / 3 s |
+| Inductor with CUDA graphs (`mode="reduce-overhead"`) | **2.0** | n/a* | 1.13 / – | 1 graph | 5 s / 5 s |
+| MegaBake | 3.0 | **3.7** | 1.48 / 2.22 | **1** | 127 s / 79 s |
 
-  [megabake] Top kernels (total GPU: 4723.5 us):
-    megakernel                                                               x1       4723.5 us (100.0%)
-```
+\* Inductor skips CUDA graphs for decode because the KV caches are mutated inputs, so its decode run is plain Inductor. There is no CUDA-graph decode baseline yet.
 
-The harness reports latency, kernel count, and max absolute difference. If it
-reports unsupported ATen ops, the measured MegaBake call is eager fallback,
-not a megakernel run.
+What this means:
 
-## Quick start
+- **End to end:** MegaBake beats eager and default `torch.compile` in both modes, because one launch replaces 500–1,800.
+- **Against CUDA Graph replay:** prefill is still 1.5x slower (3.0 ms vs 2.0 ms). Two gaps remain, and both have to close:
+  - **GPU work:** 1.48 ms vs 1.13 ms.
+  - **Host work:** MegaBake spends about 1.5 ms outside the kernel per call; CUDA-graph replay spends about 0.9 ms.
+- **GPU kernel time:** MegaBake's kernel takes 1.4x Inductor's kernel time in prefill and 1.6x in decode, down from 2.8–3x. Its decode attention cost still grows with context length.
+- **Compilation** takes 79–127 s per mode.
+
+Where the kernel time goes, from per-phase GPU timestamps. Phases in one barrier interval overlap, so the attribution is approximate.
+
+| Phase type | Prefill | Decode, about 40 cached tokens |
+| --- | ---: | ---: |
+| 211 tuned GEMM phases | 0.77 ms | 0.98 ms |
+| 30 attention phases | 0.14 ms | 0.66 ms |
+| 61 fused RMSNorm reductions | 0.21 ms | 0.21 ms |
+| ~200–300 other elementwise and copy phases | 0.36 ms | 0.34 ms |
+
+The next fixes, in order:
+
+1. Split K, or use stream-K, for GEMMs with fewer output tiles than workers. The K/V projections fill 3 of 60 CTAs, and every GEMM phase pays its pipeline start-up.
+2. Split decode attention across the context, with a softmax merge, so its cost stops growing with the number of cached tokens.
+3. Fuse each residual add into the following norm, and the elementwise work around GEMMs into their epilogues.
+4. Cut per-call host work, and find why prefill compilation grew to 127 s.
+
+[PERFORMANCE_REPORT.md](PERFORMANCE_REPORT.md) has the full-model analysis, the history of each fix, and the earlier MLP report.
+
+Reproduce on an SM90 device:
 
 ```bash
-git clone https://github.com/megabake/megabake.git
-cd megabake
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+.venv/bin/python benchmarks/full_model.py                               # 40 calls, decode capacity 128; writes artifacts/full_model/report.json
+.venv/bin/python tools/dump_megakernels.py --checkpoint                  # correctness check plus generated source and phase tables
 ```
 
-Requires Python 3.10+, an NVIDIA GPU, and CUDA Toolkit with `nvcc`.
-`requirements.txt` pins PyTorch 2.6.0+cu124 and installs CUTLASS/CuTe headers.
-To use a separate CUTLASS checkout, set `CUTLASS_PATH` before starting Python:
+`benchmarks/run.py --workload mlp|transformer-block` and `benchmarks/isolated.py` measure the smaller fixtures.
 
-```bash
-export CUTLASS_PATH=/path/to/cutlass
-```
+## Current frontend
+
+The Dynamo backend runs the pinned AOT, pre-grad, and post-grad FX transformations, retains the result as an FX `GraphModule`, and compiles it on SM90 when the complete plan is supported. It does not invoke Inductor lowering or code generation. It preserves the PyTorch wrappers around arguments, outputs, aliases, and mutations, and separates its capture cache from compiled-plan reuse.
 
 ```python
 import torch
 import megabake
 
-model = MyModel().half().cuda()
-x = torch.randn(4, 512, dtype=torch.float16, device="cuda")
-
-compiled = megabake.compile(model, x)
-output = megabake.run(compiled, model, x)
+model = model.eval()
+compiled = torch.compile(model, backend=megabake.make_backend(), fullgraph=True)
+with torch.no_grad():
+    output = compiled(example_input)
 ```
 
-## Benchmark commands
+The development CLI also exercises the capture path. CPU commands use the reference forward; CUDA commands follow the same backend policy and require a supported graph:
 
 ```bash
-python benchmarks/bench_compare.py
-python benchmarks/bench_compare.py --models mlp_silu,llama_decoder
+python src/main.py demo --device cpu
+python src/main.py transformers --model-name HuggingFaceTB/SmolLM-135M
+python src/main.py export --callable module:callable --arg '[[1.0, 2.0]]'
 ```
 
-For per-task cycle diagnostics on a supported graph:
+## Environment setup
+
+The checked-in requirements target Python 3.13, PyTorch with CUDA 13.0, and CuTe DSL's CUDA 13 package. Use an NVIDIA GPU and driver supported by that PyTorch wheel. Kernel compilation needs the CUDA 13.0 development toolkit and its `nvcc`; installing Python requirements does not install `nvcc`. The CUDA version reported by `nvidia-smi` describes driver support, not the installed compiler toolkit.
+
+From the repository root, create and activate a virtual environment, then install the project and its pinned direct dependencies:
 
 ```bash
-python benchmarks/test_harness.py llama_decoder --task-profile
+python3.13 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-The profiler reports per-task cycle statistics and saves JSON under
-`benchmarks/baselines/`. This is diagnostic instrumentation, not a latency
-benchmark; unsupported graphs fall back to eager execution.
-
-## Run tests
+Point `CUDA_HOME` at the CUDA 13.0 toolkit before compiling kernels, especially if `/usr/local/cuda` selects another version:
 
 ```bash
-pytest
-pytest tests/test_tasks/
-pytest tests/test_e2e/
+export CUDA_HOME=/path/to/cuda-13.0
+export PATH="$CUDA_HOME/bin:$PATH"
 ```
 
-## Coverage
+Check the selected Python, PyTorch CUDA build, GPU visibility, and CUDA compiler:
 
-The compiler supports a subset of ATen operations, including common matrix
-multiplication, attention, elementwise, reduction/normalization, embedding,
-indexing, copy, and shape operations. Support depends on the graph and tensor
-metadata; one unsupported operation causes the whole call to fall back to
-eager PyTorch. Partial graph acceleration is not implemented.
+```bash
+python --version
+python -c 'import torch; print("torch:", torch.__version__); print("CUDA runtime:", torch.version.cuda); print("GPU available:", torch.cuda.is_available())'
+nvcc --version  # should report release 13.0
+```
 
-## License
+Activate the environment again in new shells with `source .venv/bin/activate`.
 
-MIT License ([LICENSE-MIT](LICENSE-MIT)).
+```bash
+.venv/bin/python -m megabake.main transformers \
+  --model-name HuggingFaceTB/SmolLM-135M \
+  --device cuda \
+  --dump-dir fx_traces/smollm \
+  --dump-compute-graph \
+  --dump-lowering-graph
+```

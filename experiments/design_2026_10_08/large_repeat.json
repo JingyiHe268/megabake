@@ -1,0 +1,285 @@
+{
+  "torch": "2.14.0+cu130",
+  "torch_git": "08187d9e0fba026dc8217405802ab5381dc88d90",
+  "cuda_runtime": "13.0",
+  "cute": "4.8.0",
+  "gpu": "_CudaDeviceProperties(name='NVIDIA H200 MIG 3g.71gb', major=9, minor=0, total_memory=71424MB, multi_processor_count=60, uuid=de3ecfb1-ba9b-9ed1-49f3-5010912e5f4c, pci_bus_id=203, pci_device_id=0, pci_domain_id=0, L2_cache_size=29MB)",
+  "cutlass_revision": "0b55a2f691d69981583568fd9eb69687b1f0de8a",
+  "source_sha256": {
+    "dense_gemm.py": "bb7b76d893219757e2f3701abf1a7c8c819b9966e38aaed30a768596a55aca9f",
+    "dense_gemm_persistent.py": "65088a1fd7655ed46ad54fecd08e1461a334fb38f1b2d1da7cf252e465afc130"
+  },
+  "seed": 123,
+  "validation_only": false,
+  "precision": "BF16 inputs/output, FP32 accumulation; reduced precision reduction disabled",
+  "timing": "CUDA event batch averages, CUDA Graph replay; no Python gaps; no host latency claim",
+  "cache": "repeated same buffers",
+  "records": [
+    {
+      "m": 1024,
+      "n": 11008,
+      "k": 4096,
+      "provider": "torch_mm",
+      "tile": null,
+      "weight_buffers": 1,
+      "setup_seconds": 2.4009495973587036e-06,
+      "max_abs_error": 2.0,
+      "relative_l2_error": 0.00014997135440353304,
+      "median_us": 232.71049559116364,
+      "batch_mean_us": [
+        233.4890067577362,
+        232.7360063791275,
+        232.68650472164154,
+        232.681006193161,
+        232.6660007238388,
+        232.65600204467773,
+        232.70049691200256,
+        232.71049559116364,
+        232.77249932289124,
+        233.03599655628204,
+        233.0384999513626
+      ],
+      "status": "passed_diagnostic"
+    },
+    {
+      "m": 1024,
+      "n": 11008,
+      "k": 4096,
+      "provider": "dense",
+      "tile": [
+        64,
+        256
+      ],
+      "weight_buffers": 1,
+      "threads": 128,
+      "stages": 5,
+      "shared_storage_bytes": 205824,
+      "kernels": [
+        {
+          "name": "kernel_cutlass_kernel_dense_gemmHopperWgmmaGemmKernel_object_at__CopyAtom_ThrID10_TVLayoutSrc1409601_TVLayoutDst1409601_Valuetypebf16_tensor000o111012_CopyAtom_ThrID10_TVLayoutSrc11638401_0",
+          "registers": 154,
+          "local_bytes": 0,
+          "resident_blocks_per_sm": 1
+        }
+      ],
+      "setup_seconds": 0.5189690329134464,
+      "max_abs_error": 2.0,
+      "relative_l2_error": 0.00014997135440353304,
+      "median_us": 271.98898792266846,
+      "batch_mean_us": [
+        271.98898792266846,
+        274.19498562812805,
+        272.0569968223572,
+        271.3730037212372,
+        270.735502243042,
+        273.3894884586334,
+        272.5600004196167,
+        270.13298869132996,
+        273.0799913406372,
+        271.2650001049042,
+        271.7064917087555
+      ],
+      "status": "passed_diagnostic"
+    },
+    {
+      "m": 1024,
+      "n": 11008,
+      "k": 4096,
+      "provider": "persistent",
+      "tile": [
+        64,
+        256
+      ],
+      "weight_buffers": 1,
+      "threads": 256,
+      "stages": 5,
+      "shared_storage_bytes": 222208,
+      "kernels": [
+        {
+          "name": "kernel_cutlass_kernel_dense_gemm_persistentHopperWgmmaGemmPersistentKernel_object_at__CopyAtom_ThrID10_TVLayoutSrc1409601_TVLayoutDst1409601_Valuetypebf16_tensor000o111012_CopyAtom_ThrID1_0",
+          "registers": 232,
+          "local_bytes": 0,
+          "resident_blocks_per_sm": 1
+        }
+      ],
+      "setup_seconds": 0.829598056152463,
+      "max_abs_error": 2.0,
+      "relative_l2_error": 0.00014997135440353304,
+      "median_us": 299.0865111351013,
+      "batch_mean_us": [
+        309.1669976711273,
+        305.1280081272125,
+        306.4655065536499,
+        294.22199726104736,
+        294.2905128002167,
+        298.69601130485535,
+        305.15098571777344,
+        299.67200756073,
+        299.0865111351013,
+        296.7889904975891,
+        297.77950048446655
+      ],
+      "status": "passed_diagnostic"
+    },
+    {
+      "m": 1024,
+      "n": 11008,
+      "k": 4096,
+      "provider": "restart",
+      "tile": [
+        64,
+        256
+      ],
+      "weight_buffers": 1,
+      "threads": 128,
+      "stages": 5,
+      "shared_storage_bytes": 205824,
+      "kernels": [
+        {
+          "name": "kernel_cutlass_kernel_dense_gemm_restartHopperWgmmaGemmKernel_object_at__CopyAtom_ThrID10_TVLayoutSrc1409601_TVLayoutDst1409601_Valuetypebf16_tensor000o111012_CopyAtom_ThrID10_TVLayoutSrc_0",
+          "registers": 154,
+          "local_bytes": 0,
+          "resident_blocks_per_sm": 1
+        }
+      ],
+      "setup_seconds": 0.5170625392347574,
+      "max_abs_error": 2.0,
+      "relative_l2_error": 0.00014997135440353304,
+      "median_us": 380.03799319267273,
+      "batch_mean_us": [
+        382.1605145931244,
+        380.7080090045929,
+        381.3984990119934,
+        380.91251254081726,
+        379.2304992675781,
+        376.3344883918762,
+        379.4015049934387,
+        380.03799319267273,
+        378.27950716018677,
+        380.11500239372253,
+        378.39698791503906
+      ],
+      "status": "passed_diagnostic"
+    },
+    {
+      "m": 1024,
+      "n": 11008,
+      "k": 4096,
+      "provider": "dense",
+      "tile": [
+        128,
+        256
+      ],
+      "weight_buffers": 1,
+      "threads": 256,
+      "stages": 4,
+      "shared_storage_bytes": 197632,
+      "kernels": [
+        {
+          "name": "kernel_cutlass_kernel_dense_gemmHopperWgmmaGemmKernel_object_at__CopyAtom_ThrID10_TVLayoutSrc1819201_TVLayoutDst1819201_Valuetypebf16_tensor000o111012_CopyAtom_ThrID10_TVLayoutSrc11638401_0",
+          "registers": 154,
+          "local_bytes": 0,
+          "resident_blocks_per_sm": 1
+        }
+      ],
+      "setup_seconds": 0.46700766682624817,
+      "max_abs_error": 2.0,
+      "relative_l2_error": 0.00014997135440353304,
+      "median_us": 242.06799268722534,
+      "batch_mean_us": [
+        241.6989952325821,
+        241.29199981689453,
+        241.57899618148804,
+        242.06799268722534,
+        242.2879934310913,
+        242.1800047159195,
+        242.25249886512756,
+        242.31649935245514,
+        242.37249791622162,
+        241.48349463939667,
+        240.67500233650208
+      ],
+      "status": "passed_diagnostic"
+    },
+    {
+      "m": 1024,
+      "n": 11008,
+      "k": 4096,
+      "provider": "persistent",
+      "tile": [
+        128,
+        256
+      ],
+      "weight_buffers": 1,
+      "threads": 384,
+      "stages": 4,
+      "shared_storage_bytes": 230400,
+      "kernels": [
+        {
+          "name": "kernel_cutlass_kernel_dense_gemm_persistentHopperWgmmaGemmPersistentKernel_object_at__CopyAtom_ThrID10_TVLayoutSrc1819201_TVLayoutDst1819201_Valuetypebf16_tensor000o111012_CopyAtom_ThrID1_0",
+          "registers": 168,
+          "local_bytes": 0,
+          "resident_blocks_per_sm": 1
+        }
+      ],
+      "setup_seconds": 0.8006227891892195,
+      "max_abs_error": 2.0,
+      "relative_l2_error": 0.00014997135440353304,
+      "median_us": 231.38000071048737,
+      "batch_mean_us": [
+        231.7190021276474,
+        231.35949671268463,
+        231.32599890232086,
+        231.35849833488464,
+        231.38000071048737,
+        231.41750693321228,
+        231.501504778862,
+        231.38800263404846,
+        231.34399950504303,
+        231.33599758148193,
+        232.04199969768524
+      ],
+      "status": "passed_diagnostic"
+    },
+    {
+      "m": 1024,
+      "n": 11008,
+      "k": 4096,
+      "provider": "restart",
+      "tile": [
+        128,
+        256
+      ],
+      "weight_buffers": 1,
+      "threads": 256,
+      "stages": 4,
+      "shared_storage_bytes": 197632,
+      "kernels": [
+        {
+          "name": "kernel_cutlass_kernel_dense_gemm_restartHopperWgmmaGemmKernel_object_at__CopyAtom_ThrID10_TVLayoutSrc1819201_TVLayoutDst1819201_Valuetypebf16_tensor000o111012_CopyAtom_ThrID10_TVLayoutSrc_0",
+          "registers": 154,
+          "local_bytes": 0,
+          "resident_blocks_per_sm": 1
+        }
+      ],
+      "setup_seconds": 0.48480721190571785,
+      "max_abs_error": 2.0,
+      "relative_l2_error": 0.00014997135440353304,
+      "median_us": 240.385502576828,
+      "batch_mean_us": [
+        240.45149981975555,
+        240.09500443935394,
+        240.106999874115,
+        240.06099998950958,
+        240.09600281715393,
+        240.0664985179901,
+        240.385502576828,
+        240.89649319648743,
+        240.96450209617615,
+        240.9750074148178,
+        240.89950323104858
+      ],
+      "status": "passed_diagnostic"
+    }
+  ]
+}

@@ -1,0 +1,121 @@
+{
+  "gpu": "_CudaDeviceProperties(name='NVIDIA H200 MIG 3g.71gb', major=9, minor=0, total_memory=71424MB, multi_processor_count=60, uuid=9dea0b6d-ef2b-c5f3-8f4d-f2e6b5a59394, pci_bus_id=173, pci_device_id=0, pci_domain_id=0, L2_cache_size=29MB)",
+  "torch": "2.14.0+cu130",
+  "torch_git": "08187d9e0fba026dc8217405802ab5381dc88d90",
+  "cute": "4.8.0",
+  "upstream_revision": "0b55a2f691d69981583568fd9eb69687b1f0de8a",
+  "upstream_file": "dense_gemm_persistent.py",
+  "upstream_sha256": "65088a1fd7655ed46ad54fecd08e1461a334fb38f1b2d1da7cf252e465afc130",
+  "source_adaptation": "persistent kernel becomes a device-callable range body; enclosing worker allocates and passes shared storage; tile scheduler and TMA/WGMMA pipeline remain in the source body",
+  "body_contract": {
+    "entry": "persistent scheduler parameters, runtime scheduler grid, current TMA descriptors/tensors, CTA-local scratch, and epilogue binding",
+    "cta_threads": 256,
+    "warp_roles": {
+      "dma_warp_group": "warps 0-3; warp 0 issues TMA input loads",
+      "mma_warp_group": "warps 4-7 consume staged tiles and issue WGMMA",
+      "epilogue_store_warp": 4
+    },
+    "pipeline": "source TMA/WGMMA stage ring remains active across the assigned persistent tile range; producer_tail drains input work, WGMMA wait_group(0) completes MMA, and TMA store producer_tail drains output writes",
+    "scratch_release": "CTA-local shared storage is reusable only after the range body returns from both pipeline tails",
+    "exit": "all output tiles assigned to the synthetic scheduler grid are globally stored; the enclosing kernel must grid-synchronize before another CTA reads them",
+    "binding": "host rebuilds descriptors for each call; scheduler grid can be narrowed while idle outer CTAs bypass the range body"
+  },
+  "records": [
+    {
+      "regime": "decode_small_m",
+      "selected_tile": [
+        64,
+        64
+      ],
+      "range_resources": {
+        "name": "kernel_cutlass_range_kernel___main___range_classlocalsResidentRange_object_at__Copy_Atom_ThrID_10_TV_Layout_Src_1409601_TV_Layout_Dst_1409601_Value_type_bf16_tensor000_o_111012_Copy_Atom__0",
+        "registers_per_thread": 232,
+        "static_shared_bytes": 0,
+        "local_bytes_per_thread": 0,
+        "shared_storage_bytes": 230400,
+        "active_blocks_per_sm": 1
+      },
+      "records": [
+        {
+          "m": 4,
+          "n": 1536,
+          "k": 576,
+          "tile": [
+            64,
+            64
+          ],
+          "workers": 12,
+          "max_admitted_workers": 60,
+          "max_abs_error": 0.0009765625,
+          "relative_l2_error": 5.324869789546938e-07,
+          "resident_range_gpu_us": 4.056999925523996,
+          "standalone_persistent_gpu_us": 3.085999982431531,
+          "restarting_dense_body_gpu_us": 3.415999934077263
+        },
+        {
+          "m": 256,
+          "n": 1536,
+          "k": 576,
+          "tile": [
+            64,
+            64
+          ],
+          "workers": 48,
+          "max_admitted_workers": 60,
+          "max_abs_error": 0.25,
+          "relative_l2_error": 4.985702253179625e-05,
+          "resident_range_gpu_us": 4.3390002101659775
+        }
+      ],
+      "launch_count_each": 1
+    },
+    {
+      "regime": "prefill_larger_m",
+      "selected_tile": [
+        64,
+        128
+      ],
+      "range_resources": {
+        "name": "kernel_cutlass_range_kernel___main___range_classlocalsResidentRange_object_at__Copy_Atom_ThrID_10_TV_Layout_Src_1409601_TV_Layout_Dst_1409601_Value_type_bf16_tensor000_o_111012_Copy_Atom__0",
+        "registers_per_thread": 232,
+        "static_shared_bytes": 0,
+        "local_bytes_per_thread": 0,
+        "shared_storage_bytes": 214016,
+        "active_blocks_per_sm": 1
+      },
+      "records": [
+        {
+          "m": 256,
+          "n": 1536,
+          "k": 576,
+          "tile": [
+            64,
+            128
+          ],
+          "workers": 24,
+          "max_admitted_workers": 60,
+          "max_abs_error": 0.25,
+          "relative_l2_error": 4.2565647163428366e-05,
+          "resident_range_gpu_us": 5.601999815553427,
+          "standalone_persistent_gpu_us": 4.019000101834536,
+          "restarting_dense_body_gpu_us": 4.368999972939491
+        },
+        {
+          "m": 1024,
+          "n": 1536,
+          "k": 576,
+          "tile": [
+            64,
+            128
+          ],
+          "workers": 60,
+          "max_admitted_workers": 60,
+          "max_abs_error": 0.25,
+          "relative_l2_error": 4.9095440772362053e-05,
+          "resident_range_gpu_us": 9.457999840378761
+        }
+      ],
+      "launch_count_each": 1
+    }
+  ]
+}

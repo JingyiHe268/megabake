@@ -1,0 +1,11 @@
+{
+  "random_cases": 2000,
+  "policies_per_case": 4,
+  "boundary_cases": 2,
+  "passed": true,
+  "revision": "f9eb70c254acefc9f3667b2a973d0dcf25471fce",
+  "source_sha256": "4b1400e4aa90cae8411c648002c23b6de899301fbbeedb982e4282fd29921657",
+  "compiler": "g++ (GCC) 14.3.1 20251022 (Red Hat 14.3.1-4)",
+  "seed": 20261009,
+  "limits": "Host allocation only; valid nonzero sizes padded to 128 bytes; supplied finite half-open lifetimes."
+}

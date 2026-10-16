@@ -1,0 +1,615 @@
+{
+  "torch": "2.14.0+cu130",
+  "torch_git": "08187d9e0fba026dc8217405802ab5381dc88d90",
+  "cuda_runtime": "13.0",
+  "cute": "4.8.0",
+  "gpu": "_CudaDeviceProperties(name='NVIDIA H200 MIG 3g.71gb', major=9, minor=0, total_memory=71424MB, multi_processor_count=60, uuid=9dea0b6d-ef2b-c5f3-8f4d-f2e6b5a59394, pci_bus_id=173, pci_device_id=0, pci_domain_id=0, L2_cache_size=29MB)",
+  "cutlass_revision": "0b55a2f691d69981583568fd9eb69687b1f0de8a",
+  "source_sha256": {
+    "dense_gemm.py": "bb7b76d893219757e2f3701abf1a7c8c819b9966e38aaed30a768596a55aca9f",
+    "dense_gemm_persistent.py": "65088a1fd7655ed46ad54fecd08e1461a334fb38f1b2d1da7cf252e465afc130"
+  },
+  "seed": 123,
+  "validation_only": false,
+  "precision": "BF16 inputs/output, FP32 accumulation; reduced precision reduction disabled",
+  "timing": "CUDA event batch averages, CUDA Graph replay; no Python gaps; no host latency claim",
+  "cache": "rotating weights, at least 64 MiB",
+  "records": [
+    {
+      "m": 4,
+      "n": 1536,
+      "k": 576,
+      "provider": "torch_mm",
+      "tile": null,
+      "weight_buffers": 38,
+      "launch_count": 1,
+      "setup_seconds": 1.269020140171051e-05,
+      "first_call_host_us": 58218.92246603966,
+      "max_abs_error": 0.03125,
+      "relative_l2_error": 1.643324867472984e-05,
+      "warm_gpu_per_weight": {
+        "median_us": 3.603368605438032,
+        "batch_mean_us": [
+          4.455578954596269,
+          3.6286315635630957,
+          3.6294738713063692,
+          3.603368605438032,
+          3.5865263719307747,
+          3.5932632653336776,
+          3.571368361774244,
+          3.6202104468094674,
+          3.5983159353858545,
+          3.5882105952815007,
+          3.6168420001080164
+        ]
+      },
+      "complete_host_call": {
+        "median_us": 414.1759127378464,
+        "samples_us": [
+          510.8434706926346,
+          406.1944782733917,
+          418.66861283779144,
+          414.2392426729202,
+          414.9973392486572,
+          399.1425037384033,
+          392.7648067474365,
+          415.5002534389496,
+          400.3196954727173,
+          414.1759127378464,
+          396.6148942708969
+        ]
+      },
+      "status": "passed_diagnostic",
+      "first_call_event_span_us": 58093.055725097656
+    },
+    {
+      "m": 4,
+      "n": 1536,
+      "k": 576,
+      "provider": "dense",
+      "tile": [
+        64,
+        64
+      ],
+      "weight_buffers": 38,
+      "launch_count": 1,
+      "threads": 128,
+      "stages": 14,
+      "shared_storage_bytes": 230400,
+      "kernels": [
+        {
+          "name": "kernel_cutlass_kernel_dense_gemmHopperWgmmaGemmKernel_object_at__CopyAtom_ThrID10_TVLayoutSrc1409601_TVLayoutDst1409601_Valuetypebf16_tensor000o111012_CopyAtom_ThrID10_TVLayoutSrc1409601__0",
+          "registers": 58,
+          "local_bytes": 0,
+          "resident_blocks_per_sm": 1
+        }
+      ],
+      "setup_seconds": 0.3017321266233921,
+      "first_call_host_us": 298.0213612318039,
+      "max_abs_error": 0.03125,
+      "relative_l2_error": 1.643324867472984e-05,
+      "warm_gpu_per_weight": {
+        "median_us": 3.613473553406565,
+        "batch_mean_us": [
+          4.081684115685914,
+          3.6479999360285307,
+          3.6176843078512895,
+          3.614315861149838,
+          3.5856840641875016,
+          3.600842074344033,
+          3.613473553406565,
+          3.607578967746935,
+          3.603368605438032,
+          3.600842074344033,
+          3.632000010264547
+        ]
+      },
+      "complete_host_call": {
+        "median_us": 332.32197165489197,
+        "samples_us": [
+          410.52699089050293,
+          359.4495356082916,
+          331.2285989522934,
+          329.4646739959717,
+          356.05020821094513,
+          331.00880682468414,
+          314.80006873607635,
+          339.51178193092346,
+          322.2040832042694,
+          332.32197165489197,
+          339.87313508987427
+        ]
+      },
+      "status": "passed_diagnostic",
+      "first_call_event_span_us": 184.64000523090363
+    },
+    {
+      "m": 4,
+      "n": 1536,
+      "k": 576,
+      "provider": "persistent",
+      "tile": [
+        64,
+        64
+      ],
+      "weight_buffers": 38,
+      "launch_count": 1,
+      "threads": 256,
+      "stages": 13,
+      "shared_storage_bytes": 230400,
+      "kernels": [
+        {
+          "name": "kernel_cutlass_kernel_dense_gemm_persistentHopperWgmmaGemmPersistentKernel_object_at__CopyAtom_ThrID10_TVLayoutSrc1409601_TVLayoutDst1409601_Valuetypebf16_tensor000o111012_CopyAtom_ThrID1_0",
+          "registers": 232,
+          "local_bytes": 0,
+          "resident_blocks_per_sm": 1
+        }
+      ],
+      "setup_seconds": 0.42086148262023926,
+      "first_call_host_us": 178.29053103923798,
+      "max_abs_error": 0.03125,
+      "relative_l2_error": 1.643324867472984e-05,
+      "warm_gpu_per_weight": {
+        "median_us": 3.3844211383869776,
+        "batch_mean_us": [
+          3.8155787869503626,
+          3.413052543213493,
+          3.402947203109139,
+          3.3953683940987838,
+          3.3751577138900757,
+          3.3844211383869776,
+          3.397894925192783,
+          3.364210458178269,
+          3.3701054359737195,
+          3.381052691685526,
+          3.3473686168068335
+        ]
+      },
+      "complete_host_call": {
+        "median_us": 324.02388751506805,
+        "samples_us": [
+          392.9845988750458,
+          331.70729875564575,
+          321.79243862628937,
+          318.4974193572998,
+          313.77561390399933,
+          305.5799752473831,
+          336.0770642757416,
+          326.27955079078674,
+          320.8797425031662,
+          332.94036984443665,
+          324.02388751506805
+        ]
+      },
+      "status": "passed_diagnostic",
+      "first_call_event_span_us": 91.32800251245499
+    },
+    {
+      "m": 4,
+      "n": 1536,
+      "k": 576,
+      "provider": "restart",
+      "tile": [
+        64,
+        64
+      ],
+      "weight_buffers": 38,
+      "launch_count": 1,
+      "threads": 128,
+      "stages": 14,
+      "shared_storage_bytes": 230400,
+      "kernels": [
+        {
+          "name": "kernel_cutlass_kernel_dense_gemm_restartHopperWgmmaGemmKernel_object_at__CopyAtom_ThrID10_TVLayoutSrc1409601_TVLayoutDst1409601_Valuetypebf16_tensor000o111012_CopyAtom_ThrID10_TVLayoutSrc_0",
+          "registers": 58,
+          "local_bytes": 0,
+          "resident_blocks_per_sm": 1
+        }
+      ],
+      "setup_seconds": 0.2925694230943918,
+      "first_call_host_us": 173.16080629825592,
+      "max_abs_error": 0.03125,
+      "relative_l2_error": 1.643324867472984e-05,
+      "warm_gpu_per_weight": {
+        "median_us": 3.722947286932092,
+        "batch_mean_us": [
+          4.149052657579121,
+          3.73136840368572,
+          3.7103158078695597,
+          3.7044212222099304,
+          3.727999956984269,
+          3.7490525528004297,
+          3.712841946827738,
+          3.707789668911382,
+          3.722947286932092,
+          3.727999956984269,
+          3.707789668911382
+        ]
+      },
+      "complete_host_call": {
+        "median_us": 339.07219767570496,
+        "samples_us": [
+          416.4520651102066,
+          342.613086104393,
+          353.26555371284485,
+          346.11858427524567,
+          348.6592322587967,
+          325.2774477005005,
+          323.1894224882126,
+          339.07219767570496,
+          326.5701234340668,
+          326.31680369377136,
+          334.9222242832184
+        ]
+      },
+      "status": "passed_diagnostic",
+      "first_call_event_span_us": 88.60799670219421
+    },
+    {
+      "m": 4,
+      "n": 1536,
+      "k": 576,
+      "provider": "dense",
+      "tile": [
+        64,
+        128
+      ],
+      "weight_buffers": 38,
+      "launch_count": 1,
+      "threads": 128,
+      "stages": 9,
+      "shared_storage_bytes": 222208,
+      "kernels": [
+        {
+          "name": "kernel_cutlass_kernel_dense_gemmHopperWgmmaGemmKernel_object_at__CopyAtom_ThrID10_TVLayoutSrc1409601_TVLayoutDst1409601_Valuetypebf16_tensor000o111012_CopyAtom_ThrID10_TVLayoutSrc1819201__0",
+          "registers": 90,
+          "local_bytes": 0,
+          "resident_blocks_per_sm": 1
+        }
+      ],
+      "setup_seconds": 0.30700501799583435,
+      "first_call_host_us": 172.55358397960663,
+      "max_abs_error": 0.03125,
+      "relative_l2_error": 1.643324867472984e-05,
+      "warm_gpu_per_weight": {
+        "median_us": 4.181052509107087,
+        "batch_mean_us": [
+          4.639157731282084,
+          4.198736658221797,
+          4.188631710253264,
+          4.176842146798184,
+          4.152421104280572,
+          4.192000156954715,
+          4.181052509107087,
+          4.171789476746007,
+          4.210526221676877,
+          4.170947561138554,
+          4.147368434228395
+        ]
+      },
+      "complete_host_call": {
+        "median_us": 342.95208752155304,
+        "samples_us": [
+          406.76072239875793,
+          358.6523234844208,
+          336.40675246715546,
+          329.9843519926071,
+          353.96963357925415,
+          332.73547887802124,
+          334.09707248210907,
+          348.8268703222275,
+          345.54675221443176,
+          333.1378102302551,
+          342.95208752155304
+        ]
+      },
+      "status": "passed_diagnostic",
+      "first_call_event_span_us": 88.19200098514557
+    },
+    {
+      "m": 4,
+      "n": 1536,
+      "k": 576,
+      "provider": "persistent",
+      "tile": [
+        64,
+        128
+      ],
+      "weight_buffers": 38,
+      "launch_count": 1,
+      "threads": 256,
+      "stages": 8,
+      "shared_storage_bytes": 214016,
+      "kernels": [
+        {
+          "name": "kernel_cutlass_kernel_dense_gemm_persistentHopperWgmmaGemmPersistentKernel_object_at__CopyAtom_ThrID10_TVLayoutSrc1409601_TVLayoutDst1409601_Valuetypebf16_tensor000o111012_CopyAtom_ThrID1_0",
+          "registers": 232,
+          "local_bytes": 0,
+          "resident_blocks_per_sm": 1
+        }
+      ],
+      "setup_seconds": 0.4572626519948244,
+      "first_call_host_us": 196.9020813703537,
+      "max_abs_error": 0.03125,
+      "relative_l2_error": 1.643324867472984e-05,
+      "warm_gpu_per_weight": {
+        "median_us": 4.006736764782353,
+        "batch_mean_us": [
+          4.453052815638091,
+          4.005052541431628,
+          4.01768402049416,
+          3.9747369132543864,
+          4.046315817456496,
+          3.968000019851484,
+          3.9629473497993066,
+          4.019368243844886,
+          4.006736764782353,
+          3.9772630522125647,
+          4.023578998289611
+        ]
+      },
+      "complete_host_call": {
+        "median_us": 307.9678863286972,
+        "samples_us": [
+          377.15211510658264,
+          330.47422766685486,
+          304.37298119068146,
+          306.5187484025955,
+          318.9612179994583,
+          307.9678863286972,
+          307.401642203331,
+          328.84441316127777,
+          298.75151813030243,
+          317.6592290401459,
+          307.9064190387726
+        ]
+      },
+      "status": "passed_diagnostic",
+      "first_call_event_span_us": 109.24799740314484
+    },
+    {
+      "m": 4,
+      "n": 1536,
+      "k": 576,
+      "provider": "restart",
+      "tile": [
+        64,
+        128
+      ],
+      "weight_buffers": 38,
+      "launch_count": 1,
+      "threads": 128,
+      "stages": 9,
+      "shared_storage_bytes": 222208,
+      "kernels": [
+        {
+          "name": "kernel_cutlass_kernel_dense_gemm_restartHopperWgmmaGemmKernel_object_at__CopyAtom_ThrID10_TVLayoutSrc1409601_TVLayoutDst1409601_Valuetypebf16_tensor000o111012_CopyAtom_ThrID10_TVLayoutSrc_0",
+          "registers": 90,
+          "local_bytes": 0,
+          "resident_blocks_per_sm": 1
+        }
+      ],
+      "setup_seconds": 0.3136287182569504,
+      "first_call_host_us": 183.2917332649231,
+      "max_abs_error": 0.03125,
+      "relative_l2_error": 1.643324867472984e-05,
+      "warm_gpu_per_weight": {
+        "median_us": 4.297263136035518,
+        "batch_mean_us": [
+          4.757894889304512,
+          4.3157895928935,
+          4.2812632102715344,
+          4.30989461509805,
+          4.276210540219357,
+          4.297263136035518,
+          4.301473498344421,
+          4.252631413309198,
+          4.286315880323711,
+          4.330105295306758,
+          4.283789349229712
+        ]
+      },
+      "complete_host_call": {
+        "median_us": 323.53587448596954,
+        "samples_us": [
+          402.83799171447754,
+          337.63423562049866,
+          323.53587448596954,
+          329.81298863887787,
+          314.2915666103363,
+          317.3947334289551,
+          326.95941627025604,
+          320.6450492143631,
+          314.8149698972702,
+          330.5003046989441,
+          312.69900500774384
+        ]
+      },
+      "status": "passed_diagnostic",
+      "first_call_event_span_us": 94.78399902582169
+    },
+    {
+      "m": 4,
+      "n": 1536,
+      "k": 576,
+      "provider": "dense",
+      "tile": [
+        128,
+        128
+      ],
+      "weight_buffers": 38,
+      "launch_count": 1,
+      "threads": 128,
+      "stages": 7,
+      "shared_storage_bytes": 230400,
+      "kernels": [
+        {
+          "name": "kernel_cutlass_kernel_dense_gemmHopperWgmmaGemmKernel_object_at__CopyAtom_ThrID10_TVLayoutSrc1819201_TVLayoutDst1819201_Valuetypebf16_tensor000o111012_CopyAtom_ThrID10_TVLayoutSrc1819201__0",
+          "registers": 154,
+          "local_bytes": 0,
+          "resident_blocks_per_sm": 1
+        }
+      ],
+      "setup_seconds": 0.4279206432402134,
+      "first_call_host_us": 239.38901722431183,
+      "max_abs_error": 0.03125,
+      "relative_l2_error": 1.643324867472984e-05,
+      "warm_gpu_per_weight": {
+        "median_us": 5.808000109697643,
+        "batch_mean_us": [
+          6.282105257636623,
+          5.819789281016902,
+          5.809684333048369,
+          5.791157876190386,
+          5.7995789929440145,
+          5.809684333048369,
+          5.765894918065322,
+          5.815578918707998,
+          5.808000109697643,
+          5.7684210570235,
+          5.7962105462425635
+        ]
+      },
+      "complete_host_call": {
+        "median_us": 338.8207405805588,
+        "samples_us": [
+          397.2146660089493,
+          340.96091985702515,
+          323.35519790649414,
+          338.8207405805588,
+          346.8915820121765,
+          338.51154148578644,
+          342.40633249282837,
+          346.9027578830719,
+          324.7354179620743,
+          325.82320272922516,
+          335.02280712127686
+        ]
+      },
+      "status": "passed_diagnostic",
+      "first_call_event_span_us": 94.08000111579895
+    },
+    {
+      "m": 4,
+      "n": 1536,
+      "k": 576,
+      "provider": "persistent",
+      "tile": [
+        128,
+        128
+      ],
+      "weight_buffers": 38,
+      "launch_count": 1,
+      "threads": 256,
+      "stages": 6,
+      "shared_storage_bytes": 214016,
+      "kernels": [
+        {
+          "name": "kernel_cutlass_kernel_dense_gemm_persistentHopperWgmmaGemmPersistentKernel_object_at__CopyAtom_ThrID10_TVLayoutSrc1819201_TVLayoutDst1819201_Valuetypebf16_tensor000o111012_CopyAtom_ThrID1_0",
+          "registers": 232,
+          "local_bytes": 0,
+          "resident_blocks_per_sm": 1
+        }
+      ],
+      "setup_seconds": 1.1112360134720802,
+      "first_call_host_us": 207.3962241411209,
+      "max_abs_error": 0.03125,
+      "relative_l2_error": 1.643324867472984e-05,
+      "warm_gpu_per_weight": {
+        "median_us": 5.6724211103037785,
+        "batch_mean_us": [
+          6.138105141489129,
+          5.7145263019360995,
+          5.725473557647906,
+          5.96547362051512,
+          5.63115783427891,
+          5.6724211103037785,
+          5.659789631241246,
+          5.648000067786167,
+          5.677473780355956,
+          5.642947397733989,
+          5.661473854591972
+        ]
+      },
+      "complete_host_call": {
+        "median_us": 321.4869648218155,
+        "samples_us": [
+          396.2535411119461,
+          344.0678119659424,
+          310.4358911514282,
+          309.9348396062851,
+          321.4869648218155,
+          328.3694386482239,
+          313.19260597229004,
+          327.59271562099457,
+          308.13366174697876,
+          311.34672462940216,
+          325.82879066467285
+        ]
+      },
+      "status": "passed_diagnostic",
+      "first_call_event_span_us": 110.3999987244606
+    },
+    {
+      "m": 4,
+      "n": 1536,
+      "k": 576,
+      "provider": "restart",
+      "tile": [
+        128,
+        128
+      ],
+      "weight_buffers": 38,
+      "launch_count": 1,
+      "threads": 128,
+      "stages": 7,
+      "shared_storage_bytes": 230400,
+      "kernels": [
+        {
+          "name": "kernel_cutlass_kernel_dense_gemm_restartHopperWgmmaGemmKernel_object_at__CopyAtom_ThrID10_TVLayoutSrc1819201_TVLayoutDst1819201_Valuetypebf16_tensor000o111012_CopyAtom_ThrID10_TVLayoutSrc_0",
+          "registers": 154,
+          "local_bytes": 0,
+          "resident_blocks_per_sm": 1
+        }
+      ],
+      "setup_seconds": 0.45392934046685696,
+      "first_call_host_us": 171.82715237140656,
+      "max_abs_error": 0.03125,
+      "relative_l2_error": 1.643324867472984e-05,
+      "warm_gpu_per_weight": {
+        "median_us": 5.769262972630952,
+        "batch_mean_us": [
+          6.259368438469736,
+          5.803789355252919,
+          5.7743156426831295,
+          5.79536823849929,
+          5.769262972630952,
+          5.749894600165518,
+          5.7684210570235,
+          5.777684089384581,
+          5.746526153464067,
+          5.749894600165518,
+          5.763368386971323
+        ]
+      },
+      "complete_host_call": {
+        "median_us": 335.3189677000046,
+        "samples_us": [
+          422.8372126817703,
+          354.6271473169327,
+          325.37616789340973,
+          327.14009284973145,
+          348.99264574050903,
+          335.3189677000046,
+          323.2378512620926,
+          343.6114639043808,
+          324.8881548643112,
+          330.8206796646118,
+          348.74677658081055
+        ]
+      },
+      "status": "passed_diagnostic",
+      "first_call_event_span_us": 85.53600311279297
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "task_01": {
+    "status": "complete",
+    "evidence": "g0_workload.json, WORKLOAD.md, refreshed GEMM and MLP baseline records",
+    "notes": [
+      "M=1, 4, 256, and 1024 cases are covered across GEMM and full MLP baselines.",
+      "The rotating-weight case uses 38 buffers and records synchronized host-call latency.",
+      "The SmolLM stateful cache record covers prefill length 4 and one decode step to length 5."
+    ]
+  },
+  "task_02": {
+    "status": "complete",
+    "evidence": "resident_range_probe.py and resident_range.json",
+    "notes": [
+      "The pinned CUTLASS persistent body retains its TMA/WGMMA pipeline across assigned tiles.",
+      "Changed tensor addresses, contents, and M=4 to M=256 to M=1024 tile counts pass against the original launch and restarting adapter."
+    ]
+  },
+  "task_03": {
+    "status": "complete",
+    "evidence": "mixed_body.json, mixed_shape_m1.json, mixed_shape_m256.json, mixed_kernel_trace.json, generated_typed_bodies.py, mixed_m4_memcheck.log, mixed_m4_racecheck.log, mixed_m4_synccheck.log, mixed_shape_m1_memcheck.log, mixed_shape_m256_memcheck.log",
+    "passed": [
+      "One M=4 cooperative kernel contains two range GEMMs, typed BF16/FP32 vector and reduction work, four cross-CTA barriers, and two workers that skip GEMM tiles but still join barriers.",
+      "A leader-scanned release/acquire barrier passes repeated calls at 4, 24, and 60 workers; idle GEMM workers still join every barrier.",
+      "The complete compiled kernel uses 256 threads, 232 registers per thread, 230400 shared bytes, and one active block per SM. On 60 SMs this admits 60 workers; 61 is rejected before the workload launch.",
+      "Three changed M=4 bindings pass at 60 workers with delayed producers and a one-kernel profiler trace. Three M=4-to-M=1 and three M=4-to-M=256 shape/tile-count rebinds also pass at 60 workers.",
+      "Final-source memcheck and synccheck report zero errors and racecheck reports zero hazards at 60 workers. M=1 and M=256 shape-rebind memcheck reports are also clean.",
+      "The vector and reduction bodies are generated from typed scalar expressions and record their source hashes.",
+      "The largest compiled-resource-admitted 60-worker grid passes; an oversized 61-worker request is rejected before launch."
+    ],
+    "limitations": [
+      "CUDA Graph replay is outside the G0 probe; the tested eager calls pass their epoch values from the host."
+    ]
+  }
+}
