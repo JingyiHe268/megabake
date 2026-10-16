@@ -6,6 +6,7 @@ from typing import Any
 from ..graph import Region
 from .attention import AttentionBodyProvider
 from .gemm import G0RangeBodyProvider
+from .blackwell import BlackwellGemmProvider
 from .interface import (
     BodyConfig,
     CandidateSet,
@@ -96,10 +97,17 @@ class GenericBodyProvider:
         return CandidateSet((_generic_config(region, program),), ())
 
 
-PROVIDERS: tuple[GenericBodyProvider | G0RangeBodyProvider | AttentionBodyProvider, ...] = (
+PROVIDERS: tuple[
+    GenericBodyProvider
+    | G0RangeBodyProvider
+    | AttentionBodyProvider
+    | BlackwellGemmProvider,
+    ...,
+] = (
     GenericBodyProvider(),
     G0RangeBodyProvider(),
     AttentionBodyProvider(),
+    BlackwellGemmProvider(),
 )
 
 

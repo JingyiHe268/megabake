@@ -1264,19 +1264,19 @@ def _target_facts(device: torch.device) -> TargetFacts:
         raise UnsupportedCompiler("MegaBake generated kernels require CUDA")
     properties = torch.cuda.get_device_properties(device)
     architecture = f"sm{properties.major}{properties.minor}"
-    if architecture != "sm90":
+    if architecture not in {"sm90", "sm100", "sm103", "sm120", "sm121"}:
         raise UnsupportedCompiler(
-            f"generated CuTe kernels require SM90; found {architecture}"
+            f"generated CuTe kernels require SM90 or Blackwell SM100/103/120/121; found {architecture}"
         )
     return TargetFacts(
-        architecture="sm90a",
+        architecture="sm90a" if architecture == "sm90" else architecture,
         threads_per_warp=properties.warp_size,
         max_threads_per_cta=properties.max_threads_per_block,
         max_shared_memory_per_cta=properties.shared_memory_per_block_optin,
         max_registers_per_thread=255,
         multiprocessor_count=properties.multi_processor_count,
         supports_tma=True,
-        supports_wgmma=True,
+        supports_wgmma=architecture == "sm90",
     )
 
 

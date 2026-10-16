@@ -240,7 +240,7 @@ def main() -> None:
         )
         inductor_result, inductor_first = _first_call(inductor, *inputs)
         backend_setup_started = time.perf_counter()
-        backend = make_backend(scheduler=arguments.scheduler)
+        backend = make_backend(scheduler=arguments.scheduler, compile_kernel=True)
         backend_setup_us = (time.perf_counter() - backend_setup_started) * 1_000_000
         wrapper_setup_started = time.perf_counter()
         compiled = torch.compile(
@@ -255,11 +255,11 @@ def main() -> None:
             (inductor_result.float() - reference.float()).norm()
             / reference.float().norm()
         ).item()
-        if error >= 0.01:
+        if not error < 0.01:
             raise RuntimeError(f"MLP relative error {error}")
-        if inductor_error >= 0.01:
+        if not inductor_error < 0.01:
             raise RuntimeError(f"Inductor MLP relative error {inductor_error}")
-        if graph_error >= 0.01:
+        if not graph_error < 0.01:
             raise RuntimeError(f"CUDA Graph MLP relative error {graph_error}")
 
         record = {

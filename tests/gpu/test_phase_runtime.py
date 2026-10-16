@@ -108,23 +108,15 @@ def _launch(
 
 
 def _target() -> TargetFacts:
-    return TargetFacts(
-        architecture="sm90a",
-        threads_per_warp=32,
-        max_threads_per_cta=1024,
-        max_shared_memory_per_cta=232_448,
-        max_registers_per_thread=255,
-        multiprocessor_count=60,
-        supports_tma=True,
-        supports_wgmma=True,
-    )
+    from megabake.compiler import _target_facts
+    return _target_facts(torch.device("cuda"))
 
 
 def _plan(workers: int):
     class Model(torch.nn.Module):
         def forward(self, value):
-            left = torch.relu(value)
-            right = torch.neg(value)
+            left = value.sum(dim=-1)
+            right = value.amax(dim=-1)
             return left + right
 
     value = torch.randn(2, 3)
@@ -185,11 +177,12 @@ def _flat(tensor):
 
 def test_phase_runtime_ports_delay_idle_rebinding_and_largest_grid():
     device = torch.device("cuda")
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
     stream = torch.cuda.Stream(device=device)
     with torch.cuda.stream(stream):
         source = torch.ones(257, device=device, dtype=torch.float32)
-        produced = torch.empty(60, device=device, dtype=torch.float32)
-        ready = torch.full((61,), -1, device=device, dtype=torch.int32)
+        produced = torch.empty(sms, device=device, dtype=torch.float32)
+        ready = torch.full((sms + 1,), -1, device=device, dtype=torch.int32)
         sink = torch.empty(1, device=device, dtype=torch.float32)
         compiled = cute.compile(
             _launch,
@@ -226,10 +219,10 @@ def test_phase_runtime_ports_delay_idle_rebinding_and_largest_grid():
     execute_phase_plan(four_worker_plan, kernel, stream)
     assert sink.item() == 600_000.0
 
-    largest_plan = _plan(60)
-    assert admit_runtime(largest_plan).max_workers == 60
+    largest_plan = _plan(sms)
+    assert admit_runtime(largest_plan).max_workers == sms
     execute_phase_plan(largest_plan, kernel, stream)
-    assert sink.item() == 11_800_000.0
+    assert sink.item() == (sms - 1) * 200_000.0
 
 
 def test_phase_runtime_rejects_cuda_graph_capture():
