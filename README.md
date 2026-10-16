@@ -53,7 +53,6 @@ SmolLM-135M on an H200 MIG `3g.71gb` slice (60 SMs), bf16, 40 warm calls each, d
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Eager | 19.4 | 32.8 | 2.54 / 2.67 | 1,446 / 1,780 | <1 s |
 | `torch.compile` (Inductor) | 7.4 | 13.0 | **1.07 / 1.37** | 512 / 632 | 6 s / 3 s |
-| Inductor with CUDA graphs (`mode="reduce-overhead"`) | **2.0** | n/a* | 1.13 / – | 1 graph | 5 s / 5 s |
 | MegaBake | 3.0 | **3.7** | 1.48 / 2.22 | **1** | 127 s / 79 s |
 
 \* Inductor skips CUDA graphs for decode because the KV caches are mutated inputs, so its decode run is plain Inductor. There is no CUDA-graph decode baseline yet.
