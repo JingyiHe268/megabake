@@ -29,6 +29,7 @@ from megabake.graph import import_fx
 from megabake.lowering import canonicalize_semantics
 from megabake.regions import form_regions
 from megabake.plan import ConversionBody, CuTeLayout
+from megabake.runtime import make_ready
 
 
 pytestmark = pytest.mark.skipif(
@@ -102,12 +103,7 @@ def _run_generic(generated, source):
                     device="cuda",
                 )
             )
-    ready = torch.full(
-        (generated.launch.grid_size + 1,),
-        -1,
-        dtype=torch.int32,
-        device="cuda",
-    )
+    ready = make_ready(generated.launch.grid_size, "cuda")
     work_iterators = [
         torch.arange(iterator.length, device="cuda", dtype=torch.int64) * iterator.step
         for iterator in generated.launch.work_iterators
@@ -121,6 +117,13 @@ def _run_generic(generated, source):
     phase_table = torch.tensor(
         generated.launch.phase_table, dtype=torch.int32, device="cuda"
     )
+    dynamic_addresses = torch.tensor(
+        [tensors[slot].data_ptr() for slot in generated.launch.dynamic_slots] or [0],
+        dtype=torch.int64,
+    ).pin_memory()
+    dynamic_slots = torch.tensor(
+        list(generated.launch.dynamic_slots) or [0], dtype=torch.int32, device="cuda"
+    )
     views = [
         _view(ready),
         cutlass.Int32(generated.launch.grid_size),
@@ -128,10 +131,9 @@ def _run_generic(generated, source):
         _view(addresses),
         _view(phase_table),
         iterator_views,
-        tuple(
-            cutlass.Int64(tensors[slot].data_ptr())
-            for slot in generated.launch.dynamic_slots
-        ),
+        # Per-call boundary addresses: a host-mapped buffer and its slots.
+        cutlass.Int64(dynamic_addresses.data_ptr()),
+        _view(dynamic_slots),
     ]
     compiled = cute.compile(module.launch, *views, stream)
     compiled(*views, stream)
@@ -244,12 +246,7 @@ def test_generated_g0_kernel_matches_existing_g0_executable(tmp_path):
     tensor_a, tensor_b, tensor_c = cute_gemm_tensors(
         gpu_source, gpu_weight, output
     )
-    ready = torch.full(
-        (generated.launch.grid_size + 1,),
-        -1,
-        dtype=torch.int32,
-        device="cuda",
-    )
+    ready = make_ready(generated.launch.grid_size, "cuda")
     tensor_views = (
         *(_view(tensor) for tensor in (gpu_source, gpu_weight, output, gpu_weight.t())),
         tensor_a,
@@ -291,12 +288,7 @@ def _run_mixed(generated, source, weight, output_shape):
     gpu_weight = weight.cuda()
     workspace = torch.empty((4, 1536), device="cuda", dtype=torch.bfloat16)
     output = torch.empty(output_shape, device="cuda", dtype=torch.bfloat16)
-    ready = torch.full(
-        (generated.launch.grid_size + 1,),
-        -1,
-        dtype=torch.int32,
-        device="cuda",
-    )
+    ready = make_ready(generated.launch.grid_size, "cuda")
     work_iterator = torch.arange(
         generated.launch.work_iterators[0].length,
         device="cuda",

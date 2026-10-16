@@ -24,6 +24,17 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _assert_tuned_projections(compiled, layers: int = 30) -> None:
+    # Every Q/K/V/O, gate/up/down, and vocabulary projection runs the tuned
+    # TMA GEMM inside the table launch, on every cooperative worker.
+    assert compiled.generated.launch.launch_policy == "megabake_cooperative_table"
+    assert (
+        sum(phase.body.provider == "g0_range" for phase in compiled.plan.phases)
+        == 7 * layers + 1
+    )
+    assert compiled.plan.launch.grid_size == compiled.resources.max_cooperative_workers
+
+
 def test_task31_compiles_complete_smollm_architecture(tmp_path):
     from megabake import make_backend, verify_plan
 
@@ -74,6 +85,7 @@ def test_task31_compiles_complete_smollm_architecture(tmp_path):
     assert compiled.resources.body_variant_count < len(compiled.plan.phases)
     assert compiled.resources.compiled_code_bytes > 0
     assert compiled.generated.source_path.exists()
+    _assert_tuned_projections(compiled)
 
     trace = backend.megabake_last_trace[-1]
     assert trace.workload_kernel_launches == 1
@@ -207,6 +219,7 @@ def test_task31_compiles_complete_stateful_smollm_decode(tmp_path):
     verify_plan(compiled.plan)
     assert len(compiled.plan.storage.state) == 30
     assert all(state.capacity == 4 for state in compiled.plan.storage.state)
+    _assert_tuned_projections(compiled)
     assert compiled.resources.workspace_bytes == compiled.plan.storage.workspace_bytes
     assert compiled.resources.compiled_code_bytes > 0
     trace = backend.megabake_last_trace[-1]
@@ -267,3 +280,4 @@ def test_task31_compiles_pinned_smollm_checkpoint(tmp_path):
     compiled = backend.megabake_last_compiled
     verify_plan(compiled.plan)
     assert backend.megabake_last_trace[-1].workload_kernel_launches == 1
+    _assert_tuned_projections(compiled)

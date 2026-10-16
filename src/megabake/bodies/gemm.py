@@ -41,6 +41,7 @@ import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils as utils
 import cutlass.utils.hopper_helpers as sm90_utils
+from cutlass.tensor_utils import TensorMapManager, TensorMapUpdateMode
 
 """
 A high-performance batched dense GEMM (C = A * B) example for the NVIDIA Hopper architecture
@@ -156,6 +157,8 @@ class HopperWgmmaGemmPersistentKernel:
         cluster_shape_mn: tuple[int, int],
         swizzle_size: int,
         raster_along_m: bool,
+        smem_capacity: int | None = None,
+        reallocate_registers: bool = True,
     ):
         """
         Initializes the configuration for a Hopper dense GEMM kernel.
@@ -206,7 +209,13 @@ class HopperWgmmaGemmPersistentKernel:
         )
         self.load_register_requirement = 40
         self.mma_register_requirement = 232
-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_90")
+        # MegaBake: a mixed megakernel shares shared memory with other bodies,
+        # so it may cap the pipeline's budget instead of filling the SM.
+        self.smem_capacity = smem_capacity or utils.get_smem_capacity_in_bytes("sm_90")
+        # MegaBake: warp-specialized register reallocation is only valid when
+        # the GEMM owns the kernel; mixed megakernels run other bodies on the
+        # same warps afterwards and keep the kernel-wide register count.
+        self.reallocate_registers = reallocate_registers
 
         self.ab_stage = None
         self.epi_stage = None
@@ -502,6 +511,41 @@ class HopperWgmmaGemmPersistentKernel:
             cute.arch.grid_dim(),
         )
 
+    @cute.jit
+    def run_table(self, prepared, scratch, tma_descs):
+        """Run one table-launched phase whose TMA descriptors live in global
+        memory. ``prepared`` is this variant's ``prepare`` result; the kernel
+        prologue has written ``tma_descs`` (A, B, C) for this phase's tensors."""
+        tensor_bindings, epilogue, tile_sched_params = prepared
+        (
+            tma_atom_a,
+            mA_mkl,
+            tma_atom_b,
+            mB_nkl,
+            tiled_mma,
+            cta_layout_mnk,
+            a_smem_layout_staged,
+            b_smem_layout_staged,
+        ) = tensor_bindings
+        tma_atom_c, mC_mnl, epi_smem_layout_staged = epilogue
+        self.kernel(
+            tma_atom_a,
+            mA_mkl,
+            tma_atom_b,
+            mB_nkl,
+            tma_atom_c,
+            mC_mnl,
+            tiled_mma,
+            cta_layout_mnk,
+            a_smem_layout_staged,
+            b_smem_layout_staged,
+            epi_smem_layout_staged,
+            tile_sched_params,
+            scratch,
+            cute.arch.grid_dim(),
+            tma_descs,
+        )
+
     @cute.kernel
     def range_kernel(
         self,
@@ -553,6 +597,7 @@ class HopperWgmmaGemmPersistentKernel:
         tile_sched_params: utils.PersistentTileSchedulerParams,
         scratch,
         schedule_grid_dim,
+        tma_descs=None,
     ):
         """
         GPU device kernel performing the batched GEMM computation.
@@ -587,11 +632,20 @@ class HopperWgmmaGemmPersistentKernel:
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
+        # MegaBake: table launches pass per-phase descriptors in global
+        # memory; copies then name them through tma_desc_ptr.
+        desc_a = None
+        desc_b = None
+        desc_c = None
+        if cutlass.const_expr(tma_descs is not None):
+            desc_a, desc_b, desc_c = tma_descs
+
         # Prefetch Tma desc
-        if warp_idx == 0:
-            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_a)
-            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b)
-            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_c)
+        if cutlass.const_expr(tma_descs is None):
+            if warp_idx == 0:
+                cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_a)
+                cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b)
+                cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_c)
 
         cta_rank_in_cluster = cute.arch.make_warp_uniform(
             cute.arch.block_idx_in_cluster()
@@ -726,8 +780,9 @@ class HopperWgmmaGemmPersistentKernel:
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
         is_dma_warp_group = warp_group_idx < self.num_dma_warp_groups
-        if is_dma_warp_group:
-            cute.arch.setmaxregister_decrease(self.load_register_requirement)
+        if cutlass.const_expr(self.reallocate_registers):
+            if is_dma_warp_group:
+                cute.arch.setmaxregister_decrease(self.load_register_requirement)
 
         if warp_idx == self.load_warp_id:
             tile_sched = utils.StaticPersistentTileScheduler.create(
@@ -738,6 +793,13 @@ class HopperWgmmaGemmPersistentKernel:
             mainloop_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.ab_stage
             )
+            if cutlass.const_expr(tma_descs is not None):
+                cute.nvgpu.cpasync.fence_tma_desc_acquire(desc_a)
+                cute.nvgpu.cpasync.fence_tma_desc_acquire(desc_b)
+            # MegaBake: operands may have been written with generic stores by
+            # other CTAs before the enclosing grid barrier; order those
+            # writes before this thread's async-proxy TMA loads.
+            cute.arch.fence_proxy("async.global")
 
             while work_tile.is_valid_tile:
                 tile_coord_mnl = work_tile.tile_idx
@@ -765,6 +827,7 @@ class HopperWgmmaGemmPersistentKernel:
                             mainloop_producer_state
                         ),
                         mcast_mask=a_mcast_mask,
+                        tma_desc_ptr=desc_a,
                     )
                     cute.copy(
                         tma_atom_b,
@@ -774,6 +837,7 @@ class HopperWgmmaGemmPersistentKernel:
                             mainloop_producer_state
                         ),
                         mcast_mask=b_mcast_mask,
+                        tma_desc_ptr=desc_b,
                     )
 
                     # Mainloop pipeline's producer commit is a NOP
@@ -787,7 +851,11 @@ class HopperWgmmaGemmPersistentKernel:
 
         # MMA warp group
         if not is_dma_warp_group:
-            cute.arch.setmaxregister_increase(self.mma_register_requirement)
+            if cutlass.const_expr(self.reallocate_registers):
+                cute.arch.setmaxregister_increase(self.mma_register_requirement)
+            if cutlass.const_expr(tma_descs is not None):
+                if warp_idx == self.epi_store_warp_id:
+                    cute.nvgpu.cpasync.fence_tma_desc_acquire(desc_c)
             tile_sched = utils.StaticPersistentTileScheduler.create(
                 tile_sched_params, cute.arch.block_idx(), schedule_grid_dim
             )
@@ -969,6 +1037,7 @@ class HopperWgmmaGemmPersistentKernel:
                             tma_atom_c,
                             bSG_sD[(None, epi_buffer)],
                             bSG_gD[(None, gmem_coord)],
+                            tma_desc_ptr=desc_c,
                         )
                         tma_store_pipeline.producer_commit()
                         tma_store_pipeline.producer_acquire()
@@ -979,6 +1048,13 @@ class HopperWgmmaGemmPersistentKernel:
                 work_tile = tile_sched.get_current_work()
 
             tma_store_pipeline.producer_tail()
+            # MegaBake: the tail only waits until shared memory has been read.
+            # Other CTAs read these outputs after the enclosing grid barrier,
+            # so wait for the global writes and order them with the generic
+            # proxy before returning.
+            if warp_idx == self.epi_store_warp_id:
+                cute.arch.cp_async_bulk_wait_group(0, read=False)
+                cute.arch.fence_proxy("async.global")
 
     @staticmethod
     def _compute_stages(
@@ -1440,6 +1516,81 @@ from .interface import (
 )
 
 
+# Pipeline barriers (1 KiB), eight 64x64x64 BF16 A/B stages, and four 64x32
+# BF16 epilogue stages; HopperWgmmaGemmPersistentKernel derives eight stages
+# when this is its shared-memory capacity.
+TABLE_GEMM_SHARED_BYTES = 1024 + 8 * 2 * 64 * 64 * 2 + 4 * 64 * 32 * 2
+
+_TABLE_TENSORMAPS = TensorMapManager(TensorMapUpdateMode.GMEM, 128)
+
+
+@cute.jit
+def table_descriptor(
+    descriptors: cute.Tensor,
+    gemm: cutlass.Int32,
+    operand: cutlass.Constexpr,
+    space: cutlass.Constexpr = cute.AddressSpace.generic,
+):
+    """Pointer to the A (0), B (1), or C (2) TMA descriptor of one table GEMM.
+
+    ``descriptors`` is an Int64 buffer holding three 128-byte descriptors per
+    GEMM phase. TMA copies take generic pointers; descriptor writes take
+    global ones."""
+    return _TABLE_TENSORMAPS.get_tensormap_ptr(
+        descriptors.iterator + (gemm * 3 + operand) * 16, space
+    )
+
+
+@cute.jit
+def table_descriptors(descriptors: cute.Tensor, gemm: cutlass.Int32):
+    return (
+        table_descriptor(descriptors, gemm, 0),
+        table_descriptor(descriptors, gemm, 1),
+        table_descriptor(descriptors, gemm, 2),
+    )
+
+
+@cute.jit
+def _bf16_tensor(address: cutlass.Int64, shape: cutlass.Constexpr, stride: cutlass.Constexpr):
+    return cute.make_tensor(
+        cute.make_ptr(cutlass.BFloat16, address, cute.AddressSpace.gmem, assumed_align=16),
+        cute.make_layout(shape, stride=stride),
+    )
+
+
+@cute.jit
+def build_table_descriptors(
+    prepared,
+    descriptors: cute.Tensor,
+    gemm: cutlass.Int32,
+    a_address: cutlass.Int64,
+    b_address: cutlass.Int64,
+    c_address: cutlass.Int64,
+    mnk: cutlass.Constexpr,
+):
+    """Write one GEMM phase's descriptors from its variant's templates.
+
+    Called by one full warp: the descriptor update is warp-collective, so a
+    single thread deadlocks. The caller publishes the writes with
+    ``fence_tma_desc_release`` before the grid barrier, and the GEMM body
+    acquires them before its first TMA copy."""
+    m, n, k = mnk
+    tensor_bindings, epilogue, _ = prepared
+    atoms = (tensor_bindings[0], tensor_bindings[2], epilogue[0])
+    tensors = (
+        _bf16_tensor(a_address, (m, k, 1), (k, 1, m * k)),
+        _bf16_tensor(b_address, (n, k, 1), (k, 1, n * k)),
+        _bf16_tensor(c_address, (m, n, 1), (n, 1, m * n)),
+    )
+    for operand in cutlass.range_constexpr(3):
+        pointer = table_descriptor(descriptors, gemm, operand, cute.AddressSpace.gmem)
+        with cute.arch.elect_one():
+            cute.nvgpu.cpasync.copy_tensormap(atoms[operand], pointer)
+        cute.arch.sync_warp()
+        cute.nvgpu.cpasync.update_tma_descriptor(atoms[operand], tensors[operand], pointer)
+        cute.arch.sync_warp()
+
+
 class G0RangeBodyProvider:
     provider_name = "g0_range"
 
@@ -1452,7 +1603,7 @@ class G0RangeBodyProvider:
         if not policy.allow_tuned:
             return reject("tuned providers disabled")
         if not policy.allow_tma_gemm:
-            return reject("TMA GEMM bodies are disabled for table-driven launches")
+            return reject("TMA GEMM bodies are disabled by policy")
         if not region.tensor_programs or len(region.tensor_programs) != 1:
             return reject("region has no single tensor program")
 
@@ -1498,6 +1649,13 @@ class G0RangeBodyProvider:
         if not target.supports_tma or not target.supports_wgmma:
             return reject("target lacks TMA or WGMMA")
 
+        if policy.table_launch:
+            # Every table-launched GEMM shares one staged shared-memory layout,
+            # sized to leave room for the other bodies' scratch.
+            return CandidateSet(
+                (_g0_config(region, program, (64, 64), 8, TABLE_GEMM_SHARED_BYTES),),
+                (),
+            )
         return CandidateSet(
             (
                 _g0_config(region, program, (64, 64), 13, 230_400),

@@ -98,6 +98,11 @@ class LaunchMetadata:
     phase_table: tuple[tuple[int, ...], ...] = ()
     dynamic_slots: tuple[int, ...] = ()
     barrier_epochs: int = 0
+    # Table-launched TMA GEMMs: one row per GEMM phase (variant, A, B, and C
+    # address slots), and the phase whose tensors build each variant's
+    # descriptor templates on the host.
+    gemm_table: tuple[tuple[int, ...], ...] = ()
+    gemm_template_phases: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -156,13 +161,21 @@ def emit_cute(
     output_dir: Path | str | None = Path("artifacts/generated"),
     *,
     event_schedule: EventSchedule | None = None,
+    table: bool = False,
 ) -> GeneratedCuTeModule:
+    """Emit one CuTe module for ``plan``.
+
+    ``table`` selects the table-driven launch even when the plan contains TMA
+    GEMM bodies; it is required once per-phase kernel parameters would exceed
+    CUDA's parameter limit. Without it, plans with TMA GEMMs pass their
+    descriptors as kernel parameters.
+    """
     verify_plan(plan)
     if plan.launch.architecture != "sm90a":
         raise UnsupportedCodegen("codegen currently supports sm90a plans only")
 
-    if event_schedule is None and not any(
-        phase.body.provider == "g0_range" for phase in plan.phases
+    if event_schedule is None and (
+        table or not any(phase.body.provider == "g0_range" for phase in plan.phases)
     ):
         source, launch, source_map = _emit_table_module(plan)
     else:
@@ -702,8 +715,14 @@ def _emit_table_module(
     static layout, so kernel parameters and generated code stay bounded by the
     number of distinct bodies rather than by the number of layers.
     """
+    has_gemm = any(phase.body.provider == "g0_range" for phase in plan.phases)
     selected = {
-        selection.region_id: selection for selection in plan.selection.selections
+        selection.region_id: (
+            _normalize_generic_selection(selection, plan.launch.threads_per_block)
+            if has_gemm
+            else selection
+        )
+        for selection in plan.selection.selections
     }
     tensor_arguments = tuple(
         TensorArgument(
@@ -717,6 +736,12 @@ def _emit_table_module(
         )
         for index, binding in enumerate(plan.storage.bindings)
     )
+    gemm_variants: dict[tuple[Any, ...], int] = {}
+    gemm_definitions: list[str] = []
+    gemm_shapes: list[tuple[int, int, int]] = []
+    gemm_template_phases: list[int] = []
+    gemm_rows: list[tuple[int, ...]] = []
+    gemm_scratch_bytes: set[int] = set()
     variants: dict[tuple[Any, ...], tuple[str, int, Any]] = {}
     body_definitions: list[str] = []
     runner_variants: dict[tuple[Any, ...], tuple[int, int, list[str]]] = {}
@@ -753,6 +778,89 @@ def _emit_table_module(
 
     for phase in plan.phases:
         selection = selected[phase.region_id]
+        if phase.body.provider == "g0_range":
+            if phase.conversion_bodies:
+                raise UnsupportedCodegen(
+                    f"table GEMM phase {phase.region_id} needs a layout conversion"
+                )
+            program = selection.program
+            rows, columns = program.store.shape
+            reduction = next(
+                domain.size
+                for domain in program.iteration_domains
+                if domain.axis in program.reduction_axes
+            )
+            tile = tuple(phase.body.tiles.cta_shape[:2])
+            gemm_scratch_bytes.add(phase.body.scratch.size_bytes)
+            gemm_key = (tile, phase.body.scratch.size_bytes, rows, columns, reduction)
+            if gemm_key not in gemm_variants:
+                gemm_variant = len(gemm_variants)
+                gemm_variants[gemm_key] = gemm_variant
+                gemm_shapes.append((rows, columns, reduction))
+                gemm_template_phases.append(phase.index)
+                symbol = f"_gemm_{gemm_variant}"
+                variants[("g0_range", gemm_key)] = (symbol, len(variants), None)
+                gemm_definitions.append(
+                    f"{symbol} = HopperWgmmaGemmPersistentKernel(\n"
+                    "    cutlass.Float32,\n"
+                    f"    {tile!r},\n"
+                    "    (1, 1),\n"
+                    "    1,\n"
+                    "    True,\n"
+                    f"    smem_capacity={phase.body.scratch.size_bytes},\n"
+                    "    reallocate_registers=False,\n"
+                    ")"
+                )
+            gemm_variant = gemm_variants[gemm_key]
+            body_symbol, body_variant_id, _ = variants[("g0_range", gemm_key)]
+            gemm_slots = [
+                _tensor_argument_index(
+                    tensor_arguments,
+                    _tensor_name(tensor_arguments, load.value_id, phase.region_id, "input"),
+                )
+                for load in program.loads
+            ]
+            gemm_slots.append(
+                _tensor_argument_index(
+                    tensor_arguments,
+                    _tensor_name(
+                        tensor_arguments, selection.outputs[0], phase.region_id, "output"
+                    ),
+                )
+            )
+            gemm_index = len(gemm_rows)
+            gemm_rows.append((gemm_variant, *gemm_slots))
+            runner_key = ("g0_range", gemm_variant)
+            if runner_key not in runner_variants:
+                representative_phases.append(phase)
+                runner_variants[runner_key] = (
+                    len(runner_variants),
+                    0,
+                    [
+                        f"            {body_symbol}.run_table(",
+                        f"                gemm_values[{gemm_variant}],",
+                        "                _gemm_scratch,",
+                        "                table_descriptors(tma_descriptors, phase_table[phase, 2]),",
+                        "            )",
+                    ],
+                )
+            runner_id = runner_variants[runner_key][0]
+            phase_rows.append((runner_id, int(phase.barrier is not None), gemm_index))
+            phase_records.append(
+                PhaseEmission(
+                    phase.index,
+                    phase.region_id,
+                    f"{body_symbol}.run_table",
+                    body_variant_id,
+                    phase.body.provider,
+                    phase.body.name,
+                    len(phase.work_items),
+                    len(phase.work_items),
+                    (),
+                    phase.barrier.id if phase.barrier else None,
+                )
+            )
+            continue
         generated = _generate_device_body(selection)
         if generated.__dataclass_fields__.get("scratch_elements") is not None:
             scratch_elements[phase.index] = generated.scratch_elements
@@ -924,6 +1032,18 @@ def _emit_table_module(
     shared_source = _shared_scratch_source(scratch_plan, scratch_elements)
     scratch_prelude = _scratch_prelude(scratch_plan, scratch_elements)
     shared_memory_bytes = plan.launch.dynamic_shared_memory_bytes
+    if has_gemm:
+        if len(gemm_scratch_bytes) != 1 or len({key[0] for key in gemm_variants}) != 1:
+            raise UnsupportedCodegen(
+                "table-launched GEMMs must share one tile and shared-memory layout"
+            )
+        # The allocator sizes dynamic shared memory from the GEMM stages and
+        # the generic union; the 1 KiB covers the GEMM buffers' alignment.
+        shared_memory_bytes = (
+            next(iter(gemm_scratch_bytes))
+            + _generic_scratch_bytes(scratch_plan, scratch_elements)
+            + 1024
+        )
     target = plan.selection.target
     if target is not None and shared_memory_bytes > target.max_shared_memory_per_cta:
         raise UnsupportedCodegen(
@@ -934,10 +1054,100 @@ def _emit_table_module(
         f"        if variant == {runner_id}:\n" + "\n".join(lines)
         for runner_id, _, lines in runner_variants.values()
     )
-    dynamic_writes = "\n".join(
-        f"            addresses[{slot}] = dynamic_addresses[{position}]"
-        for position, slot in enumerate(dynamic_slots)
-    ) or "            pass"
+    # Per-call boundary addresses arrive through one pointer to a host-mapped
+    # buffer instead of one kernel parameter per slot; the first CTA copies
+    # them into the device table before the first barrier.
+    dynamic_writes = (
+        "        _dynamic = cute.make_tensor(\n"
+        "            cute.make_ptr(\n"
+        "                cutlass.Int64, dynamic_addresses, cute.AddressSpace.gmem, assumed_align=8\n"
+        "            ),\n"
+        f"            cute.make_layout({len(dynamic_slots)}),\n"
+        "        )\n"
+        f"        for _position in cutlass.range(_thread, {len(dynamic_slots)}, {plan.launch.threads_per_block}, unroll=1):\n"
+        "            addresses[dynamic_slot_table[_position]] = _dynamic[_position]\n"
+        if dynamic_slots
+        else "        pass\n"
+    )
+    # Phase barriers follow the address barrier and, with GEMMs, the
+    # descriptor barrier.
+    phase_epoch_offset = 2 if has_gemm else 1
+    gemm_kernel_arguments = (
+        "    gemm_table: cute.Tensor,\n"
+        "    tma_descriptors: cute.Tensor,\n"
+        "    gemm_values,\n"
+        if has_gemm
+        else ""
+    )
+    gemm_launch_arguments = (
+        "    gemm_table: cute.Tensor,\n"
+        "    tma_descriptors: cute.Tensor,\n"
+        "    gemm_tensors: tuple[tuple[cute.Tensor, cute.Tensor, cute.Tensor], ...],\n"
+        "    max_active_clusters: cutlass.Constexpr,\n"
+        if has_gemm
+        else ""
+    )
+    gemm_prepare = (
+        "    gemm_values = (\n"
+        + "".join(
+            f"        _gemm_{variant}.prepare(\n"
+            f"            gemm_tensors[{variant}][0],\n"
+            f"            gemm_tensors[{variant}][1],\n"
+            f"            gemm_tensors[{variant}][2],\n"
+            "            max_active_clusters,\n"
+            "        ),\n"
+            for variant in range(len(gemm_shapes))
+        )
+        + "    )\n"
+        if has_gemm
+        else ""
+    )
+    gemm_scratch = (
+        "    _gemm_scratch = cutlass.utils.SmemAllocator().allocate(_gemm_0.shared_storage)\n"
+        if has_gemm
+        else ""
+    )
+    gemm_builds = "\n".join(
+        f"            if gemm_variant == {variant}:\n"
+        f"                build_table_descriptors(\n"
+        f"                    gemm_values[{variant}],\n"
+        "                    tma_descriptors,\n"
+        "                    gemm,\n"
+        "                    addresses[gemm_table[gemm, 1]],\n"
+        "                    addresses[gemm_table[gemm, 2]],\n"
+        "                    addresses[gemm_table[gemm, 3]],\n"
+        f"                    {shape!r},\n"
+        "                )"
+        for variant, shape in enumerate(gemm_shapes)
+    )
+    # One warp per CTA writes the descriptors of the GEMM phases it owns from
+    # this call's addresses, then a barrier publishes them to every TMA user.
+    gemm_prologue = (
+        "    _warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())\n"
+        "    if _warp == 0:\n"
+        f"        for gemm in cutlass.range(_block, {len(gemm_rows)}, workers, unroll=1):\n"
+        "            gemm_variant = gemm_table[gemm, 0]\n"
+        f"{gemm_builds}\n"
+        "        cute.nvgpu.cpasync.fence_tma_desc_release()\n"
+        "    grid_barrier(ready, workers, cutlass.Int32(1) + epoch)\n"
+        if has_gemm
+        else ""
+    )
+    gemm_kernel_call = (
+        "        gemm_table,\n        tma_descriptors,\n        gemm_values,\n"
+        if has_gemm
+        else ""
+    )
+    launch_smem = "" if has_gemm else f"        smem={shared_memory_bytes},\n"
+    gemm_import = (
+        "from megabake.bodies.gemm import (\n"
+        "    HopperWgmmaGemmPersistentKernel,\n"
+        "    build_table_descriptors,\n"
+        "    table_descriptors,\n"
+        ")\n"
+        if has_gemm
+        else ""
+    )
     source = f"""import cutlass
 import cutlass.cute as cute
 from cuda.bindings import driver as cuda
@@ -945,6 +1155,8 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.tensor import _Tensor
 
 from megabake.runtime import grid_barrier
+{gemm_import}
+{chr(10).join(gemm_definitions)}
 
 
 @cute.jit
@@ -983,22 +1195,24 @@ def megabake_kernel(
     addresses: cute.Tensor,
     phase_table: cute.Tensor,
     work_iterators: tuple[cute.Tensor, ...],
-    dynamic_addresses: tuple[cutlass.Int64, ...],
-):
+    dynamic_addresses: cutlass.Int64,
+    dynamic_slot_table: cute.Tensor,
+{gemm_kernel_arguments}):
     _, _, _block = cute.arch.block_idx()
     _thread, _, _ = cute.arch.thread_idx()
 {scratch_prelude}
+{gemm_scratch}
 {"".join(body_definitions)}
     # Publish this call's boundary addresses before any phase reads them.
     if _block == 0:
-        if _thread == 0:
 {dynamic_writes}
     grid_barrier(ready, workers, epoch)
+{gemm_prologue}
     for phase in cutlass.range({len(plan.phases)}, unroll=1):
         variant = phase_table[phase, 0]
 {dispatch}
         if phase_table[phase, 1] != 0:
-            grid_barrier(ready, workers, epoch + phase + 1)
+            grid_barrier(ready, workers, epoch + phase + {phase_epoch_offset})
 
 
 @cute.jit
@@ -1009,10 +1223,11 @@ def launch(
     addresses: cute.Tensor,
     phase_table: cute.Tensor,
     work_iterators: tuple[cute.Tensor, ...],
-    dynamic_addresses: tuple[cutlass.Int64, ...],
-    stream: cuda.CUstream,
+    dynamic_addresses: cutlass.Int64,
+    dynamic_slot_table: cute.Tensor,
+{gemm_launch_arguments}    stream: cuda.CUstream,
 ):
-    megabake_kernel(
+{gemm_prepare}    megabake_kernel(
         ready,
         workers,
         epoch,
@@ -1020,12 +1235,12 @@ def launch(
         phase_table,
         work_iterators,
         dynamic_addresses,
-    ).launch(
+        dynamic_slot_table,
+{gemm_kernel_call}    ).launch(
         grid=[1, 1, workers],
         block=[{plan.launch.threads_per_block}, 1, 1],
         cooperative=True,
-        smem={shared_memory_bytes},
-        stream=stream,
+{launch_smem}        stream=stream,
     )
 """
     launch_metadata = LaunchMetadata(
@@ -1044,18 +1259,26 @@ def launch(
             "phase_table",
             "work_iterators",
             "dynamic_addresses",
+            "dynamic_slot_table",
+            *(
+                ("gemm_table", "tma_descriptors", "gemm_tensors", "max_active_clusters")
+                if has_gemm
+                else ()
+            ),
             "stream",
         ),
         tuple(work_iterators),
         tensor_arguments,
         tuple(phase_records),
         launch_policy="megabake_cooperative_table",
-        body_variant_count=len(body_definitions),
+        body_variant_count=len(variants),
         phase_runner_count=len(runner_variants),
         source_bytes=len(source.encode("utf-8")),
         phase_table=phase_table,
         dynamic_slots=dynamic_slots,
-        barrier_epochs=len(plan.phases) + 1,
+        barrier_epochs=len(plan.phases) + phase_epoch_offset,
+        gemm_table=tuple(gemm_rows),
+        gemm_template_phases=tuple(gemm_template_phases),
     )
     return source, launch_metadata, _source_map(source, plan, phase_records)
 
@@ -1699,7 +1922,7 @@ def _source_map(
             ) or next(
                 index
                 for index, line in enumerate(source_lines, 1)
-                if "grid_barrier(ready, workers, epoch + phase + 1)" in line
+                if "grid_barrier(ready, workers, epoch + phase + " in line
             )
             entries.append(
                 SourceMapEntry(

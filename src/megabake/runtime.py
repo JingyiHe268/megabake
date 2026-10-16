@@ -21,32 +21,45 @@ class InvalidRuntime(ValueError):
 _MAX_INT32 = 2**31 - 1
 
 
+def ready_slots(workers: int) -> int:
+    """Barrier state: per-worker slots, the release flag, and the arrival counter."""
+    return workers + 2
+
+
+def make_ready(workers: int, device: torch.device | str) -> torch.Tensor:
+    ready = torch.full((ready_slots(workers),), -1, dtype=torch.int32, device=device)
+    ready[-1] = 0
+    return ready
+
+
+def reset_ready(ready: torch.Tensor) -> None:
+    ready.fill_(-1)
+    ready[-1] = 0
+
+
 @cute.jit
 def grid_barrier(ready: cute.Tensor, workers: cutlass.Int32, epoch: cutlass.Int32):
-    _, _, block = cute.arch.block_idx()
+    # One arrival atomic per CTA. The last arrival clears the counter before
+    # releasing the epoch flag, so the counter is zero between barriers and no
+    # CTA can arrive at the next barrier before the clear. The previous design
+    # polled every worker's flag serially from one thread, which cost one
+    # acquire round trip per worker (13 us per barrier at 60 workers).
     thread, _, _ = cute.arch.thread_idx()
     cute.arch.sync_threads()
     if thread == 0:
-        cute.arch.atomic_exch(
-            ready.iterator + block,
-            epoch,
-            sem="release",
+        arrived = cute.arch.atomic_add(
+            ready.iterator + workers + 1,
+            cutlass.Int32(1),
+            sem="acq_rel",
             scope="gpu",
         )
-        if block == 0:
-            all_ready = False
-            while not all_ready:
-                all_ready = True
-                for worker in cutlass.range(workers):
-                    seen = cute.arch.atomic_cas(
-                        ready.iterator + worker,
-                        cmp=epoch,
-                        val=epoch,
-                        sem="acquire",
-                        scope="gpu",
-                    )
-                    if seen != epoch:
-                        all_ready = False
+        if arrived == workers - 1:
+            cute.arch.atomic_exch(
+                ready.iterator + workers + 1,
+                cutlass.Int32(0),
+                sem="relaxed",
+                scope="gpu",
+            )
             cute.arch.atomic_exch(
                 ready.iterator + workers,
                 epoch,
@@ -234,11 +247,8 @@ def execute_phase_plan(
     if _stream_is_capturing(active_stream):
         raise InvalidRuntime("CUDA Graph capture is not supported for phase plans")
     with torch.cuda.stream(active_stream):
-        selected_ready = ready if ready is not None else torch.full(
-            (plan.launch.grid_size + 1,),
-            -1,
-            dtype=torch.int32,
-            device=device,
+        selected_ready = (
+            ready if ready is not None else make_ready(plan.launch.grid_size, device)
         )
         selected_epoch = 0 if epoch is None else epoch
         kernel(selected_ready, selected_epoch, active_stream)

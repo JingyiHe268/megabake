@@ -22,7 +22,7 @@ from megabake.frontend import prepare_fx_graph
 from megabake.graph import import_fx
 from megabake.lowering import canonicalize_semantics
 from megabake.regions import form_regions
-from megabake.runtime import cooperative_worker_loop, grid_barrier
+from megabake.runtime import cooperative_worker_loop, grid_barrier, make_ready
 from megabake.schedule import WorkerAssignment
 
 
@@ -189,7 +189,7 @@ def test_phase_runtime_ports_delay_idle_rebinding_and_largest_grid():
     with torch.cuda.stream(stream):
         source = torch.ones(257, device=device, dtype=torch.float32)
         produced = torch.empty(60, device=device, dtype=torch.float32)
-        ready = torch.full((61,), -1, device=device, dtype=torch.int32)
+        ready = make_ready(60, device)
         sink = torch.empty(1, device=device, dtype=torch.float32)
         compiled = cute.compile(
             _launch,
@@ -210,7 +210,7 @@ def test_phase_runtime_ports_delay_idle_rebinding_and_largest_grid():
             _flat(produced),
             _flat(ready_tensor),
             _flat(sink),
-            cutlass.Int32(ready_tensor.numel() - 1),
+            cutlass.Int32(ready_tensor.numel() - 2),
             cutlass.Int32(epoch),
             cuda.CUstream(active_stream.cuda_stream),
         )

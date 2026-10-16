@@ -13,6 +13,7 @@ import uuid
 
 import cutlass
 import cutlass.cute as cute
+import numpy as np
 from cutlass.cute.runtime import from_dlpack
 from cuda.bindings import driver as cuda
 import torch
@@ -45,6 +46,8 @@ from .runtime import (
     admit_runtime,
     execute_event_plan,
     execute_phase_plan,
+    make_ready,
+    reset_ready,
 )
 
 
@@ -190,9 +193,14 @@ class CallableTrace:
     recurring_gpu_operations: tuple[tuple[str, int], ...]
 
 
-# Above this size, per-phase TMA GEMM parameters exceed the CUDA kernel
-# parameter limit, so plans use table-driven generic bodies instead.
+# Above this size, per-phase kernel parameters exceed CUDA's limit, so plans
+# use the table-driven launch: tensors come from a device address table and
+# TMA GEMM descriptors are written per phase in the kernel prologue.
 _TABLE_LAUNCH_OPS = 1_000
+
+
+def _uses_table_launch(graph: ComputeGraph) -> bool:
+    return len(graph.ops) > _TABLE_LAUNCH_OPS
 # A measured candidate must match the captured reference within this
 # relative L2 error before it can be selected. Deep table-launched graphs
 # accumulate bf16 rounding differences: on the 30-layer pinned SmolLM the
@@ -203,7 +211,7 @@ _TABLE_PLAN_RELATIVE_L2_LIMIT = 0.02
 
 
 def _plan_relative_l2_limit(plan: KernelPlan) -> float:
-    if plan.graph is not None and len(plan.graph.ops) > _TABLE_LAUNCH_OPS:
+    if plan.graph is not None and _uses_table_launch(plan.graph):
         return _TABLE_PLAN_RELATIVE_L2_LIMIT
     return _PLAN_RELATIVE_L2_LIMIT
 
@@ -232,7 +240,7 @@ def compile_post_grad(
     if policy is None:
         policy = SelectionPolicy(
             mode=prepared.context.mode,
-            allow_tma_gemm=len(graph.ops) <= _TABLE_LAUNCH_OPS,
+            table_launch=_uses_table_launch(graph),
         )
     if isinstance(search_budget, int):
         if search_budget < 1:
@@ -240,7 +248,7 @@ def compile_post_grad(
         budget = SearchBudget(max_plans=search_budget)
     else:
         budget = search_budget or SearchBudget()
-        if search_budget is None and len(graph.ops) > _TABLE_LAUNCH_OPS:
+        if search_budget is None and _uses_table_launch(graph):
             budget = SearchBudget(max_plans=1, max_compilations=1)
 
     plan_key: str | None = None
@@ -561,7 +569,10 @@ def compile_plan(
                     worker_count=current_plan.launch.grid_size,
                 )
             generated = emit_cute(
-                current_plan, artifact_dir, event_schedule=event_schedule
+                current_plan,
+                artifact_dir,
+                event_schedule=event_schedule,
+                table=_uses_table_launch(current_plan.graph),
             )
             module = _load_generated_module(generated)
             max_active_clusters = _max_active_clusters(generated)
@@ -806,7 +817,9 @@ def bind_callable(
 
         with runtime_lock:
             input_tensors = _input_tensors(graph, full_inputs)
-            _validate_data_indices(compiled_kernel.plan, input_tensors)
+            if state is None:
+                # Structural: every graph input is bound on every call.
+                _validate_data_indices(compiled_kernel.plan, input_tensors)
             active_stream = torch.cuda.current_stream(
                 next(iter(input_tensors.values())).device
             )
@@ -834,6 +847,7 @@ def bind_callable(
                 nonlocal launches
                 arguments = state.arguments(epoch, cuda.CUstream(stream.cuda_stream))
                 compiled_kernel.compiled(*arguments)
+                state.record_launch(stream)
                 launches += 1
 
             if compiled_kernel.event_schedule is None:
@@ -1110,7 +1124,7 @@ def _isolated_kernel_samples(
     if compiled_kernel.event_schedule is not None:
         state.ready.zero_()
     else:
-        state.ready.fill_(-1)
+        reset_ready(state.ready)
     epoch_stride = _epoch_stride(compiled_kernel)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     fast_path = hasattr(
@@ -1586,6 +1600,31 @@ def _worker_assignments(region_id: str, work_items: Sequence[Any], worker_count:
     return tuple(assignments)
 
 
+_DYNAMIC_ADDRESS_BUFFERS = 4
+
+
+@dataclass
+class _TableRebind:
+    """Slots and graph outputs as offsets from per-call root tensors."""
+
+    inputs: list[torch.Tensor]
+    output_layouts: list[Any]
+    output_ids: list[str]
+    slot_roots: np.ndarray
+    slot_offsets: np.ndarray
+    empty_slots: np.ndarray
+    # (root, shape, strides, element offset, is the root itself) per output.
+    graph_outputs: tuple[tuple[int, tuple[int, ...], tuple[int, ...], int, bool], ...]
+
+    def addresses(self, roots: Sequence[torch.Tensor]) -> np.ndarray:
+        pointers = np.fromiter(
+            (tensor.data_ptr() for tensor in roots), dtype=np.int64, count=len(roots)
+        )
+        addresses = pointers[self.slot_roots] + self.slot_offsets
+        addresses[self.empty_slots] = 0
+        return addresses
+
+
 class _RuntimeState:
     def __init__(
         self,
@@ -1609,7 +1648,8 @@ class _RuntimeState:
         self.workspace = workspace
         self.workspace_base = workspace_base
         self.outputs = outputs
-        self.values = values
+        self._values = values
+        self._values_stale = False
         self.g0_tensors = g0_tensors
         self._normal_view_cache: dict[str, tuple[tuple[Any, ...], Any]] = {}
         self._work_iterator_view_cache: dict[
@@ -1621,10 +1661,25 @@ class _RuntimeState:
         self._ready_view: tuple[torch.Tensor, Any] | None = None
         self._max_active_clusters = max_active_clusters
         self._address_table: torch.Tensor | None = None
-        self._address_mirror: list[int] | None = None
+        self._address_mirror: np.ndarray | None = None
         self._phase_table: tuple[torch.Tensor, Any] | None = None
+        self._gemm_table: tuple[torch.Tensor, Any] | None = None
+        # Per-invocation TMA descriptors (three 128-byte maps per table GEMM),
+        # rewritten by every call's kernel prologue.
+        self._tma_descriptors: tuple[torch.Tensor, Any] | None = None
         self._checked_layouts: dict[int, tuple[Any, ...]] = {}
         self.address_table_uploads = 0
+        # Outputs this state allocates per call, by value id.
+        self._allocated_outputs: dict[str, Any] = {}
+        # Table launches: per-call rebinding from root pointers (see
+        # _prepare_table_rebind); None until the first full binding.
+        self._table_rebind: _TableRebind | None = None
+        self._slot_addresses: np.ndarray | None = None
+        self._dynamic_slot_table: tuple[torch.Tensor, Any] | None = None
+        # [pinned buffer, its NumPy view, event of the launch that read it]
+        self._dynamic_buffers: list[list[Any]] = []
+        self._dynamic_buffer_index = 0
+        self._work_iterator_views: tuple[Any, ...] | None = None
 
     @classmethod
     def create(
@@ -1647,12 +1702,7 @@ class _RuntimeState:
         _validate_state_capacities(plan, input_tensors)
         device = next(iter(input_tensors.values())).device
         if ready is None:
-            ready = torch.full(
-                (plan.launch.grid_size + 1,),
-                -1,
-                dtype=torch.int32,
-                device=device,
-            )
+            ready = make_ready(plan.launch.grid_size, device)
         if work_iterators is None:
             work_iterators = {
                 iterator.name: torch.arange(
@@ -1688,15 +1738,33 @@ class _RuntimeState:
         return state
 
     def rebind(self, input_tensors: Mapping[str, torch.Tensor]) -> None:
+        if self._table_rebind is not None and self._fast_table_rebind(input_tensors):
+            return
         self._refresh_values(input_tensors)
 
     def reset_ready(self) -> None:
-        self.ready.fill_(-1)
+        reset_ready(self.ready)
 
     def poison_workspace(self, value: int = 0xE5) -> None:
         self.workspace_base.fill_(value)
 
-    def _refresh_values(self, input_tensors: Mapping[str, torch.Tensor]) -> None:
+    @property
+    def values(self) -> dict[str, torch.Tensor]:
+        """Tensor bound to each value for the current call.
+
+        The table fast path updates only outputs; other bindings are derived
+        again here, keeping this call's outputs, when something reads them."""
+        if self._values_stale:
+            self._values_stale = False
+            outputs = {value_id: self._values[value_id] for value_id in self._allocated_outputs}
+            self._refresh_values(self.input_tensors, reuse_outputs=outputs)
+        return self._values
+
+    def _refresh_values(
+        self,
+        input_tensors: Mapping[str, torch.Tensor],
+        reuse_outputs: Mapping[str, torch.Tensor] | None = None,
+    ) -> None:
         plan = self.plan
         if plan.graph is None:
             raise CompilerError(
@@ -1709,6 +1777,7 @@ class _RuntimeState:
         device = next(iter(input_tensors.values())).device
         workspace = self.workspace
         values: dict[str, torch.Tensor] = {}
+        self._allocated_outputs = {}
         for binding in plan.storage.bindings:
             if binding.storage_id in workspace:
                 values[binding.value_id] = workspace[binding.storage_id]
@@ -1744,7 +1813,12 @@ class _RuntimeState:
                             requirement="output layout",
                         )
                     )
-                values[binding.value_id] = _allocate(binding.layout, device)
+                values[binding.value_id] = (
+                    reuse_outputs[binding.value_id]
+                    if reuse_outputs is not None and binding.value_id in reuse_outputs
+                    else _allocate(binding.layout, device)
+                )
+                self._allocated_outputs[binding.value_id] = binding.layout
                 continue
             if binding.kind == "alias":
                 raise CompilerError(
@@ -1755,6 +1829,12 @@ class _RuntimeState:
                         requirement="boundary alias",
                     )
                 )
+        # Table launches bind only one template group per GEMM variant; the
+        # kernel writes every phase's descriptors from the address table.
+        template_phases = set(self.generated.launch.gemm_template_phases)
+        table_launch = (
+            self.generated.launch.launch_policy == "megabake_cooperative_table"
+        )
         g0_tensors = tuple(
             (
                 _g0_activation_view(
@@ -1775,17 +1855,145 @@ class _RuntimeState:
             )
             for phase in plan.phases
             if phase.body.provider == "g0_range"
+            and (not table_launch or phase.index in template_phases)
             for selected in plan.selection.selections
             if selected.region_id == phase.region_id
         )
         self.input_tensors = input_tensors
-        self.values = values
+        self._values = values
+        self._values_stale = False
         self.outputs = {
             value_id: values[value_id] for value_id in plan.graph.outputs
         }
+        if reuse_outputs is not None:
+            # Diagnostic re-derivation keeps the fast path and its templates.
+            return
         self.g0_tensors = g0_tensors
+        self._slot_addresses = None
+        self._table_rebind = None
+
+    def _prepare_table_rebind(self) -> None:
+        """Express every slot and graph output as (root, byte offset).
+
+        Roots are the graph inputs, the workspace, and the outputs allocated
+        per call. After one full binding, later calls only re-check inputs
+        whose tensor object changed and gather root pointers, instead of
+        re-deriving thousands of bindings in Python. A value whose storage
+        cannot be traced to a root keeps the full path.
+        """
+        graph = self.plan.graph
+        launch = self.generated.launch
+        inputs = [self.input_tensors[value_id] for value_id in graph.inputs]
+        outputs = list(self._allocated_outputs)
+        roots = [*inputs, self.workspace_base, *(self.values[v] for v in outputs)]
+        index = {value_id: position for position, value_id in enumerate(graph.inputs)}
+        index.update(
+            {value_id: len(inputs) + 1 + position for position, value_id in enumerate(outputs)}
+        )
+        workspace_ids = {
+            binding.value_id
+            for binding in self.plan.storage.bindings
+            if binding.storage_id in self.workspace
+        }
+
+        def locate(value_id: str) -> tuple[int, int] | None:
+            tensor = self.values.get(value_id)
+            if tensor is None:
+                return None
+            root_id = _storage_root(value_id, graph)
+            if value_id in workspace_ids or root_id in workspace_ids:
+                position = len(inputs)
+            elif value_id in index:
+                position = index[value_id]
+            elif root_id in index:
+                position = index[root_id]
+            else:
+                return None
+            root = roots[position]
+            if tensor.untyped_storage().data_ptr() != root.untyped_storage().data_ptr():
+                return None
+            return position, tensor.data_ptr() - root.data_ptr()
+
+        slot_roots = np.full(len(launch.tensors), -1, dtype=np.int64)
+        slot_offsets = np.zeros(len(launch.tensors), dtype=np.int64)
+        for slot, argument in enumerate(launch.tensors):
+            if argument.layout is None:
+                continue
+            located = locate(argument.value_id)
+            if located is None:
+                return
+            slot_roots[slot], slot_offsets[slot] = located
+        graph_outputs = []
+        for value_id in graph.outputs:
+            located = locate(value_id)
+            if located is None:
+                return
+            tensor = self.values[value_id]
+            position, offset = located
+            element = tensor.element_size()
+            if offset % element:
+                return
+            graph_outputs.append(
+                (
+                    position,
+                    tuple(tensor.shape),
+                    tuple(tensor.stride()),
+                    offset // element,
+                    tensor is roots[position],
+                )
+            )
+        self._table_rebind = _TableRebind(
+            inputs,
+            [self._allocated_outputs[value_id] for value_id in outputs],
+            outputs,
+            np.where(slot_roots < 0, 0, slot_roots),
+            np.where(slot_roots < 0, 0, slot_offsets),
+            slot_roots < 0,
+            tuple(graph_outputs),
+        )
+        self._slot_addresses = self._table_rebind.addresses(roots)
+
+    def _fast_table_rebind(self, input_tensors: Mapping[str, torch.Tensor]) -> bool:
+        rebind = self._table_rebind
+        graph = self.plan.graph
+        inputs = [input_tensors[value_id] for value_id in graph.inputs]
+        for position, (tensor, previous) in enumerate(zip(inputs, rebind.inputs)):
+            if tensor is previous:
+                continue
+            if (
+                tensor.shape != previous.shape
+                or tensor.stride() != previous.stride()
+                or tensor.dtype != previous.dtype
+                or tensor.device != previous.device
+            ):
+                return False
+        device = self.workspace_base.device
+        outputs = [_allocate(layout, device) for layout in rebind.output_layouts]
+        roots = [*inputs, self.workspace_base, *outputs]
+        self._slot_addresses = rebind.addresses(roots)
+        rebind.inputs = inputs
+        self.input_tensors = input_tensors
+        values = self._values
+        for value_id, tensor in zip(rebind.output_ids, outputs, strict=True):
+            values[value_id] = tensor
+        graph_outputs = {}
+        for value_id, (position, shape, stride, offset, is_root) in zip(
+            graph.outputs, rebind.graph_outputs, strict=True
+        ):
+            root = roots[position]
+            graph_outputs[value_id] = (
+                root
+                if is_root
+                else root.as_strided(shape, stride, root.storage_offset() + offset)
+            )
+        values.update(graph_outputs)
+        self.outputs = graph_outputs
+        self._values_stale = True
+        return True
 
     def tensor_for_value(self, value_id: str) -> torch.Tensor:
+        if value_id in self.outputs:
+            return self.outputs[value_id]
         return self.values[value_id]
 
     @property
@@ -1797,7 +2005,9 @@ class _RuntimeState:
         self, epoch: int, stream: cuda.CUstream, *, include_constants: bool = False
     ) -> tuple[Any, ...]:
         if self.generated.launch.launch_policy == "megabake_cooperative_table":
-            return self._table_arguments(epoch, stream)
+            return self._table_arguments(
+                epoch, stream, include_constants=include_constants
+            )
         normal_views = {
             argument.name: self._cached_view(
                 self._normal_view_cache,
@@ -1870,25 +2080,42 @@ class _RuntimeState:
                 )
         return tuple(arguments)
 
-    def _table_arguments(self, epoch: int, stream: cuda.CUstream) -> tuple[Any, ...]:
+    def _table_arguments(
+        self, epoch: int, stream: cuda.CUstream, *, include_constants: bool = False
+    ) -> tuple[Any, ...]:
         launch = self.generated.launch
         device = self.ready.device
-        addresses = []
-        for slot, argument in enumerate(launch.tensors):
-            if argument.layout is None:
-                addresses.append(0)
-                continue
-            tensor = self.values[argument.value_id]
-            self._check_slot_layout(slot, argument, tensor)
-            addresses.append(tensor.data_ptr())
-        dynamic = set(launch.dynamic_slots)
-        static_addresses = [
-            0 if slot in dynamic else address for slot, address in enumerate(addresses)
-        ]
-        if self._address_table is None or self._address_mirror != static_addresses:
+        if self._slot_addresses is None:
+            for slot, argument in enumerate(launch.tensors):
+                if argument.layout is not None:
+                    self._check_slot_layout(
+                        slot, argument, self.values[argument.value_id]
+                    )
+            self._prepare_table_rebind()
+        if self._slot_addresses is None:
+            addresses = np.array(
+                [
+                    0
+                    if argument.layout is None
+                    else self.values[argument.value_id].data_ptr()
+                    for argument in launch.tensors
+                ]
+                or [0],
+                dtype=np.int64,
+            )
+        else:
+            addresses = self._slot_addresses
+        if launch.gemm_table:
+            self._check_gemm_alignment(addresses)
+        dynamic_slots = np.asarray(launch.dynamic_slots, dtype=np.int64)
+        static_addresses = addresses.copy()
+        static_addresses[dynamic_slots] = 0
+        if self._address_table is None or not np.array_equal(
+            self._address_mirror, static_addresses
+        ):
             # Static slots (weights and workspace) change only on rebinding;
             # the kernel prologue writes the per-call boundary slots itself.
-            table = torch.tensor(static_addresses or [0], dtype=torch.int64)
+            table = torch.from_numpy(static_addresses)
             if self._address_table is None:
                 self._address_table = table.to(device)
             else:
@@ -1902,7 +2129,17 @@ class _RuntimeState:
             self._phase_table = (phase_table, _cute_view(phase_table))
         if self._ready_view is None or self._ready_view[0] is not self.ready:
             self._ready_view = (self.ready, _cute_view(self.ready))
-        return (
+        if self._work_iterator_views is None:
+            self._work_iterator_views = tuple(
+                _cute_view(self.work_iterators[iterator.name])
+                for iterator in launch.work_iterators
+            )
+        if self._dynamic_slot_table is None:
+            slot_table = torch.tensor(
+                list(launch.dynamic_slots) or [0], dtype=torch.int32, device=device
+            )
+            self._dynamic_slot_table = (slot_table, _cute_view(slot_table))
+        arguments: list[Any] = [
             self._ready_view[1],
             cutlass.Int32(self.plan.launch.grid_size),
             cutlass.Int32(epoch),
@@ -1910,17 +2147,89 @@ class _RuntimeState:
                 self._normal_view_cache, "addresses", self._address_table
             ),
             self._phase_table[1],
-            tuple(
-                self._cached_view(
-                    self._work_iterator_view_cache,
-                    iterator.name,
-                    self.work_iterators[iterator.name],
+            self._work_iterator_views,
+            cutlass.Int64(self._stage_dynamic_addresses(addresses[dynamic_slots])),
+            self._dynamic_slot_table[1],
+        ]
+        if launch.gemm_table:
+            if self._gemm_table is None:
+                gemm_table = torch.tensor(
+                    launch.gemm_table, dtype=torch.int32, device=device
                 )
-                for iterator in launch.work_iterators
-            ),
-            tuple(cutlass.Int64(addresses[slot]) for slot in launch.dynamic_slots),
-            stream,
-        )
+                self._gemm_table = (gemm_table, _cute_view(gemm_table))
+            if self._tma_descriptors is None:
+                descriptors = torch.zeros(
+                    len(launch.gemm_table) * 3 * 16, dtype=torch.int64, device=device
+                )
+                self._tma_descriptors = (
+                    descriptors,
+                    from_dlpack(descriptors, assumed_align=128),
+                )
+            arguments.extend(
+                (
+                    self._gemm_table[1],
+                    self._tma_descriptors[1],
+                    tuple(
+                        self._cached_gemm_tensors(index, tensors)
+                        for index, tensors in enumerate(self.g0_tensors)
+                    ),
+                )
+            )
+            if include_constants:
+                arguments.append(self._max_active_clusters)
+        arguments.append(stream)
+        return tuple(arguments)
+
+    def _check_gemm_alignment(self, addresses: np.ndarray) -> None:
+        """TMA descriptors need 16-byte-aligned operand base addresses."""
+        gemm_slots = getattr(self, "_gemm_slots", None)
+        if gemm_slots is None:
+            gemm_slots = np.unique(
+                np.asarray(self.generated.launch.gemm_table, dtype=np.int64)[:, 1:]
+            )
+            self._gemm_slots = gemm_slots
+        misaligned = gemm_slots[addresses[gemm_slots] % 16 != 0]
+        if misaligned.size:
+            argument = self.generated.launch.tensors[int(misaligned[0])]
+            raise CompilerError(
+                CompilerDiagnostic(
+                    "runtime-binding",
+                    f"{argument.value_id} is not 16-byte aligned for its TMA GEMM",
+                    (argument.value_id,),
+                    requirement="16-byte-aligned GEMM operand",
+                )
+            )
+
+    def _stage_dynamic_addresses(self, addresses: np.ndarray) -> int:
+        """Write this call's boundary addresses to a host-mapped pinned buffer
+        and return its address, which the kernel prologue reads directly.
+
+        A small ring keeps a buffer untouched until the launch that read it
+        has finished, without adding GPU work.
+        """
+        if not self._dynamic_buffers:
+            for _ in range(_DYNAMIC_ADDRESS_BUFFERS):
+                host = torch.zeros(max(len(addresses), 1), dtype=torch.int64).pin_memory()
+                self._dynamic_buffers.append([host, host.numpy(), None])
+        entry = self._dynamic_buffers[self._dynamic_buffer_index]
+        self._dynamic_buffer_index = (
+            self._dynamic_buffer_index + 1
+        ) % _DYNAMIC_ADDRESS_BUFFERS
+        if entry[2] is not None:
+            entry[2].synchronize()
+        entry[1][: len(addresses)] = addresses
+        self._pending_dynamic_buffer = entry
+        return entry[0].data_ptr()
+
+    def record_launch(self, stream: torch.cuda.Stream) -> None:
+        """Mark the dynamic-address buffer of the launch just enqueued."""
+        entry = getattr(self, "_pending_dynamic_buffer", None)
+        if entry is None:
+            return
+        event = entry[2] or torch.cuda.Event()
+        event.record(stream)
+        entry[2] = event
+        self._pending_dynamic_buffer = None
 
     def _check_slot_layout(
         self, slot: int, argument: Any, tensor: torch.Tensor
