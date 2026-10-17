@@ -1,6 +1,6 @@
 """Time Hugging Face causal LMs: eager, Inductor, Inductor with CUDA graphs, and MegaBake.
 
-Prefill runs a four-token prompt; decode advances a stateful KV cache one
+Prefill runs a four-token prompt (--prompt-tokens); decode advances a stateful KV cache one
 token per call. Each variant reports the median complete call (host and GPU,
 measured with CUDA events around the call), the profiled kernel time and launch
 count of one call, and its first-call (compile) time. The default model is the
@@ -11,6 +11,7 @@ error and the run continues.
     .venv/bin/python benchmarks/full_model.py --out artifacts/full_model
     .venv/bin/python benchmarks/full_model.py --modes decode --capacity 256
     .venv/bin/python benchmarks/full_model.py --model Qwen/Qwen3.5-0.8B google/gemma-3-270m
+    .venv/bin/python benchmarks/full_model.py --modes decode --decode-contexts 512 2048
 """
 
 from __future__ import annotations
@@ -136,7 +137,8 @@ def _megabake(mode: str, out: Path):
 
 
 def bench_prefill(model, args) -> dict:
-    ids = torch.tensor([PROMPT], device="cuda")
+    prompt = (PROMPT * -(-args.prompt_tokens // len(PROMPT)))[: args.prompt_tokens]
+    ids = torch.tensor([prompt], device="cuda")
     mask = torch.ones_like(ids)
     variants = {
         "eager": lambda: model,
@@ -151,7 +153,7 @@ def bench_prefill(model, args) -> dict:
     }
     with torch.no_grad():
         return {
-            "prompt_tokens": len(PROMPT),
+            "prompt_tokens": len(prompt),
             **{
                 name: _measure_or_error(
                     f"prefill_{name}",
@@ -244,6 +246,86 @@ def bench_decode(model, args) -> dict:
     return results
 
 
+def bench_decode_contexts(model, args) -> dict:
+    """Decode with ``--decode-contexts`` tokens already cached.
+
+    Every wrapper keeps an int32 valid length per attention layer; setting
+    them (and the positions) to L puts the call at context L. Cache contents
+    stay zero: decode time does not depend on them. Each variant compiles
+    once at the capacity of the largest context and is timed at every L.
+    """
+    contexts = sorted(args.decode_contexts)
+    capacity = contexts[-1] + 2 * args.samples + 8
+    stateful, state_shapes = decode_module(model, capacity)
+    token = torch.tensor([[504]], device="cuda")
+    variants = {
+        "eager": lambda: stateful,
+        "inductor": lambda: torch.compile(stateful, fullgraph=True, dynamic=False),
+        "inductor_cudagraphs": lambda: torch.compile(
+            stateful, mode="reduce-overhead", fullgraph=True, dynamic=False
+        ),
+        "megabake": lambda: torch.compile(
+            stateful, backend=_megabake("decode", args.out), fullgraph=True, dynamic=False
+        ),
+    }
+    results: dict[str, object] = {"capacity": capacity, "contexts": contexts}
+    with torch.no_grad():
+        for name, build in variants.items():
+            if name not in args.variants:
+                continue
+            try:
+                torch._dynamo.reset()
+                state = [
+                    torch.zeros(shape, device="cuda", dtype=dtype)
+                    for layer in state_shapes
+                    for shape, dtype in layer
+                ]
+                lengths = [t for t in state if t.dtype == torch.int32 and t.numel() == 1]
+                function = build()
+                function(token, torch.tensor([[0]], device="cuda"), *state)
+                rows = {}
+                for context in contexts:
+                    # Separate device tensors made before timing: a host copy
+                    # inside the loop would synchronize every call.
+                    positions = [
+                        torch.tensor([[context + offset]], device="cuda")
+                        for offset in range(2 * args.samples + 4)
+                    ]
+                    for length in lengths:
+                        length.fill_(context)
+                    for position in positions[:4]:
+                        function(token, position, *state)
+                    torch.cuda.synchronize()
+                    complete = []
+                    for position in positions[4 : 4 + args.samples]:
+                        torch.cuda.synchronize()
+                        started = time.perf_counter()
+                        function(token, position, *state)
+                        torch.cuda.synchronize()
+                        complete.append((time.perf_counter() - started) * 1e6)
+                    pipelined = _pipelined_calls(
+                        [
+                            lambda position=position: function(token, position, *state)
+                            for position in positions[4 + args.samples :]
+                        ]
+                    )
+                    rows[str(context)] = {
+                        "complete_call_us": statistics.median(complete),
+                        "pipelined_call_us": pipelined,
+                    }
+                results[name] = rows
+                summary = {
+                    context: round(row["pipelined_call_us"]) for context, row in rows.items()
+                }
+                print(f"decode_contexts_{name} pipelined_call_us: {json.dumps(summary)}", flush=True)
+            except Exception as error:  # noqa: BLE001 - keep benchmarking the other variants
+                traceback.print_exc()
+                print(f"decode_contexts_{name}: FAILED {type(error).__name__}: {error}", flush=True)
+                results[name] = {"error": f"{type(error).__name__}: {error}"}
+            torch.cuda.empty_cache()
+    return results
+
+
 def _bench_model(name: str, revision: str | None, args: argparse.Namespace) -> None:
     args.out.mkdir(parents=True, exist_ok=True)
     print(f"== {name}@{revision or 'main'} -> {args.out}", flush=True)
@@ -257,6 +339,9 @@ def _bench_model(name: str, revision: str | None, args: argparse.Namespace) -> N
     }
     for mode in args.modes:
         report[mode] = (bench_prefill if mode == "prefill" else bench_decode)(model, args)
+        (args.out / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+    if args.decode_contexts:
+        report["decode_contexts"] = bench_decode_contexts(model, args)
         (args.out / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(f"wrote {args.out / 'report.json'}")
     del model
@@ -287,8 +372,18 @@ def main() -> None:
         help="variants to time (default: all)",
     )
     parser.add_argument("--samples", type=int, default=40)
+    parser.add_argument(
+        "--prompt-tokens", type=int, default=len(PROMPT), help="prefill prompt length"
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--capacity", type=int, default=128, help="decode KV cache capacity")
+    parser.add_argument(
+        "--decode-contexts",
+        type=int,
+        nargs="*",
+        default=[],
+        help="also time decode with this many tokens already cached (e.g. 512 2048)",
+    )
     parser.add_argument("--out", type=Path, default=Path("artifacts/full_model"))
     args = parser.parse_args()
     root = args.out

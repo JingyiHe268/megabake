@@ -410,6 +410,20 @@ def _tile_maps(selection: BodySelectionPlan) -> tuple[TileMap, ...]:
 
 
 def _consumers(selection: BodySelectionPlan) -> dict[str, tuple[str, ...]]:
+    # Boundary bindings ask once per value; build the map once per selection.
+    cached = _CONSUMERS_CACHE.get(id(selection))
+    if cached is not None and cached[0] is selection:
+        return cached[1]
+    result = _build_consumers(selection)
+    _CONSUMERS_CACHE.clear()
+    _CONSUMERS_CACHE[id(selection)] = (selection, result)
+    return result
+
+
+_CONSUMERS_CACHE: dict[int, tuple[BodySelectionPlan, dict[str, tuple[str, ...]]]] = {}
+
+
+def _build_consumers(selection: BodySelectionPlan) -> dict[str, tuple[str, ...]]:
     consumers: dict[str, list[str]] = {}
     graph = selection.graph
     for selected in selection.selections:

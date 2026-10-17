@@ -102,10 +102,12 @@ def test_emit_map_body_generates_copy_source():
     body = emit_map_body(region.tensor_programs[0], config)
 
     assert body.function_name == "run"
-    assert body.tile_count == 3
+    # 350 elements, four per thread: one tile of 128 x 4.
+    assert body.tile_count == 1
+    assert body.tile_elements == 4 * config.participants.participating_threads
     assert body.work_iterator_dtype == "torch.int64"
-    assert "tensor_bindings[0][o0, o1]" in body.source
-    assert "output[o0, o1] = value" in body.source
+    assert "tensor_bindings[0][o0_0, o1_0]" in body.source
+    assert "output[o0_3, o1_3] = value_3" in body.source
 
 
 def test_emit_map_body_generates_zero_rank_scalar_source():
@@ -288,12 +290,12 @@ def test_emit_map_body_decomposes_coordinates_by_output_strides():
     row_body = emit_map_body(*programs[0])
     column_body = emit_map_body(*programs[1])
 
-    assert "o1 = linear_index % 70" in row_body.source
-    assert "linear_index = linear_index // 70" in row_body.source
-    assert "o0 = linear_index % 5" in row_body.source
-    assert "o0 = linear_index % 70" in column_body.source
-    assert "linear_index = linear_index // 70" in column_body.source
-    assert "o1 = linear_index % 5" in column_body.source
+    assert "o1_0 = remainder_0 % 70" in row_body.source
+    assert "remainder_0 = remainder_0 // 70" in row_body.source
+    assert "o0_0 = remainder_0 % 5" in row_body.source
+    assert "o0_0 = remainder_0 % 70" in column_body.source
+    assert "remainder_0 = remainder_0 // 70" in column_body.source
+    assert "o1_0 = remainder_0 % 5" in column_body.source
 
 
 def test_emit_contraction_body_preserves_bias_partial_dimensions_and_cast():
@@ -476,9 +478,13 @@ def test_emit_map_body_binds_each_load_once():
     config = get_candidates(region, _target(), _policy()).configurations[0]
     body = emit_map_body(region.tensor_programs[0], config)
 
+    # Once per element a thread covers, all before the first store.
+    first_store = body.source.index("output[")
     for index, _ in enumerate(region.tensor_programs[0].loads):
-        assert body.source.count(f"load_{index} = ") == 1
-    assert "value = " in body.source and "tensor_bindings[0][o0, o1]" in body.source
+        for element in range(4):
+            assert body.source.count(f"load_{index}_{element} = ") == 1
+            assert body.source.index(f"load_{index}_{element} = ") < first_store
+    assert "value_0 = " in body.source and "tensor_bindings[0][o0_0, o1_0]" in body.source
 
 
 def test_swap_ab_serves_small_m_launches_with_transposed_tiles():
@@ -488,6 +494,7 @@ def test_swap_ab_serves_small_m_launches_with_transposed_tiles():
 
     assert wants_swap_ab([(4, 2048), (4, 8192), (4, 49152)])
     assert wants_swap_ab([(16, 576)])
+    assert wants_swap_ab([(64, 2048)])
     assert not wants_swap_ab([(4, 2048), (256, 2048)])
     assert not wants_swap_ab([])
     body = SimpleNamespace(

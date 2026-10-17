@@ -35,6 +35,8 @@ class SelectionPolicy:
     # side (Mirage's swapAB). One orientation serves the whole launch because
     # its GEMMs share one shared-memory layout.
     table_gemm_swap_ab: bool = False
+    # The token tile (WGMMA N) of swapAB launches: 16, 32, or 64 rows.
+    table_gemm_swap_ab_rows: int = 16
     # Split the K range of swapAB table GEMMs that have fewer weight tiles
     # than SMs (see bodies.gemm.split_k_count).
     table_gemm_split_k: bool = False

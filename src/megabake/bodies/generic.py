@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from math import prod
@@ -186,28 +188,53 @@ def emit_map_body(program: TensorProgram, config: BodyConfig) -> GeneratedMapBod
     ordered_loads = sorted(
         program.loads, key=lambda load: load.id not in index_load_ids
     )
-    hoisted_lines = ""
-    for load in ordered_loads:
-        if load.id not in index_load_ids:
-            hoisted_lines += _gather_bounds_lines(load, hoisted_names)
-        hoisted_lines += (
-            f"            {hoisted_names[load.id]} = "
-            f"{_load_access(load, load_indices[load.id], program.loads, axis_coordinates).code}\n"
+    # Each thread covers MAP_ELEMENTS_PER_THREAD elements of a tile, strided by
+    # the CTA size. Every element's loads are issued before any store, so a
+    # tile costs one round of memory latency; a store between them would
+    # serialize the loads (the pointers may alias). Coordinates wrap modulo
+    # each axis, so an element past the end loads in bounds; only its store
+    # is guarded.
+    elements = MAP_ELEMENTS_PER_THREAD
+    tile_elements = threads * elements
+    load_lines = ""
+    value_lines = ""
+    store_lines = ""
+    for element in range(elements):
+        names = {axis: f"{name}_{element}" for axis, name in axis_coordinates.items()}
+        hoisted = {load_id: f"{name}_{element}" for load_id, name in hoisted_names.items()}
+        index = f"linear_{element}"
+        load_lines += f"        {index} = base + {element * threads}\n"
+        load_lines += f"        remainder_{element} = {index}\n"
+        coordinates = _coordinate_lines(
+            program.store.shape, program.store.strides, f"remainder_{element}"
         )
-    token = _HOISTED_LOADS.set(hoisted_names)
-    try:
-        value = _emit_expression(
-            program.combine, load_indices, axis_coordinates, program.loads
+        load_lines += re.sub(r"\bo(\d+)\b", rf"o\1_{element}", coordinates).replace(
+            "            ", "        "
         )
-    finally:
-        _HOISTED_LOADS.reset(token)
-    value = _cast_expression(value, program.store.dtype)
+        for load in ordered_loads:
+            if load.id not in index_load_ids:
+                load_lines += _gather_bounds_lines(load, hoisted).replace(
+                    "            ", "        ", 1
+                ).replace("\n            ", "\n        ")
+            load_lines += (
+                f"        {hoisted[load.id]} = "
+                f"{_load_access(load, load_indices[load.id], program.loads, names).code}\n"
+            )
+        token = _HOISTED_LOADS.set(hoisted)
+        try:
+            value = _emit_expression(program.combine, load_indices, names, program.loads)
+        finally:
+            _HOISTED_LOADS.reset(token)
+        value = _cast_expression(value, program.store.dtype)
+        value_lines += f"        value_{element} = {value.code}\n"
+        output_index = ", ".join(
+            names[domain.axis] for domain in program.iteration_domains
+        ) or "0"
+        store_lines += (
+            f"        if {index} < output_count:\n"
+            f"            output[{output_index}] = value_{element}\n"
+        )
 
-    coordinate_lines = _coordinate_lines(program.store.shape, program.store.strides)
-    output_coordinates = ", ".join(
-        axis_coordinates[domain.axis] for domain in program.iteration_domains
-    )
-    output_index = output_coordinates or "0"
     binding_type = ", ".join(
         "cute.Tensor" for _ in range(len(input_value_ids) + 1)
     )
@@ -231,19 +258,16 @@ def run(
     output = tensor_bindings[{len(input_value_ids)}]
     output_count = cute.size(output)
     for tile in cutlass.range(block, cute.size(work_iterator), workers):
-        linear_index = work_iterator[tile] + thread
-        if linear_index < output_count:
-{coordinate_lines}{hoisted_lines}            value = {value.code}
-            output[{output_index}] = value
-'''
+        base = work_iterator[tile] + thread
+{load_lines}{value_lines}{store_lines}'''
     element_count = 1
     for size in program.store.shape:
         element_count *= size
-    tile_count = (element_count + threads - 1) // threads
+    tile_count = (element_count + tile_elements - 1) // tile_elements
     return GeneratedMapBody(
         source=source,
         threads_per_cta=threads,
-        tile_elements=threads,
+        tile_elements=tile_elements,
         tile_count=tile_count,
     )
 
@@ -411,6 +435,42 @@ def _expression_axes(expression: Any, loads: Sequence[IndexedLoad]) -> set[str] 
         else:
             return None
     return axes
+
+
+# Elements each thread of a map body covers per tile (see emit_map_body).
+MAP_ELEMENTS_PER_THREAD = 4
+
+
+def reduced_row_axes(program: TensorProgram) -> set[str] | None:
+    """Output axes a reduction's combine and init read: one reduction runs
+    per coordinate of these. The other output axes only take the post
+    expression. None when an index is data dependent."""
+    axes = _expression_axes(program.combine, program.loads)
+    if axes is None:
+        return None
+    return axes | (_expression_axes(program.init, program.loads) or set())
+
+
+def single_cta_rounds(program: TensorProgram, threads: int) -> int:
+    """Rounds of dependent memory latency one CTA spends running every tile
+    of a map or reduction body: map tiles, or reduced rows."""
+    elements = prod(program.store.shape)
+    if program.family != "reduction":
+        return -(-elements // (threads * MAP_ELEMENTS_PER_THREAD))
+    output_domains = [
+        domain
+        for domain in program.iteration_domains
+        if domain.axis not in program.reduction_axes
+    ]
+    reduced_axes = reduced_row_axes(program)
+    row_domains = [
+        domain
+        for domain in output_domains
+        if reduced_axes is None or domain.axis in reduced_axes
+    ]
+    if len(row_domains) == len(output_domains):
+        return elements
+    return prod(domain.size for domain in row_domains)
 
 
 # Strided per-thread loops with at most this many iterations unroll fully, so

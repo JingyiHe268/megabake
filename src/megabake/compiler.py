@@ -23,7 +23,7 @@ import torch
 from torch.utils import _pytree as pytree
 
 from .bodies import SelectionPolicy, TargetFacts
-from .bodies.gemm import cute_gemm_tensors, is_swap_ab, wants_swap_ab
+from .bodies.gemm import cute_gemm_tensors, is_swap_ab, swap_ab_rows, wants_swap_ab
 from .cache import PlanCache, make_plan_key
 from .codegen import GeneratedCuTeModule, emit_cute
 from .diagnostics import CompilerDiagnostic, CompilerError
@@ -97,11 +97,13 @@ def _structural_plan_exists(
     policy: SelectionPolicy | None,
     scheduler: str,
 ) -> bool:
+    # One structurally complete plan proves existence; the measured search
+    # that follows builds its own candidates.
     result = search_plans(
         graph,
         target,
         policy,
-        SearchBudget(evaluator=None),
+        SearchBudget(evaluator=None, max_plans=1),
     )
     return any(
         candidate.plan is not None and candidate.status == "unmeasured"
@@ -396,11 +398,13 @@ def compile_post_grad(
         )
     if policy is None:
         table_launch = _uses_table_launch(graph)
-        swap_ab = table_launch and wants_swap_ab(_gemm_shapes(graph))
+        shapes = _gemm_shapes(graph)
+        swap_ab = table_launch and wants_swap_ab(shapes)
         policy = SelectionPolicy(
             mode=prepared.context.mode,
             table_launch=table_launch,
             table_gemm_swap_ab=swap_ab,
+            table_gemm_swap_ab_rows=swap_ab_rows(shapes) if swap_ab else 16,
             table_gemm_split_k=swap_ab and os.environ.get("MEGABAKE_SPLIT_K") == "1",
         )
     if isinstance(search_budget, int):
@@ -1773,7 +1777,11 @@ def _with_worker_count(
     phases = tuple(
         replace(
             phase,
-            workers=_worker_assignments(phase.region_id, phase.work_items, worker_count),
+            workers=(
+                _recompute_assignments(phase.region_id, phase.work_items, worker_count)
+                if phase.recompute
+                else _worker_assignments(phase.region_id, phase.work_items, worker_count)
+            ),
             barrier=None
             if phase.barrier is None
             else replace(
@@ -1794,6 +1802,12 @@ def _with_worker_count(
         required_active_blocks=worker_count,
     )
     return replace(plan, phases=phases, storage=storage, launch=launch)
+
+
+def _recompute_assignments(region_id: str, work_items: Sequence[Any], worker_count: int):
+    from .schedule import _recompute_assignments as assignments
+
+    return assignments(region_id, tuple(work_items), worker_count)
 
 
 def _worker_assignments(region_id: str, work_items: Sequence[Any], worker_count: int):
@@ -2769,7 +2783,8 @@ def _g0_operands(
 ) -> tuple[torch.Tensor, ...]:
     """CUTLASS ``(A, B, C)`` for a G0 GEMM: activation, weight and output, or
     weight, activation and the transposed output for swapAB."""
-    activation_load, *weight_loads = selected.program.loads
+    # A bias (addmm) is read by the GEMM epilogue, not bound as an operand.
+    activation_load, *weight_loads = selected.program.loads[:2]
     activation = _g0_activation_view(
         activation_load.value_id,
         _g0_source_tensor(activation_load.value_id, graph, input_tensors, values),

@@ -32,66 +32,46 @@ A complete-model request includes all requested outputs and state updates. Named
 
 ## Current status
 
-The complete pinned SmolLM-135M checkpoint (`HuggingFaceTB/SmolLM-135M@1d461723`) compiles through the normal backend into one cooperative CuTe kernel in both prefill and stateful decode. The kernel covers the embedding, all 30 layers, the final norm, the tied vocabulary projection, and the KV-cache updates. Bodies by kind:
+Complete Hugging Face decoder models compile through the normal backend into one cooperative CuTe kernel, in prefill and stateful decode: SmolLM-135M and SmolLM-1.7B (Llama blocks), Qwen2-0.5B (q/k/v biases). Gemma 3 decode compiles through the declared attention op (ROADMAP step 4; not re-measured since). The kernel covers the embedding, every layer, the final norm, the vocabulary projection, and the KV-cache updates.
 
-- **Projections:** every Q/K/V/O, gate/up/down, and vocabulary projection (211 per call) runs the tuned Hopper TMA/WGMMA GEMM body.
-- **Norms and RoPE:** each RMSNorm and each RoPE is fused into one generated region.
-- **Attention:** warp-per-row CuTe bodies.
-- **Everything else:** other elementwise work runs generated generic bodies.
+- **Projections:** the tuned Hopper TMA/WGMMA GEMM. Launches whose GEMMs have at most 64 rows use swapAB (weights on WGMMA's M side, tokens on N = 16/32/64); `addmm` biases are added in the epilogue.
+- **Attention:** declared through transformers' `AttentionInterface` (`megabake::attention`, `megabake::kv_attention`). Decode splits each row's context across CTAs.
+- **Small operators** (norms, RoPE, residual adds, gated activations) run generated bodies. At decode sizes they fold into the barrier interval of their consumer: every CTA recomputes them, so a layer costs about six barrier intervals instead of eleven.
+- **Synchronization:** a grid barrier on a monotonic arrival counter (~0.7 µs at 60 CTAs). Kernel arguments are constant between calls, so a call packs nothing and does not block.
 
-Phases are grouped by dependency level, so independent work shares one grid barrier: 364 barriers per prefill call and 333 per decode call.
+Decode of SmolLM-135M and Qwen2-0.5B matches eager bf16 exactly over advancing calls. SmolLM-1.7B regions match PyTorch on their own inputs up to GEMM accumulation order (≤ 2.6e-4).
 
-Decode logits and all KV caches match eager bf16 exactly over advancing calls. Prefill matches eager exactly after the first call. The first call differs by 1.8% with the same argmax, within the 2% full-model tolerance.
-
-Support is limited to SM90 GPUs, bf16, and models with Llama-style blocks. Decode needs the explicit one-token KV-cache contract (`megabake::kv_attention`), currently captured through the hand-written `StatefulSmolLM` wrapper in `tests/fixtures.py` rather than Hugging Face's own cache classes.
+Limits: SM90 and bf16 only; kernels have static shapes, and `megabake.bucketed` serves variable prompt and batch lengths through a few compiled buckets, checking that padding cannot change real outputs; prefill is slow above ~64 tokens; linear-attention mixers (Qwen3.5's gated delta rule) are not declared yet. [ROADMAP.md](ROADMAP.md) has the plan and the measured state.
 
 ## Current performance
 
-SmolLM-135M on an H200 MIG `3g.71gb` slice (60 SMs), bf16, 40 warm calls each, decode KV capacity 128. Times are medians in milliseconds. "Complete call" is what a caller waits for: host work, launches, and GPU execution. "GPU kernel time" is the sum of kernel durations in one profiled call. The machine is shared, so the eager and Inductor numbers also vary by 5–10% between runs.
+H200 MIG `3g.71gb` slice (60 SMs, ~2.2 TB/s), bf16, 40 warm calls, KV capacity 128. Medians in microseconds. "Call" is a synchronized complete call; "kernel" is GPU time of one profiled call. The slice shares a GPU with other tenants and its clocks move with their load, so single-call kernel times vary by 10–15%.
 
-| | Prefill, 4 tokens | Decode, 1 token | GPU kernel time (prefill / decode) | Kernels per call | First call (prefill / decode) |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Eager | 19.4 | 32.8 | 2.54 / 2.67 | 1,446 / 1,780 | <1 s |
-| `torch.compile` (Inductor) | 7.4 | 13.0 | **1.07 / 1.37** | 512 / 632 | 6 s / 3 s |
-| MegaBake | 3.0 | **3.7** | 1.48 / 2.22 | **1** | 127 s / 79 s |
+| Model | Variant | Decode call | Decode kernel | Prefill call, 4 tokens |
+| --- | --- | ---: | ---: | ---: |
+| SmolLM-135M | Inductor | 11,575 | 1,384 | 1,931 (CUDA graphs) |
+| | MegaBake | **2,135** | 1,503 | 2,093 |
+| SmolLM-1.7B | Inductor | 9,568 | 2,421 | 2,923 (CUDA graphs) |
+| | MegaBake | **3,318** | 2,983 | 3,317 |
+| Qwen2-0.5B | Inductor | 10,178 | 1,650 | 2,162 (CUDA graphs) |
+| | MegaBake | **2,282** | **1,578** | 2,354 |
 
-\* Inductor skips CUDA graphs for decode because the KV caches are mutated inputs, so its decode run is plain Inductor. There is no CUDA-graph decode baseline yet.
+Inductor skips CUDA graphs in decode because the KV caches are mutated inputs. Back-to-back decode calls (`pipelined_call_us`) overlap MegaBake's host work with the previous kernel: 1.50 ms per call on 135M, 2.84 ms on 1.7B.
 
-What this means:
-
-- **End to end:** MegaBake beats eager and default `torch.compile` in both modes, because one launch replaces 500–1,800.
-- **Against CUDA Graph replay:** prefill is still 1.5x slower (3.0 ms vs 2.0 ms). Two gaps remain, and both have to close:
-  - **GPU work:** 1.48 ms vs 1.13 ms.
-  - **Host work:** MegaBake spends about 1.5 ms outside the kernel per call; CUDA-graph replay spends about 0.9 ms.
-- **GPU kernel time:** MegaBake's kernel takes 1.4x Inductor's kernel time in prefill and 1.6x in decode, down from 2.8–3x. Its decode attention cost still grows with context length.
-- **Compilation** takes 79–127 s per mode.
-
-Where the kernel time goes, from per-phase GPU timestamps. Phases in one barrier interval overlap, so the attribution is approximate.
-
-| Phase type | Prefill | Decode, about 40 cached tokens |
-| --- | ---: | ---: |
-| 211 tuned GEMM phases | 0.77 ms | 0.98 ms |
-| 30 attention phases | 0.14 ms | 0.66 ms |
-| 61 fused RMSNorm reductions | 0.21 ms | 0.21 ms |
-| ~200–300 other elementwise and copy phases | 0.36 ms | 0.34 ms |
-
-The next fixes, in order:
-
-1. Split K, or use stream-K, for GEMMs with fewer output tiles than workers. The K/V projections fill 3 of 60 CTAs, and every GEMM phase pays its pipeline start-up.
-2. Split decode attention across the context, with a softmax merge, so its cost stops growing with the number of cached tokens.
-3. Fuse each residual add into the following norm, and the elementwise work around GEMMs into their epilogues.
-4. Cut per-call host work, and find why prefill compilation grew to 127 s.
-
-[PERFORMANCE_REPORT.md](PERFORMANCE_REPORT.md) has the full-model analysis, the history of each fix, and the earlier MLP report.
+- **Decode end to end:** 3–5x faster than Inductor, since one launch replaces 450–630.
+- **Long contexts:** decode stays flat. At 2,000 cached tokens: 135M 2.3 ms (Inductor 10.5 ms), 1.7B 5.5 ms (8.5 ms).
+- **Still behind:** decode GPU time on the SmolLM models (1.50 vs 1.38 ms, 2.98 vs 2.42 ms), prefill on 1.7B and at 32-token prompts, and compilation (1–6 minutes, growing with token count).
 
 Reproduce on an SM90 device:
 
 ```bash
-.venv/bin/python benchmarks/full_model.py                               # 40 calls, decode capacity 128; writes artifacts/full_model/report.json
-.venv/bin/python tools/dump_megakernels.py --checkpoint                  # correctness check plus generated source and phase tables
+.venv/bin/python benchmarks/full_model.py --model HuggingFaceTB/SmolLM-135M HuggingFaceTB/SmolLM-1.7B
+.venv/bin/python benchmarks/full_model.py --variants inductor megabake --modes decode   # a subset
+MEGABAKE_PHASE_TIMER=1 .venv/bin/python tools/phase_profile.py --mode decode            # time per barrier interval
+.venv/bin/python tools/dump_megakernels.py --checkpoint                                   # correctness check plus generated source
 ```
 
-`benchmarks/run.py --workload mlp|transformer-block` and `benchmarks/isolated.py` measure the smaller fixtures.
+`benchmarks/run.py --workload mlp|transformer-block` and `benchmarks/isolated.py` measure the smaller fixtures. [PERFORMANCE_REPORT.md](PERFORMANCE_REPORT.md) has the earlier analysis.
 
 ## Current frontend
 

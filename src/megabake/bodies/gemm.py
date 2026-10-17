@@ -34,6 +34,7 @@
 from collections.abc import Sequence
 from typing import Optional, Tuple, Type
 import math
+from math import prod
 import re
 import cuda.bindings.driver as cuda
 
@@ -162,6 +163,8 @@ class HopperWgmmaGemmPersistentKernel:
         smem_capacity: int | None = None,
         reallocate_registers: bool = True,
         splits: int = 1,
+        bias_features: int = 0,
+        bias_along_m: bool = False,
     ):
         """
         Initializes the configuration for a Hopper dense GEMM kernel.
@@ -225,6 +228,11 @@ class HopperWgmmaGemmPersistentKernel:
         # them in split order and runs the epilogue, so results do not depend
         # on which CTA finishes last.
         self.splits = splits
+        # MegaBake: a BF16 bias over the output features (addmm), added to
+        # the FP32 accumulators before the single rounding to BF16. swapAB
+        # GEMMs carry the features on CUTLASS M, the others on N.
+        self.bias_features = bias_features
+        self.bias_along_m = bias_along_m
 
         self.ab_stage = None
         self.epi_stage = None
@@ -261,9 +269,9 @@ class HopperWgmmaGemmPersistentKernel:
         # check the cta tile shape
         if self.tile_shape_mnk[0] not in [64, 128]:
             raise ValueError("CTA tile shape M must be 64/128")
-        # N=16 serves swapAB GEMMs, whose N is the 1-16 token rows.
-        if self.tile_shape_mnk[1] not in [16, 64, 128, 256]:
-            raise ValueError("CTA tile shape N must be 16/64/128/256")
+        # N=16/32 serve swapAB GEMMs, whose N is the 1-32 token rows.
+        if self.tile_shape_mnk[1] not in [16, 32, 64, 128, 256]:
+            raise ValueError("CTA tile shape N must be 16/32/64/128/256")
 
         self.tiled_mma = sm90_utils.make_trivial_tiled_mma(
             self.a_dtype,
@@ -525,7 +533,9 @@ class HopperWgmmaGemmPersistentKernel:
         )
 
     @cute.jit
-    def run_table(self, prepared, scratch, tma_descs, rotated_block=None, split_state=None):
+    def run_table(
+        self, prepared, scratch, tma_descs, rotated_block=None, split_state=None, bias_address=None
+    ):
         """Run one table-launched phase whose TMA descriptors live in global
         memory. ``prepared`` is this variant's ``prepare`` result; the kernel
         prologue has written ``tma_descs`` (A, B, C) for this phase's tensors.
@@ -561,6 +571,7 @@ class HopperWgmmaGemmPersistentKernel:
             tma_descs,
             rotated_block,
             split_state,
+            bias_address,
         )
 
     @cute.kernel
@@ -617,6 +628,7 @@ class HopperWgmmaGemmPersistentKernel:
         tma_descs=None,
         rotated_block=None,
         split_state=None,
+        bias_address=None,
     ):
         """
         GPU device kernel performing the batched GEMM computation.
@@ -1043,6 +1055,9 @@ class HopperWgmmaGemmPersistentKernel:
                         tile_sched,
                         warp_idx,
                         desc_c,
+                        thr_copy_r2s,
+                        tile_coord_mnl,
+                        bias_address,
                     )
 
                 tile_sched.advance_to_next_work()
@@ -1131,6 +1146,9 @@ class HopperWgmmaGemmPersistentKernel:
         tile_sched,
         warp_idx,
         desc_c,
+        thr_copy_r2s=None,
+        tile_coord_mnl=None,
+        bias_address=None,
     ):
         # Epilogue
         tCgC_for_tma_partition = cute.zipped_divide(gC_mnl_slice, self.epi_tile)
@@ -1151,10 +1169,43 @@ class HopperWgmmaGemmPersistentKernel:
         )
 
         num_prev_epi_tiles = tile_sched.num_tiles_executed * epi_tile_num
+        if cutlass.const_expr(self.bias_features > 0):
+            # MegaBake: the source side of the per-thread register-to-shared
+            # copy follows the MMA accumulator layout, so it locates each D
+            # register in the epilogue subtile. (The MMA slice is per
+            # warpgroup, and the stmatrix destination side names the rows a
+            # thread addresses, not the values it holds.)
+            epi_coordinates = thr_copy_r2s.partition_S(
+                cute.make_identity_tensor(self.epi_tile)
+            )
+            bias = cute.make_tensor(
+                cute.make_ptr(
+                    cutlass.BFloat16, bias_address, cute.AddressSpace.gmem, assumed_align=2
+                ),
+                cute.make_layout(self.bias_features),
+            )
         for epi_idx in cutlass.range_constexpr(epi_tile_num):
             # Copy from accumulators to D registers
             for epi_v in cutlass.range_constexpr(size_tRS_rD):
                 tRS_rD[epi_v] = tRS_rAcc[epi_idx * size_tRS_rD + epi_v]
+            if cutlass.const_expr(self.bias_features > 0):
+                # addmm: add the output feature's bias in FP32, then round once.
+                epi_m, epi_n = epi_tile_layout.get_hier_coord(epi_idx)
+                for epi_v in cutlass.range_constexpr(size_tRS_rD):
+                    coordinate = epi_coordinates[epi_v]
+                    if cutlass.const_expr(self.bias_along_m):
+                        feature = (
+                            tile_coord_mnl[0] * self.tile_shape_mnk[0]
+                            + epi_m * self.epi_tile[0]
+                            + coordinate[0]
+                        )
+                    else:
+                        feature = (
+                            tile_coord_mnl[1] * self.tile_shape_mnk[1]
+                            + epi_n * self.epi_tile[1]
+                            + coordinate[1]
+                        )
+                    tRS_rD[epi_v] = tRS_rD[epi_v] + bias[feature].to(cutlass.Float32)
 
             # Type conversion
             acc_vec = tRS_rD.load()
@@ -1753,8 +1804,14 @@ class G0RangeBodyProvider:
         program = region.tensor_programs[0]
         if program.family != "contraction":
             return reject("provider supports contraction only")
-        if len(program.loads) != 2:
-            return reject("bias epilogues are not supported")
+        if len(program.loads) == 3:
+            if not policy.table_launch:
+                return reject("bias epilogues need a table launch")
+            reason = _bias_epilogue_rejection(program)
+            if reason is not None:
+                return reject(reason)
+        elif len(program.loads) != 2:
+            return reject("provider supports two operands and an optional bias")
         if len(program.store.shape) != 2:
             return reject("provider supports two-dimensional GEMM only")
         if (
@@ -1774,7 +1831,7 @@ class G0RangeBodyProvider:
         if columns % 64 or reduction_size % 64:
             return reject("N and K must be multiples of 64")
 
-        left, right = program.loads
+        left, right = program.loads[:2]
         left_strides = dict(zip(left.axes, left.strides, strict=True))
         right_strides = dict(zip(right.axes, right.strides, strict=True))
         if (
@@ -1796,8 +1853,9 @@ class G0RangeBodyProvider:
             # Every table-launched GEMM shares one staged shared-memory budget,
             # sized to leave room for the other bodies' scratch.
             if policy.table_gemm_swap_ab:
-                if rows > SWAP_AB_MAX_ROWS:
-                    return reject(f"swapAB GEMMs need at most {SWAP_AB_MAX_ROWS} rows")
+                token_tile = policy.table_gemm_swap_ab_rows
+                if rows > token_tile:
+                    return reject(f"swapAB GEMMs of this launch take at most {token_tile} rows")
                 splits = (
                     split_k_count(
                         -(-columns // 64), reduction_size // 64, target.multiprocessor_count
@@ -1808,7 +1866,7 @@ class G0RangeBodyProvider:
                 return CandidateSet(
                     (
                         _g0_config(
-                            region, program, (SWAP_AB_MAX_ROWS, 64), 8,
+                            region, program, (token_tile, 64), 8,
                             TABLE_GEMM_SHARED_BYTES, swap_ab=True, splits=splits,
                         ),
                     ),
@@ -1832,7 +1890,10 @@ class G0RangeBodyProvider:
 # Swapping the operands puts 64 weight rows on WGMMA's M side and the tokens
 # on N=16. On 60 SMs this doubles decode GEMM bandwidth (0.84-1.04 to
 # 1.78-2.07 TB/s), matching cuBLAS.
-SWAP_AB_MAX_ROWS = 16
+SWAP_AB_MAX_ROWS = 64
+# WGMMA N tiles for the token rows of swapAB launches; a launch takes the
+# smallest that holds its largest GEMM.
+SWAP_AB_ROW_TILES = (16, 32, 64)
 
 
 # Split-K (Mirage splits small-N linears the same way): a decode projection
@@ -1858,9 +1919,54 @@ def split_k_count(tiles: int, k_tiles: int, workers: int) -> int:
     return best
 
 
+def has_bias(body: BodyConfig) -> bool:
+    """Whether a G0 GEMM body adds a bias in its epilogue (addmm)."""
+    return body.name.endswith("_bias")
+
+
+def _bias_epilogue_rejection(program) -> str | None:
+    """Why ``program``'s bias does not fit the GEMM epilogue, or None.
+
+    The epilogue adds a contiguous BF16 bias over the output columns to the
+    FP32 accumulators and rounds once, exactly ``post`` with alpha = beta = 1.
+    """
+    from ..lowering import Accumulator, Binary, Cast, Load
+
+    bias = program.loads[2]
+    columns = program.store.shape[1]
+    axes = dict(zip(bias.axes, bias.strides, strict=True))
+    if bias.dtype != "torch.bfloat16":
+        return "bias must be BF16"
+    if axes.get("o1") != 1 or any(
+        not isinstance(axis, int) for axis in bias.axes if axis != "o1"
+    ):
+        return "bias must be contiguous over the output columns"
+    if bias.source_shape is not None and prod(bias.source_shape) != columns:
+        return "bias must hold one value per output column"
+    product = program.combine.rhs if isinstance(program.combine, Binary) else None
+    if not (
+        isinstance(product, Binary)
+        and product.operator == "mul"
+        and all(isinstance(operand, Cast) for operand in (product.lhs, product.rhs))
+    ):
+        return "only alpha = 1 is supported"
+    post = program.post
+    if not (
+        isinstance(post, Cast)
+        and isinstance(post.operand, Binary)
+        and post.operand.operator == "add"
+        and isinstance(post.operand.lhs, Accumulator)
+        and isinstance(post.operand.rhs, Cast)
+        and isinstance(post.operand.rhs.operand, Load)
+        and post.operand.rhs.operand.load_id == bias.id
+    ):
+        return "only beta = 1 is supported"
+    return None
+
+
 def split_k(body: BodyConfig) -> int:
     """K splits of a G0 GEMM body (1 without split-K)."""
-    match = re.search(r"_k(\d+)$", body.name)
+    match = re.search(r"_k(\d+)(?:_bias)?$", body.name)
     return int(match.group(1)) if match else 1
 
 
@@ -1875,6 +1981,12 @@ def kernel_tile(body: BodyConfig) -> tuple[int, int]:
     columns) coordinates, which swapAB transposes."""
     rows, columns = body.tiles.cta_shape[:2]
     return (columns, rows) if is_swap_ab(body) else (rows, columns)
+
+
+def swap_ab_rows(shapes: Sequence[tuple[int, int]]) -> int:
+    """The swapAB token tile for a launch's ``(rows, columns)`` GEMMs."""
+    largest = max((rows for rows, _ in shapes), default=0)
+    return next(tile for tile in SWAP_AB_ROW_TILES if largest <= tile)
 
 
 def wants_swap_ab(shapes: Sequence[tuple[int, int]]) -> bool:
@@ -2013,6 +2125,7 @@ def _g0_config(
         name=(
             f"g0_range_{'swapab_' if swap_ab else ''}{tile[0]}x{tile[1]}"
             + (f"_k{splits}" if splits > 1 else "")
+            + ("_bias" if len(program.loads) == 3 else "")
         ),
         semantic=SemanticContract(
             operation_family="view_plus_gemm"

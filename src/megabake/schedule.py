@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from bisect import bisect_left, bisect_right
@@ -92,6 +92,11 @@ class ScheduledPhase:
     dependencies: tuple[str, ...]
     conversion_bodies: tuple[ConversionBody, ...] = ()
     barrier: PhaseBarrier | None = None
+    # Every worker runs all of this phase's work items before the other
+    # phases of its barrier interval, which may then depend on it. Small
+    # producers fold into the interval of their consumers this way instead
+    # of costing a barrier interval of their own (see _fold_small_intervals).
+    recompute: bool = False
 
 
 @dataclass(frozen=True)
@@ -213,6 +218,22 @@ class EventScheduleSimulation:
 
 
 def derive_dependencies(selection: BodySelectionPlan) -> DependencyPlan:
+    """Dependencies of ``selection``'s regions; computed once per selection
+    object, since plan search derives them for every worker count."""
+    cached = _DEPENDENCY_CACHE.get(id(selection))
+    if cached is not None and cached[0] is selection:
+        return cached[1]
+    result = _derive_dependencies(selection)
+    if len(_DEPENDENCY_CACHE) >= 8:
+        _DEPENDENCY_CACHE.pop(next(iter(_DEPENDENCY_CACHE)))
+    _DEPENDENCY_CACHE[id(selection)] = (selection, result)
+    return result
+
+
+_DEPENDENCY_CACHE: dict[int, tuple[BodySelectionPlan, DependencyPlan]] = {}
+
+
+def _derive_dependencies(selection: BodySelectionPlan) -> DependencyPlan:
     if not selection.report.complete:
         raise InvalidSchedule("cannot schedule a plan with unsupported regions")
     if selection.graph is None:
@@ -275,6 +296,7 @@ def make_phase_schedule(
     dependencies: DependencyPlan,
     *,
     worker_count: int | None = None,
+    fold_small_intervals: bool = False,
 ) -> PhaseSchedule:
     if not selection.report.complete:
         raise InvalidSchedule("cannot schedule a plan with unsupported regions")
@@ -297,6 +319,11 @@ def make_phase_schedule(
     order, barrier_after = _level_order(
         _topological_order(selection.selections, dependencies), dependencies
     )
+    recompute: frozenset[str] = frozenset()
+    if fold_small_intervals:
+        order, barrier_after, recompute = _fold_small_intervals(
+            order, barrier_after, selection, selected_by_region
+        )
     # Plans list bodies in phase order.
     selection = replace(
         selection, selections=tuple(selected_by_region[region_id] for region_id in order)
@@ -328,6 +355,7 @@ def make_phase_schedule(
         selected = selected_by_region[region_id]
         tile_map = tile_maps[region_id]
         work_items = tile_map.work_items
+        folded = region_id in recompute
         barrier = (
             PhaseBarrier(
                 f"phase:{phase_index}:grid",
@@ -344,7 +372,11 @@ def make_phase_schedule(
                 participants=selected.participants,
                 resources=selected.resources,
                 work_items=work_items,
-                workers=_worker_assignments(region_id, work_items, worker_count),
+                workers=(
+                    _recompute_assignments(region_id, work_items, worker_count)
+                    if folded
+                    else _worker_assignments(region_id, work_items, worker_count)
+                ),
                 dependencies=tuple(
                     sorted(dependencies.prerequisites_for(region_id))
                 ),
@@ -354,6 +386,7 @@ def make_phase_schedule(
                     if conversion.source_region_id == region_id
                 ),
                 barrier=barrier,
+                recompute=folded,
             )
         )
 
@@ -376,14 +409,20 @@ def simulate_phase_schedule(schedule: PhaseSchedule) -> ScheduleSimulation:
     work_counts: dict[str, int] = {}
     idle_counts: dict[str, int] = {}
 
+    # Recompute phases of the current interval, which every worker has run.
+    recomputed: set[str] = set()
     for index, phase in enumerate(schedule.phases):
-        concurrent = schedule.prerequisites_for(phase.region_id) & interval
+        if phase.recompute and interval - recomputed:
+            raise InvalidSchedule(
+                f"recompute phase {phase.index} follows a distributed phase of its interval"
+            )
+        concurrent = schedule.prerequisites_for(phase.region_id) & (interval - recomputed)
         if concurrent:
             raise InvalidSchedule(
                 f"phase {phase.index} shares a barrier interval with its prerequisites "
                 f"{sorted(concurrent)}"
             )
-        missing = schedule.prerequisites_for(phase.region_id) - completed
+        missing = schedule.prerequisites_for(phase.region_id) - completed - recomputed
         if missing:
             raise InvalidSchedule(
                 f"phase {phase.index} has unfinished prerequisites {sorted(missing)}"
@@ -396,13 +435,19 @@ def simulate_phase_schedule(schedule: PhaseSchedule) -> ScheduleSimulation:
         worker_ids = [worker.worker_id for worker in phase.workers]
         if worker_ids != list(range(schedule.worker_count)):
             raise InvalidSchedule(f"phase {phase.index} has invalid worker IDs")
-        assigned = Counter(
-            work_item
-            for worker in phase.workers
-            for work_item in worker.work_items
-        )
-        if assigned != Counter(phase.work_items):
-            raise InvalidSchedule(f"phase {phase.index} has invalid work assignments")
+        if phase.recompute:
+            if any(worker.work_items != phase.work_items for worker in phase.workers):
+                raise InvalidSchedule(
+                    f"recompute phase {phase.index} does not give every worker every item"
+                )
+        else:
+            assigned = Counter(
+                work_item
+                for worker in phase.workers
+                for work_item in worker.work_items
+            )
+            if assigned != Counter(phase.work_items):
+                raise InvalidSchedule(f"phase {phase.index} has invalid work assignments")
         if any(not worker.participates_in_barrier for worker in phase.workers):
             raise InvalidSchedule(f"phase {phase.index} has a worker outside its barrier")
 
@@ -424,9 +469,12 @@ def simulate_phase_schedule(schedule: PhaseSchedule) -> ScheduleSimulation:
             not worker.work_items for worker in phase.workers
         )
         interval.add(phase.region_id)
+        if phase.recompute:
+            recomputed.add(phase.region_id)
         if phase.barrier is not None or is_final:
             completed |= interval
             interval = set()
+            recomputed = set()
 
     return ScheduleSimulation(
         tuple(phase_order),
@@ -979,12 +1027,30 @@ def _tile_dependency(
         producer_by_origin.setdefault(tile.origin[axis], []).append(tile)
     origins = tuple(sorted(producer_by_origin))
     maximum_extent = max(tile.shape[axis] for tile in producer_output_tiles)
+    # A consumer tile that reads the producer's whole value (a GEMM reading
+    # its activation, a norm its row) depends on every producer tile; one
+    # overlap check settles exactness instead of one per producer tile.
+    extent = tuple(
+        max(tile.origin[position] + tile.shape[position] for tile in producer_output_tiles)
+        for position in range(rank)
+    )
+    all_origins = {tile.origin for tile in producer_output_tiles}
     for access in consumer_accesses:
         input_tile = next(
             input_tile
             for input_tile in access.inputs
             if input_tile.value_id == value_id
         )
+        if (
+            len(input_tile.origin) == rank
+            and all(origin == 0 for origin in input_tile.origin)
+            and all(size >= end for size, end in zip(input_tile.shape, extent, strict=True))
+        ):
+            overlaps, is_exact = _logical_tiles_overlap(producer_output_tiles[0], input_tile)
+            if is_exact and overlaps:
+                producer_origins |= all_origins
+                consumer_tiles.add(access.output.origin)
+                continue
         matched = False
         if len(input_tile.origin) != rank:
             # Mismatched ranks are never exact; the overlap check reports it.
@@ -1310,6 +1376,135 @@ def _worker_count(
         for selected in selection.selections
     )
     return min(maximum_work, selection.target.multiprocessor_count * active_blocks)
+
+
+# Limits on what folds into a later interval: a folded producer runs on every
+# worker by itself, so it must be a few rounds of memory latency for one CTA.
+_FOLD_FAMILIES = frozenset({"elementwise", "copy", "reduction", "gather", "concat"})
+_FOLD_MAX_ROUNDS_PER_PHASE = 2
+_FOLD_MAX_ROUNDS = 6
+_FOLD_MAX_PHASES = 6
+
+
+def _fold_small_intervals(
+    order: tuple[str, ...],
+    barrier_after: tuple[bool, ...],
+    selection: BodySelectionPlan,
+    selected_by_region: Mapping[str, SelectedBody],
+) -> tuple[tuple[str, ...], tuple[bool, ...], frozenset[str]]:
+    """Fold runs of barrier intervals that hold only small map and reduction
+    bodies into the next interval, as recompute phases.
+
+    Decode spends most of its barrier intervals on norms, residual adds,
+    RoPE, and gated activations over a few thousand elements; each costs a
+    grid barrier and a dispatch round for a fraction of a microsecond of
+    work. Recomputed by every CTA at the start of the consumer interval they
+    cost one CTA's latency instead (Mirage fuses the same operators into its
+    linear and attention tasks). Every CTA writes the same values, and reads
+    only what it has written itself. A run does not fold if the receiving
+    interval writes storage the run reads or writes.
+    """
+    from .bodies.generic import single_cta_rounds
+
+    graph = selection.graph
+    threads = max(
+        (selected.participants.participating_threads for selected in selection.selections),
+        default=128,
+    )
+    converted = {
+        region_id
+        for conversion in selection.conversions
+        for region_id in (conversion.source_region_id, conversion.target_region_id)
+    }
+
+    def rounds(region_id: str) -> int | None:
+        selected = selected_by_region[region_id]
+        program = selected.program
+        if (
+            selected.body.provider != "generic"
+            or program.family not in _FOLD_FAMILIES
+            or program.state_accesses
+            or region_id in converted
+        ):
+            return None
+        count = single_cta_rounds(program, threads)
+        return count if count <= _FOLD_MAX_ROUNDS_PER_PHASE else None
+
+    def storage(region_ids: Sequence[str], *, writes: bool) -> frozenset[str]:
+        values: list[str] = []
+        for region_id in region_ids:
+            selected = selected_by_region[region_id]
+            values.extend(selected.outputs)
+            if not writes or selected.program.state_accesses:
+                # Stateful bodies may write their inputs (KV appends).
+                values.extend(selected.inputs)
+        return _storage_ids(graph, tuple(values)) if graph is not None else frozenset()
+
+    intervals: list[list[str]] = [[]]
+    for region_id, barrier in zip(order, barrier_after, strict=True):
+        intervals[-1].append(region_id)
+        if barrier:
+            intervals.append([])
+    if not intervals[-1]:
+        intervals.pop()
+
+    result: list[list[str]] = []
+    folded: set[str] = set()
+    pending: list[list[str]] = []
+    pending_rounds = 0
+
+    def flush() -> None:
+        nonlocal pending_rounds
+        result.extend(pending)
+        pending.clear()
+        pending_rounds = 0
+
+    for interval in intervals:
+        costs = [rounds(region_id) for region_id in interval]
+        if all(cost is not None for cost in costs):
+            def fits() -> bool:
+                phases = sum(len(group) for group in pending) + len(interval)
+                return (
+                    pending_rounds + sum(costs) <= _FOLD_MAX_ROUNDS
+                    and phases <= _FOLD_MAX_PHASES
+                )
+
+            if not fits():
+                flush()
+            if fits():
+                pending.append(interval)
+                pending_rounds += sum(costs)
+            else:
+                result.append(interval)
+            continue
+        if pending:
+            run = [region_id for group in pending for region_id in group]
+            receiver_writes = storage(interval, writes=True)
+            if receiver_writes & (storage(run, writes=False) | storage(run, writes=True)):
+                flush()
+            else:
+                folded.update(run)
+                interval = run + interval
+                pending.clear()
+                pending_rounds = 0
+        result.append(interval)
+    flush()
+
+    new_order = tuple(region_id for interval in result for region_id in interval)
+    new_barriers = tuple(
+        position + 1 == len(interval) and index + 1 < len(result)
+        for index, interval in enumerate(result)
+        for position in range(len(interval))
+    )
+    return new_order, new_barriers, frozenset(folded)
+
+
+def _recompute_assignments(
+    region_id: str, work_items: tuple[WorkItem, ...], worker_count: int
+) -> tuple[WorkerAssignment, ...]:
+    return tuple(
+        WorkerAssignment(worker_id, region_id, work_items) for worker_id in range(worker_count)
+    )
 
 
 def _worker_assignments(

@@ -10,7 +10,13 @@ import textwrap
 from typing import Any
 from collections.abc import Mapping, Sequence
 
-from .bodies.gemm import HopperWgmmaGemmPersistentKernel, is_swap_ab, kernel_tile, split_k
+from .bodies.gemm import (
+    HopperWgmmaGemmPersistentKernel,
+    has_bias,
+    is_swap_ab,
+    kernel_tile,
+    split_k,
+)
 from .bodies.attention import emit_attention_body
 from .bodies.blackwell import emit_blackwell_gemm
 from .bodies.generic import (
@@ -384,7 +390,7 @@ def _emit_generic_module(
             1
             if selection.program.family in {"reduction", "attention"}
             or selection.body.provider == "blackwell_mma"
-            else generated.threads_per_cta
+            else getattr(generated, "tile_elements", generated.threads_per_cta)
         )
         work_iterators.append(
             WorkIteratorBinding(
@@ -833,9 +839,10 @@ def _emit_table_module(
             )
             tile = kernel_tile(phase.body)
             splits = split_k(phase.body)
+            bias = has_bias(phase.body)
             gemm_scratch_bytes.add(phase.body.scratch.size_bytes)
             gemm_key = (
-                tile, phase.body.scratch.size_bytes, rows, columns, reduction, splits
+                tile, phase.body.scratch.size_bytes, rows, columns, reduction, splits, bias
             )
             if gemm_key not in gemm_variants:
                 gemm_variant = len(gemm_variants)
@@ -860,6 +867,8 @@ def _emit_table_module(
                     f"    smem_capacity={phase.body.scratch.size_bytes},\n"
                     "    reallocate_registers=False,\n"
                     f"    splits={splits},\n"
+                    f"    bias_features={columns if bias else 0},\n"
+                    f"    bias_along_m={is_swap_ab(phase.body)!r},\n"
                     ")"
                 )
             gemm_variant = gemm_variants[gemm_key]
@@ -871,6 +880,8 @@ def _emit_table_module(
                 )
                 for load in program.loads
             ]
+            # Row: variant, A, B, C, then the bias slot + 1 (0 without bias).
+            bias_slot = gemm_slots.pop() + 1 if bias else 0
             if is_swap_ab(phase.body):
                 # CUTLASS A is the weight and B the activation.
                 gemm_slots = [gemm_slots[1], gemm_slots[0], *gemm_slots[2:]]
@@ -883,7 +894,7 @@ def _emit_table_module(
                 )
             )
             gemm_index = len(gemm_rows)
-            gemm_rows.append((gemm_variant, *gemm_slots))
+            gemm_rows.append((gemm_variant, *gemm_slots, bias_slot))
             if splits > 1:
                 output_tiles = -(-gemm_shapes[gemm_variant][0] // tile[0]) * -(
                     -gemm_shapes[gemm_variant][1] // tile[1]
@@ -908,6 +919,14 @@ def _emit_table_module(
                     if splits > 1
                     else []
                 )
+                bias_state = (
+                    [
+                        "                None," if splits == 1 else "",
+                        "                addresses[gemm_table[phase_table[phase, 6], 4] - 1],",
+                    ]
+                    if bias
+                    else []
+                )
                 runner_variants[runner_key] = (
                     len(runner_variants),
                     0,
@@ -918,6 +937,7 @@ def _emit_table_module(
                         "                table_descriptors(tma_descriptors, phase_table[phase, 6]),",
                         "                _rotated,",
                         *split_state,
+                        *(line for line in bias_state if line),
                         "            )",
                     ],
                 )
@@ -1001,7 +1021,7 @@ def _emit_table_module(
                 1
                 if selection.program.family in {"reduction", "attention"}
                 or selection.body.provider == "blackwell_mma"
-                else generated.threads_per_cta,
+                else getattr(generated, "tile_elements", generated.threads_per_cta),
             )
         ]
         conversion_symbols: list[str] = []
@@ -1088,7 +1108,7 @@ def _emit_table_module(
                         f"                work_iterators[{iterator}],",
                         "                _rotated,",
                         "                _thread,",
-                        "                workers,",
+                        "                _workers,",
                         f"                ({tensors},),",
                         f"                {scratch_name if call_index == 0 else 'None'},",
                         (
@@ -1148,11 +1168,15 @@ def _emit_table_module(
 
     # Every body starts its tiles at CTA 0. Phases in one barrier interval run
     # concurrently, so each starts where the previous phase's tiles ended.
+    # Recompute phases run every tile on every CTA; rotation -1 marks them.
     offset = 0
     for index, phase in enumerate(plan.phases):
         if index == 0 or plan.phases[index - 1].barrier is not None:
             offset = 0
         row = phase_rows[index]
+        if phase.recompute:
+            phase_rows[index] = (*row[:2], -1, *row[3:])
+            continue
         phase_rows[index] = (*row[:2], offset % plan.launch.grid_size, *row[3:])
         offset += phase_tiles[index]
     for index, length_slot in length_publishes.items():
@@ -1393,7 +1417,15 @@ def megabake_kernel(
     for phase in cutlass.range({len(plan.phases)}, unroll=1):
         variant = phase_table[phase, 0]
         _rotated = (_block + workers - phase_table[phase, 2]) % workers
+        _workers = workers
+        if phase_table[phase, 2] < 0:
+            # A recompute phase: this CTA runs every tile itself.
+            _rotated = cutlass.Int32(0)
+            _workers = cutlass.Int32(1)
 {dispatch}
+        if phase_table[phase, 2] < 0:
+            # Later TMA reads in this interval see the generic-proxy writes.
+            cute.arch.fence_proxy("async.global")
         if phase_table[phase, 1] != 0:
             counting_grid_barrier(ready, workers, _ordinal + phase_table[phase, 1])
 {_phase_timer_stamp("phase", "            ")}            # Every reader of this interval's KV valid length has finished.
