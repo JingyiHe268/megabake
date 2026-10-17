@@ -966,11 +966,19 @@ def _tile_dependency(
     producer_origins: set[tuple[int, ...]] = set()
     consumer_tiles: set[tuple[int, ...]] = set()
     exact = True
-    producer_by_first_origin: dict[int, list[object]] = {}
+    # Index producer tiles along the axis that separates them most. Indexing
+    # the first axis alone was quadratic for [1, heads, rows, columns] state,
+    # where every tile starts at batch 0.
+    rank = len(producer_output_tiles[0].origin)
+    axis = max(
+        range(rank),
+        key=lambda position: len({tile.origin[position] for tile in producer_output_tiles}),
+    )
+    producer_by_origin: dict[int, list[object]] = {}
     for tile in producer_output_tiles:
-        producer_by_first_origin.setdefault(tile.origin[0], []).append(tile)
-    first_origins = tuple(sorted(producer_by_first_origin))
-    maximum_first_extent = max(tile.shape[0] for tile in producer_output_tiles)
+        producer_by_origin.setdefault(tile.origin[axis], []).append(tile)
+    origins = tuple(sorted(producer_by_origin))
+    maximum_extent = max(tile.shape[axis] for tile in producer_output_tiles)
     for access in consumer_accesses:
         input_tile = next(
             input_tile
@@ -978,17 +986,19 @@ def _tile_dependency(
             if input_tile.value_id == value_id
         )
         matched = False
-        consumer_begin = input_tile.origin[0]
-        consumer_end = consumer_begin + input_tile.shape[0]
-        lower = bisect_left(
-            first_origins, consumer_begin - maximum_first_extent + 1
-        )
-        upper = bisect_right(first_origins, consumer_end - 1)
-        candidates = (
-            output_tile
-            for first_origin in first_origins[lower:upper]
-            for output_tile in producer_by_first_origin[first_origin]
-        )
+        if len(input_tile.origin) != rank:
+            # Mismatched ranks are never exact; the overlap check reports it.
+            candidates = iter(producer_output_tiles)
+        else:
+            consumer_begin = input_tile.origin[axis]
+            consumer_end = consumer_begin + input_tile.shape[axis]
+            lower = bisect_left(origins, consumer_begin - maximum_extent + 1)
+            upper = bisect_right(origins, consumer_end - 1)
+            candidates = (
+                output_tile
+                for origin in origins[lower:upper]
+                for output_tile in producer_by_origin[origin]
+            )
         for output_tile in candidates:
             overlaps, is_exact = _logical_tiles_overlap(output_tile, input_tile)
             exact = exact and is_exact

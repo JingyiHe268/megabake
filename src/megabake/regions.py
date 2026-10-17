@@ -9,6 +9,8 @@ import operator
 
 from .graph import ComputeGraph, Op, Region, RegionCandidate, verify_compute_graph
 from .lowering import (
+    attention_access_axes,
+    attention_tensor_program,
     AxisAffine,
     AxisPredicate,
     AxisTerm,
@@ -148,6 +150,9 @@ def _fusion_candidates(graph: ComputeGraph) -> dict[str, tuple[RegionCandidate, 
         stateful = _stateful_attention_candidate(operation, graph)
         if stateful is not None:
             candidates.setdefault(operation.id, []).append(stateful)
+        declared = _declared_attention_candidate(operation, graph)
+        if declared is not None:
+            candidates.setdefault(operation.id, []).append(declared)
         candidate = _scalar_fusion_candidate(operation, graph)
         if candidate is not None:
             candidates.setdefault(operation.id, []).append(candidate)
@@ -183,6 +188,71 @@ def _fusion_candidates(graph: ComputeGraph) -> dict[str, tuple[RegionCandidate, 
         tail_operation = candidate.source_op_ids[-1]
         candidates.setdefault(tail_operation, []).append(candidate)
     return {tail: tuple(values) for tail, values in candidates.items()}
+
+
+def _declared_attention_candidate(
+    operation: Op, graph: ComputeGraph
+) -> RegionCandidate | None:
+    """``megabake::attention``: the model declares its attention, so the
+    region needs no pattern matching and no layout inference."""
+    if not _matches_target(operation, "megabake.attention.default"):
+        return None
+    program = operation.tensor_program
+    if not isinstance(program, TensorProgram) or program.family != "attention":
+        return None
+    loads = {load.id: load for load in program.loads}
+    query, key = loads["attention:q"], loads["attention:k"]
+    batch, _, query_heads, head_dim = query.source_shape
+    kv_heads = key.source_shape[2]
+    output_id = operation.results[0]
+    return RegionCandidate(
+        id=f"region:{operation.id.removeprefix('op:')}:attention",
+        source_op_ids=(operation.id,),
+        external_inputs=operation.operands,
+        live_outputs=(output_id,),
+        tensor_program=program,
+        semantic_facts={
+            "family": "attention",
+            "algorithm": "stable_softmax",
+            # Hugging Face eager numerics, which the reference implements.
+            "numerical_policy": {
+                "score_dtype": "torch.bfloat16",
+                "statistics_dtype": "torch.float32",
+                "probability_dtype": "torch.bfloat16",
+                "accumulator_dtype": "torch.float32",
+            },
+            "q_access": query,
+            "k_access": key,
+            "v_access": loads["attention:v"],
+            "head_grouping": {
+                "batch": batch,
+                "query_heads": query_heads,
+                "kv_heads": kv_heads,
+                "group_size": query_heads // kv_heads,
+                "head_dim": head_dim,
+            },
+            "scale": _scalar_operand(operation, 4),
+            "mask": (
+                {"kind": "additive_tensor", "block_skip_proof": None}
+                if "attention:mask" in loads
+                else {"kind": "none"}
+            ),
+            "score_expression": 0.0,
+            "requested_outputs": (output_id,),
+            "boundary_output": output_id if output_id in graph.outputs else None,
+            "cache_effects": {
+                "reads": (),
+                "appends": (),
+                "updates": (),
+                "policy": "read_only",
+            },
+            "hook_restrictions": {
+                "score": "scaled dot product",
+                "mask": "additive tensor",
+            },
+        },
+        cost_bytes=0,
+    )
 
 
 def _stateful_attention_candidate(
@@ -1177,23 +1247,46 @@ def _producer(value_id: str, graph: ComputeGraph) -> Op | None:
     return graph.ops.get(operation_id) if operation_id is not None else None
 
 
-def _attention_head_axis(value: Any) -> int | None:
+def _attention_head_axes(value: Any) -> tuple[int, ...]:
+    """Axes that can hold the heads: their stride steps over one head dim.
+
+    A size-1 axis has no meaningful stride, so with one KV head (MQA) or one
+    token both axes can qualify; the caller resolves that with the score shape.
+    """
     if value.strides is None or len(value.strides) != 4:
-        return None
+        return ()
     head_stride = value.shape[3] * value.strides[3]
-    if value.strides[2] == head_stride:
-        return 2
-    if value.strides[1] == head_stride:
-        return 1
+    return tuple(
+        axis
+        for axis in (2, 1)
+        if value.strides[axis] == head_stride or value.shape[axis] == 1
+    )
+
+
+def _attention_axes(
+    q: Any, k: Any, v: Any, scores: tuple[int, ...] | None
+) -> tuple[int, int, int] | None:
+    """Head axes of q, k and v that agree with each other and with the
+    ``[batch * query_heads, query_length, kv_length]`` score matrix."""
+    for q_axis in _attention_head_axes(q):
+        query_heads, query_length = q.shape[q_axis], q.shape[3 - q_axis]
+        for k_axis in _attention_head_axes(k):
+            kv_heads, kv_length = k.shape[k_axis], k.shape[3 - k_axis]
+            for v_axis in _attention_head_axes(v):
+                if (
+                    query_heads % kv_heads
+                    or v.shape[v_axis] != kv_heads
+                    or v.shape[3 - v_axis] != kv_length
+                ):
+                    continue
+                if scores is not None and tuple(scores) != (
+                    q.shape[0] * query_heads,
+                    query_length,
+                    kv_length,
+                ):
+                    continue
+                return q_axis, k_axis, v_axis
     return None
-
-
-def _attention_access_axes(
-    head_axis: int, batch_axis: AxisAffine, head: AxisAffine, sequence_axis: str
-) -> tuple[AxisExpression, ...]:
-    if head_axis == 2:
-        return (batch_axis, sequence_axis, head, "d")
-    return (batch_axis, head, sequence_axis, "d")
 
 
 def _attention_candidates(graph: ComputeGraph) -> tuple[RegionCandidate, ...]:
@@ -1257,11 +1350,11 @@ def _attention_candidate(value_bmm: Op, graph: ComputeGraph) -> RegionCandidate 
     v = graph.values[v_root]
     if any(value.shape is None or len(value.shape) != 4 for value in (q, k, v)):
         return None
-    q_head_axis = _attention_head_axis(q)
-    k_head_axis = _attention_head_axis(k)
-    v_head_axis = _attention_head_axis(v)
-    if q_head_axis is None or k_head_axis is None or v_head_axis is None:
+    scores = graph.values[score_bmm.results[0]].shape
+    axes = _attention_axes(q, k, v, scores)
+    if axes is None:
         return None
+    q_head_axis, k_head_axis, v_head_axis = axes
     query_heads = q.shape[q_head_axis]
     query_length = q.shape[3 - q_head_axis]
     kv_heads = k.shape[k_head_axis]
@@ -1284,7 +1377,7 @@ def _attention_candidate(value_bmm: Op, graph: ComputeGraph) -> RegionCandidate 
     q_load = IndexedLoad(
         "attention:q",
         q_root,
-        _attention_access_axes(q_head_axis, batch_head, query_head, "s"),
+        attention_access_axes(q_head_axis, batch_head, query_head, "s"),
         q.strides or (),
         q.dtype or "",
         q.shape,
@@ -1292,7 +1385,7 @@ def _attention_candidate(value_bmm: Op, graph: ComputeGraph) -> RegionCandidate 
     k_load = IndexedLoad(
         "attention:k",
         k_root,
-        _attention_access_axes(k_head_axis, batch_head, kv_head, "k"),
+        attention_access_axes(k_head_axis, batch_head, kv_head, "k"),
         k.strides or (),
         k.dtype or "",
         k.shape,
@@ -1300,7 +1393,7 @@ def _attention_candidate(value_bmm: Op, graph: ComputeGraph) -> RegionCandidate 
     v_load = IndexedLoad(
         "attention:v",
         v_root,
-        _attention_access_axes(v_head_axis, batch_head, kv_head, "k"),
+        attention_access_axes(v_head_axis, batch_head, kv_head, "k"),
         v.strides or (),
         v.dtype or "",
         v.shape,
@@ -1374,14 +1467,15 @@ def _attention_candidate(value_bmm: Op, graph: ComputeGraph) -> RegionCandidate 
         source_op_ids=tuple(operation.id for operation in operations),
         external_inputs=external_inputs,
         live_outputs=attention_live_outputs,
-        tensor_program=_attention_tensor_program(
-            value_bmm,
+        tensor_program=attention_tensor_program(
+            value_bmm.results[0],
             q_root,
             k_root,
             v_root,
             q,
             k,
             v,
+            axes,
             attention_mask,
             graph,
         ),
@@ -1656,114 +1750,6 @@ def _producer_path_until(
         operations.append(operation)
         value_id = operation.operands[0]
     return None
-
-
-def _attention_tensor_program(
-    value_bmm: Op,
-    q_root: str,
-    k_root: str,
-    v_root: str,
-    q: Any,
-    k: Any,
-    v: Any,
-    mask_value: str | None,
-    graph: ComputeGraph,
-) -> TensorProgram | None:
-    output = graph.values[value_bmm.results[0]]
-    if output.shape is None or output.dtype is None or output.strides is None:
-        return None
-    if q.shape is None or k.shape is None or v.shape is None:
-        return None
-    q_head_axis = _attention_head_axis(q)
-    k_head_axis = _attention_head_axis(k)
-    v_head_axis = _attention_head_axis(v)
-    if q_head_axis is None or k_head_axis is None or v_head_axis is None:
-        return None
-    batch = q.shape[0]
-    query_heads = q.shape[q_head_axis]
-    query_length = q.shape[3 - q_head_axis]
-    kv_heads = k.shape[k_head_axis]
-    kv_length = k.shape[3 - k_head_axis]
-    head_dim = q.shape[-1]
-    group_size = query_heads // kv_heads
-    batch_head = AxisAffine((AxisTerm("bh", divisor=query_heads),))
-    query_head = AxisAffine((AxisTerm("bh", modulus=query_heads),))
-    kv_head = AxisAffine(
-        (AxisTerm("bh", divisor=query_heads, modulus=group_size),)
-    )
-
-    loads = (
-        IndexedLoad(
-            "attention:q",
-            q_root,
-            _attention_access_axes(q_head_axis, batch_head, query_head, "s"),
-            q.strides or (),
-            q.dtype or "",
-            q.shape,
-        ),
-        IndexedLoad(
-            "attention:k",
-            k_root,
-            _attention_access_axes(k_head_axis, batch_head, kv_head, "k"),
-            k.strides or (),
-            k.dtype or "",
-            k.shape,
-        ),
-        IndexedLoad(
-            "attention:v",
-            v_root,
-            _attention_access_axes(v_head_axis, batch_head, kv_head, "k"),
-            v.strides or (),
-            v.dtype or "",
-            v.shape,
-        ),
-    )
-    if mask_value is not None:
-        mask = graph.values[mask_value]
-        if mask.shape is None or mask.strides is None or mask.dtype is None:
-            return None
-        mask_head = 0 if mask.shape[1] == 1 else query_head
-        loads = (
-            *loads,
-            IndexedLoad(
-                "attention:mask",
-                mask_value,
-                (batch_head, mask_head, "s", "k"),
-                mask.strides,
-                mask.dtype,
-                mask.shape,
-            ),
-        )
-    zero = Constant(0.0, "torch.float32")
-    return TensorProgram(
-        family="attention",
-        source_target="megabake.attention",
-        decomposition="stable softmax attention with grouped heads and typed masks",
-        iteration_domains=(
-            IterationDomain("bh", batch * query_heads),
-            IterationDomain("s", query_length),
-            IterationDomain("d", head_dim),
-            IterationDomain("k", kv_length),
-        ),
-        reduction_axes=("k",),
-        loads=loads,
-        init=zero,
-        combine=zero,
-        post=zero,
-        accumulator_dtype="torch.float32",
-        store=TensorStore(
-            output.id,
-            output.shape,
-            output.dtype,
-            output.strides,
-            True,
-        ),
-        predicates=(
-            AxisPredicate("bh", batch * query_heads),
-            AxisPredicate("s", query_length),
-            AxisPredicate("d", head_dim),
-        ),
-    )
 
 
 def _boundary_output_path(

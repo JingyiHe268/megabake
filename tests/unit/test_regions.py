@@ -654,3 +654,39 @@ def test_task25_feature_axis_cat_is_not_a_cache_append():
     effects = candidate.semantic_facts["cache_effects"]
     assert effects["policy"] == "read_only"
     assert effects["appends"] == ()
+
+
+def test_attention_matches_a_single_kv_head():
+    # Gemma 3 270M: one KV head, so the size-1 head axis of K and V carries an
+    # arbitrary stride and the strides alone cannot tell heads from tokens.
+    class Model(torch.nn.Module):
+        def forward(self, query, key, value, mask):
+            query = query.transpose(1, 2)  # [b, s, h, d] -> [b, h, s, d]
+            value = value.transpose(1, 2)  # key arrives as [b, h, s, d]
+            heads = query.shape[1]
+            key = key.expand(-1, heads, -1, -1)
+            value = value.expand(-1, heads, -1, -1)
+            scores = query @ key.transpose(-2, -1) * query.shape[-1] ** -0.5 + mask
+            probabilities = torch.softmax(scores.float(), dim=-1).to(query.dtype)
+            return probabilities @ value
+
+    torch.manual_seed(3)
+    query = torch.randn(1, 4, 4, 8, dtype=torch.bfloat16)
+    key = torch.randn(1, 1, 4, 8, dtype=torch.bfloat16)
+    value = torch.randn(1, 4, 1, 8, dtype=torch.bfloat16)
+    mask = torch.randn(1, 1, 4, 4, dtype=torch.bfloat16)
+    graph = form_regions(_import(Model(), query, key, value, mask))
+
+    candidate = next(
+        candidate
+        for region in graph.regions
+        for candidate in region.fusion_candidates
+        if candidate.semantic_facts.get("family") == "attention"
+    )
+    assert candidate.semantic_facts["head_grouping"] == {
+        "batch": 1,
+        "query_heads": 4,
+        "kv_heads": 1,
+        "group_size": 4,
+        "head_dim": 8,
+    }

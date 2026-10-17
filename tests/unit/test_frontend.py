@@ -167,3 +167,26 @@ def test_task22_inductor_fallback_handles_changed_inputs():
     context = backend.megabake_contexts[-1]
     assert context.requirements["execution"] == "inductor_fallback"
     assert context.requirements["fallback_launch_count"] == 2
+
+
+def test_splits_become_slices_before_import():
+    from megabake.frontend import split_to_slices
+
+    class Model(torch.nn.Module):
+        def forward(self, value):
+            first, second = torch.split(value, [3, 5], dim=-1)
+            halves = torch.split(value, 3, dim=-1)
+            return first * 2, second + 1, halves[2]
+
+    value = torch.randn(2, 8)
+    exported = torch.export.export(Model(), (value,))
+    prepared = prepare_fx_graph(
+        exported.graph_module, (value,), output_tree_spec=exported.call_spec.out_spec
+    )
+    targets = {node.target for node in prepared.graph.graph.nodes}
+    assert torch.ops.aten.split.Tensor not in targets
+    assert torch.ops.aten.split_with_sizes.default not in targets
+    with torch.no_grad():
+        for actual, expected in zip(prepared.forward(value), Model()(value), strict=True):
+            torch.testing.assert_close(actual, expected)
+    split_to_slices(prepared.graph)  # idempotent

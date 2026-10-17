@@ -145,6 +145,14 @@ _BINARY_SYMBOLS = {
     "mul": "*",
     "div": "/",
     "bitwise_and": "&",
+    # Integer coordinates only; float remainder follows Python and differs.
+    "remainder": "%",
+    "bitwise_or": "|",
+    "bitwise_xor": "^",
+    # Logical operators are lowered for boolean operands only.
+    "logical_and": "&",
+    "logical_or": "|",
+    "logical_xor": "^",
     "eq": "==",
     "ne": "!=",
     "lt": "<",
@@ -348,7 +356,7 @@ def run(
         output_index = work_iterator[tile]
         if output_index < output_count:
 {coordinate_lines}            accumulator = {accumulator_type}({accumulator.code})
-            for reduction_index in cutlass.range(thread, {reduction_domain.size}, {threads}):
+            for reduction_index in {_strided_range("thread", reduction_domain.size, threads)}:
                 {reduction_coordinate} = reduction_index
                 accumulator = {combine.code}
             warp_partial = {warp_reduction}
@@ -403,6 +411,17 @@ def _expression_axes(expression: Any, loads: Sequence[IndexedLoad]) -> set[str] 
         else:
             return None
     return axes
+
+
+# Strided per-thread loops with at most this many iterations unroll fully, so
+# their independent loads are in flight together instead of one per trip.
+_UNROLL_ITERATIONS = 16
+
+
+def _strided_range(start: str, size: int, threads: int) -> str:
+    """``cutlass.range`` over ``start, start + threads, ...`` below ``size``."""
+    unroll = ", unroll_full=True" if -(-size // threads) <= _UNROLL_ITERATIONS else ""
+    return f"cutlass.range({start}, {size}, {threads}{unroll})"
 
 
 def _row_major_lines(domains: Sequence[Any], names: Mapping[str, str], value: str, indent: str) -> str:
@@ -470,6 +489,22 @@ def _emit_row_reduction_body(
         for domain in program.iteration_domains
         if domain.axis not in program.reduction_axes
     )
+    post_steps = -(-post_count // threads)
+    if post_steps <= _UNROLL_ITERATIONS:
+        # Straight-line output loop: every step's loads first, then every
+        # step's stores, so the loads are in flight together; a store before
+        # a later load would serialize them (the pointers may alias).
+        post_loop = _staged_post_lines(
+            program, threads, post_steps, post_count, post_domains, axis_coordinates,
+            hoisted_names, load_indices,
+        )
+    else:
+        post_loop = (
+            f"            for post_index in {_strided_range('thread', post_count, threads)}:\n"
+            f"{_row_major_lines(post_domains, axis_coordinates, 'post_index', '                ')}"
+            f"{load_lines}"
+            f"                output[{output_coordinates}] = {post.code}\n"
+        )
     binding_type = ", ".join("cute.Tensor" for _ in range(len(input_value_ids) + 1))
     accumulator_type = _cutlass_type(program.accumulator_dtype or "")
     warp_reduction = (
@@ -510,7 +545,7 @@ def run(
         row_index = work_iterator[tile]
         if row_index < {row_count}:
 {_row_major_lines(row_domains, axis_coordinates, "row_index", "            ")}            accumulator = {accumulator_type}({accumulator.code})
-            for reduction_index in cutlass.range(thread, {reduction_domain.size}, {threads}):
+            for reduction_index in {_strided_range("thread", reduction_domain.size, threads)}:
                 {reduction_coordinate} = reduction_index
                 accumulator = {combine.code}
             warp_partial = {warp_reduction}
@@ -520,9 +555,7 @@ def run(
             accumulator = {accumulator_type}({accumulator.code})
             for warp_index in cutlass.range(warps):
                 {merge_partial}
-            for post_index in cutlass.range(thread, {post_count}, {threads}):
-{_row_major_lines(post_domains, axis_coordinates, "post_index", "                ")}{load_lines}                output[{output_coordinates}] = {post.code}
-            cute.arch.sync_threads()
+{post_loop}            cute.arch.sync_threads()
 '''
     return GeneratedReductionBody(
         source=source,
@@ -531,6 +564,60 @@ def run(
         tile_count=row_count,
         scratch_elements=warps,
     )
+
+
+def _staged_post_lines(
+    program: TensorProgram,
+    threads: int,
+    steps: int,
+    post_count: int,
+    post_domains: Sequence[Any],
+    axis_coordinates: Mapping[str, str],
+    hoisted_names: Mapping[str, str],
+    load_indices: Mapping[str, int],
+) -> str:
+    """The row reduction's output loop, unrolled at generation time.
+
+    Step ``s`` covers ``thread + s * threads``. Coordinates wrap modulo each
+    axis, so the loads of a step past the end stay in bounds; only its store
+    is guarded.
+    """
+    loads_by_id = {load.id: load for load in program.loads}
+    output_axes = [
+        domain.axis
+        for domain in program.iteration_domains
+        if domain.axis not in program.reduction_axes
+    ]
+    post_axes = {domain.axis for domain in post_domains}
+    load_lines: list[str] = []
+    store_lines: list[str] = []
+    for step in range(steps):
+        names = {
+            axis: f"{name}_{step}" if axis in post_axes else name
+            for axis, name in axis_coordinates.items()
+        }
+        index = f"post_index_{step}"
+        load_lines.append(f"            {index} = thread + {step * threads}\n")
+        load_lines.append(_row_major_lines(post_domains, names, index, "            "))
+        step_names = {load_id: f"{name}_{step}" for load_id, name in hoisted_names.items()}
+        for load_id, name in step_names.items():
+            access = _load_access(
+                loads_by_id[load_id], load_indices[load_id], program.loads, names
+            ).code
+            load_lines.append(f"            {name} = {access}\n")
+        token = _HOISTED_LOADS.set(step_names)
+        try:
+            value = _emit_expression(program.post, load_indices, names, program.loads)
+        finally:
+            _HOISTED_LOADS.reset(token)
+        coordinates = ", ".join(names[axis] for axis in output_axes)
+        guard = (step + 1) * threads > post_count
+        if guard:
+            store_lines.append(f"            if {index} < {post_count}:\n")
+            store_lines.append(f"                output[{coordinates}] = {value.code}\n")
+        else:
+            store_lines.append(f"            output[{coordinates}] = {value.code}\n")
+    return "".join(load_lines) + "".join(store_lines)
 
 
 def emit_contraction_body(
@@ -953,6 +1040,8 @@ def _emit_expression(
             code = f"cute.pow({left.code}, {right.code})"
         elif expression.operator == "maximum":
             code = _maximum_code(left.code, right.code)
+        elif expression.operator == "minimum":
+            code = f"cute.arch.fmin({left.code}, {right.code}, nan=True)"
         else:
             symbol = _BINARY_SYMBOLS.get(expression.operator)
             if symbol is None:
@@ -1085,22 +1174,47 @@ def _unary_code(operator: str, operand: _TypedExpression) -> str:
     if operator == "logical_not":
         false = f"{_cutlass_type(operand.dtype)}(False)"
         return f"(({operand.code}) == {false})"
-    functions = {
-        "abs": "cute.abs",
-        "sigmoid": "sigmoid",
-        "tanh": "cute.tanh",
-        "rsqrt": "cute.rsqrt",
-        "sqrt": "cute.sqrt",
-        "exp": "cute.exp",
-        "cos": "cute.cos",
-        "sin": "cute.sin",
-    }
-    function = functions.get(operator)
+    function = _UNARY_FUNCTIONS.get(operator)
     if function is None:
         raise UnsupportedMapBody(f"unsupported unary operator {operator}")
+    if operand.dtype in _HALF_DTYPES:
+        # PyTorch's opmath: half-precision math runs in float32 and rounds once.
+        widened = _cast_expression(operand, "torch.float32")
+        return _cast_expression(
+            _TypedExpression(_unary_function_code(function, widened), "torch.float32"),
+            operand.dtype,
+        ).code
+    return _unary_function_code(function, operand)
+
+
+_UNARY_FUNCTIONS = {
+    "abs": "cute.abs",
+    "sigmoid": "sigmoid",
+    "reciprocal": "reciprocal",
+    "tanh": "cute.tanh",
+    "rsqrt": "cute.rsqrt",
+    "sqrt": "cute.sqrt",
+    "exp": "cute.exp",
+    "exp2": "cute.math.exp2",
+    "expm1": "cute.math.expm1",
+    "log": "cute.math.log",
+    "log1p": "cute.math.log1p",
+    "log2": "cute.math.log2",
+    "erf": "cute.math.erf",
+    "floor": "cute.math.floor",
+    "ceil": "cute.math.ceil",
+    "trunc": "cute.math.trunc",
+    "cos": "cute.cos",
+    "sin": "cute.sin",
+}
+
+
+def _unary_function_code(function: str, operand: _TypedExpression) -> str:
+    one = f"{_cutlass_type(operand.dtype)}(1.0)"
     if function == "sigmoid":
-        one = f"{_cutlass_type(operand.dtype)}(1.0)"
         return f"({one} / ({one} + cute.exp(-({operand.code}))))"
+    if function == "reciprocal":
+        return f"({one} / ({operand.code}))"
     return f"{function}({operand.code})"
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import operator
 import re
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -96,6 +97,44 @@ class PreparedFX:
     context: CaptureContext
     forward: Callable[..., Any]
     example_inputs: tuple[Any, ...] = ()
+
+
+_SPLITS = frozenset(
+    {torch.ops.aten.split.Tensor, torch.ops.aten.split_with_sizes.default}
+)
+
+
+def split_to_slices(graph_module: Any) -> None:
+    """Rewrite ``split(x)[i]`` as ``slice(x, dim, start, end)``.
+
+    A split returns a tuple of views, which one tensor program cannot store;
+    each projection is a plain slice view. Inductor lowers splits the same way.
+    """
+    graph = graph_module.graph
+    for node in list(graph.nodes):
+        if node.op != "call_function" or node.target not in _SPLITS:
+            continue
+        source, sizes = node.args[0], node.args[1]
+        dim = node.args[2] if len(node.args) > 2 else node.kwargs.get("dim", 0)
+        length = source.meta["val"].shape[dim]
+        if node.target is torch.ops.aten.split.Tensor:
+            sizes = [min(sizes, length - start) for start in range(0, length, sizes)]
+        starts = [sum(sizes[:index]) for index in range(len(sizes))]
+        users = list(node.users)
+        if not all(user.target is operator.getitem for user in users):
+            continue
+        for user in users:
+            index = user.args[1]
+            with graph.inserting_before(user):
+                piece = graph.call_function(
+                    torch.ops.aten.slice.Tensor,
+                    (source, dim, starts[index], starts[index] + sizes[index]),
+                )
+            piece.meta = dict(user.meta)
+            user.replace_all_uses_with(piece)
+            graph.erase_node(user)
+        graph.erase_node(node)
+    graph.lint()
 
 
 def _torch_version() -> tuple[int, int]:
@@ -420,6 +459,7 @@ def _prepare_fx_graph(
             prepared_graph
         ):
             internals.recursive_post_grad_passes(prepared_graph, is_inference=True)
+        split_to_slices(prepared_graph)
         prepared_graph.recompile()
         final_graphs.append(prepared_graph)
         dump_graph("post_grad", prepared_graph, dump_directory)

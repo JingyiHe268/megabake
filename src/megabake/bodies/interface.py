@@ -31,6 +31,13 @@ class SelectionPolicy:
     # address table and TMA GEMM descriptors are written per phase in the
     # kernel prologue, so bodies must share one GEMM shared-memory layout.
     table_launch: bool = False
+    # Table-launched GEMMs with at most 16 rows put the weight on WGMMA's M
+    # side (Mirage's swapAB). One orientation serves the whole launch because
+    # its GEMMs share one shared-memory layout.
+    table_gemm_swap_ab: bool = False
+    # Split the K range of swapAB table GEMMs that have fewer weight tiles
+    # than SMs (see bodies.gemm.split_k_count).
+    table_gemm_split_k: bool = False
     numerical_policy: str = "source_semantics"
     require_measured: bool = False
 

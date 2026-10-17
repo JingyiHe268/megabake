@@ -31,8 +31,10 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+from collections.abc import Sequence
 from typing import Optional, Tuple, Type
 import math
+import re
 import cuda.bindings.driver as cuda
 
 import cutlass
@@ -159,6 +161,7 @@ class HopperWgmmaGemmPersistentKernel:
         raster_along_m: bool,
         smem_capacity: int | None = None,
         reallocate_registers: bool = True,
+        splits: int = 1,
     ):
         """
         Initializes the configuration for a Hopper dense GEMM kernel.
@@ -216,6 +219,12 @@ class HopperWgmmaGemmPersistentKernel:
         # the GEMM owns the kernel; mixed megakernels run other bodies on the
         # same warps afterwards and keep the kernel-wide register count.
         self.reallocate_registers = reallocate_registers
+        # MegaBake: split-K. Work tiles are (m, n, split); the L mode of A and
+        # B selects the split's K range. Each split stores its FP32
+        # accumulators, and the last split of a tile to finish sums all of
+        # them in split order and runs the epilogue, so results do not depend
+        # on which CTA finishes last.
+        self.splits = splits
 
         self.ab_stage = None
         self.epi_stage = None
@@ -252,8 +261,9 @@ class HopperWgmmaGemmPersistentKernel:
         # check the cta tile shape
         if self.tile_shape_mnk[0] not in [64, 128]:
             raise ValueError("CTA tile shape M must be 64/128")
-        if self.tile_shape_mnk[1] not in [64, 128, 256]:
-            raise ValueError("CTA tile shape N must be 64/128/256")
+        # N=16 serves swapAB GEMMs, whose N is the 1-16 token rows.
+        if self.tile_shape_mnk[1] not in [16, 64, 128, 256]:
+            raise ValueError("CTA tile shape N must be 16/64/128/256")
 
         self.tiled_mma = sm90_utils.make_trivial_tiled_mma(
             self.a_dtype,
@@ -383,6 +393,7 @@ class HopperWgmmaGemmPersistentKernel:
             self.swizzle_size,
             self.raster_along_m,
             max_active_clusters,
+            self.splits,
         )
 
         @cute.struct
@@ -390,6 +401,8 @@ class HopperWgmmaGemmPersistentKernel:
             mainloop_pipeline_array_ptr: cute.struct.MemRange[
                 cutlass.Int64, self.ab_stage * 2
             ]
+            # MegaBake: the split-K arrival count, shared by the MMA threads.
+            split_arrival: cute.struct.MemRange[cutlass.Int32, 4]
             sA: cute.struct.Align[
                 cute.struct.MemRange[
                     self.a_dtype, cute.cosize(self.a_smem_layout_staged)
@@ -512,10 +525,12 @@ class HopperWgmmaGemmPersistentKernel:
         )
 
     @cute.jit
-    def run_table(self, prepared, scratch, tma_descs, rotated_block=None):
+    def run_table(self, prepared, scratch, tma_descs, rotated_block=None, split_state=None):
         """Run one table-launched phase whose TMA descriptors live in global
         memory. ``prepared`` is this variant's ``prepare`` result; the kernel
-        prologue has written ``tma_descs`` (A, B, C) for this phase's tensors."""
+        prologue has written ``tma_descs`` (A, B, C) for this phase's tensors.
+        Split-K variants take ``split_state``: (FP32 partials, Int32 tile
+        arrival counters, this phase's partial offset, its counter offset)."""
         tensor_bindings, epilogue, tile_sched_params = prepared
         (
             tma_atom_a,
@@ -545,6 +560,7 @@ class HopperWgmmaGemmPersistentKernel:
             cute.arch.grid_dim(),
             tma_descs,
             rotated_block,
+            split_state,
         )
 
     @cute.kernel
@@ -600,6 +616,7 @@ class HopperWgmmaGemmPersistentKernel:
         schedule_grid_dim,
         tma_descs=None,
         rotated_block=None,
+        split_state=None,
     ):
         """
         GPU device kernel performing the batched GEMM computation.
@@ -995,63 +1012,38 @@ class HopperWgmmaGemmPersistentKernel:
                     mainloop_pipeline.consumer_release(mainloop_consumer_release_state)
                     mainloop_consumer_release_state.advance()
 
-                # Epilogue
-                tCgC_for_tma_partition = cute.zipped_divide(gC_mnl_slice, self.epi_tile)
-
-                # thread(b)lock-partition for (s)mem to (g)mem copy (bSG_)
-                bSG_sD, bSG_gD = cute.nvgpu.cpasync.tma_partition(
-                    tma_atom_c,
-                    0,
-                    cute.make_layout(1),
-                    cute.group_modes(sC, 0, 2),
-                    tCgC_for_tma_partition,
-                )
-
-                epi_tile_num = cute.size(tCgC_for_tma_partition, mode=[1])
-                epi_tile_shape = tCgC_for_tma_partition.shape[1]
-                epi_tile_layout = cute.make_layout(
-                    epi_tile_shape, stride=(epi_tile_shape[1], 1)
-                )
-
-                num_prev_epi_tiles = tile_sched.num_tiles_executed * epi_tile_num
-                for epi_idx in cutlass.range_constexpr(epi_tile_num):
-                    # Copy from accumulators to D registers
-                    for epi_v in cutlass.range_constexpr(size_tRS_rD):
-                        tRS_rD[epi_v] = tRS_rAcc[epi_idx * size_tRS_rD + epi_v]
-
-                    # Type conversion
-                    acc_vec = tRS_rD.load()
-                    tRS_rD_out.store(acc_vec.to(self.c_dtype))
-
-                    # Copy from D registers to shared memory
-                    epi_buffer = (num_prev_epi_tiles + epi_idx) % cute.size(
-                        tRS_sD, mode=[3]
+                run_epilogue = True
+                if cutlass.const_expr(self.splits > 1):
+                    run_epilogue = self._reduce_splits(
+                        accumulators,
+                        tile_coord_mnl,
+                        cute.size(gC_mnl, mode=[3]),
+                        tidx - self.num_dma_warp_groups * self.num_threads_per_warp_group,
+                        storage.split_arrival.data_ptr(),
+                        split_state,
                     )
-                    cute.copy(
+                    # Every split's result lands in C's single L slice.
+                    gC_mnl_slice = gC_mnl[
+                        (None, None, tile_coord_mnl[0], tile_coord_mnl[1], 0)
+                    ]
+
+                if run_epilogue:
+                    self._store_tile(
+                        accumulators,
+                        gC_mnl_slice,
+                        tma_atom_c,
+                        sC,
                         tiled_copy_r2s,
+                        tRS_sD,
+                        tRS_rAcc,
+                        tRS_rD,
                         tRS_rD_out,
-                        tRS_sD[(None, None, None, epi_buffer)],
+                        size_tRS_rD,
+                        tma_store_pipeline,
+                        tile_sched,
+                        warp_idx,
+                        desc_c,
                     )
-
-                    cute.arch.fence_proxy(
-                        "async.shared",
-                        space="cta",
-                    )
-                    self.epilog_sync_barrier.arrive_and_wait()
-
-                    gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
-                    # Copy from shared memory to global memory
-                    if warp_idx == self.epi_store_warp_id:
-                        cute.copy(
-                            tma_atom_c,
-                            bSG_sD[(None, epi_buffer)],
-                            bSG_gD[(None, gmem_coord)],
-                            tma_desc_ptr=desc_c,
-                        )
-                        tma_store_pipeline.producer_commit()
-                        tma_store_pipeline.producer_acquire()
-
-                    self.epilog_sync_barrier.arrive_and_wait()
 
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
@@ -1064,6 +1056,139 @@ class HopperWgmmaGemmPersistentKernel:
             if warp_idx == self.epi_store_warp_id:
                 cute.arch.cp_async_bulk_wait_group(0, read=False)
                 cute.arch.fence_proxy("async.global")
+
+    @cute.jit
+    def _reduce_splits(
+        self,
+        accumulators,
+        tile_coord_mnl,
+        n_tiles,
+        mma_thread,
+        arrival_flag,
+        split_state,
+    ):
+        """Publish this split's accumulators; True for the tile's last split,
+        whose accumulators then hold the sum of every split in split order."""
+        partials, counters, partial_base, counter_base = split_state
+        count = cute.size(accumulators)
+        tile = tile_coord_mnl[0] * n_tiles + tile_coord_mnl[1]
+        tile_elements = count * self.num_mma_threads
+        own = partial_base + (tile * self.splits + tile_coord_mnl[2]) * tile_elements
+        for index in cutlass.range_constexpr(count):
+            cute.arch.store(
+                partials.iterator + own + mma_thread * count + index,
+                accumulators[index],
+                cop="cg",
+            )
+        cute.arch.fence_acq_rel_gpu()
+        self.epilog_sync_barrier.arrive_and_wait()
+        if mma_thread == 0:
+            arrived = cute.arch.atomic_add(
+                counters.iterator + counter_base + tile,
+                cutlass.Int32(1),
+                sem="acq_rel",
+                scope="gpu",
+            )
+            cute.arch.store(arrival_flag, arrived)
+        self.epilog_sync_barrier.arrive_and_wait()
+        last = cute.arch.load(arrival_flag, cutlass.Int32) == self.splits - 1
+        if last:
+            cute.arch.fence_acq_rel_gpu()
+            first = partial_base + tile * self.splits * tile_elements + mma_thread * count
+            for index in cutlass.range_constexpr(count):
+                total = cutlass.Float32(0.0)
+                for split in cutlass.range_constexpr(self.splits):
+                    total = total + cute.arch.load(
+                        partials.iterator + first + split * tile_elements + index,
+                        cutlass.Float32,
+                        cop="cg",
+                    )
+                accumulators[index] = total
+            if mma_thread == 0:
+                # Ready for the next phase that uses this counter.
+                cute.arch.atomic_exch(
+                    counters.iterator + counter_base + tile,
+                    cutlass.Int32(0),
+                    sem="relaxed",
+                    scope="gpu",
+                )
+        return last
+
+    @cute.jit
+    def _store_tile(
+        self,
+        accumulators,
+        gC_mnl_slice,
+        tma_atom_c,
+        sC,
+        tiled_copy_r2s,
+        tRS_sD,
+        tRS_rAcc,
+        tRS_rD,
+        tRS_rD_out,
+        size_tRS_rD,
+        tma_store_pipeline,
+        tile_sched,
+        warp_idx,
+        desc_c,
+    ):
+        # Epilogue
+        tCgC_for_tma_partition = cute.zipped_divide(gC_mnl_slice, self.epi_tile)
+
+        # thread(b)lock-partition for (s)mem to (g)mem copy (bSG_)
+        bSG_sD, bSG_gD = cute.nvgpu.cpasync.tma_partition(
+            tma_atom_c,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sC, 0, 2),
+            tCgC_for_tma_partition,
+        )
+
+        epi_tile_num = cute.size(tCgC_for_tma_partition, mode=[1])
+        epi_tile_shape = tCgC_for_tma_partition.shape[1]
+        epi_tile_layout = cute.make_layout(
+            epi_tile_shape, stride=(epi_tile_shape[1], 1)
+        )
+
+        num_prev_epi_tiles = tile_sched.num_tiles_executed * epi_tile_num
+        for epi_idx in cutlass.range_constexpr(epi_tile_num):
+            # Copy from accumulators to D registers
+            for epi_v in cutlass.range_constexpr(size_tRS_rD):
+                tRS_rD[epi_v] = tRS_rAcc[epi_idx * size_tRS_rD + epi_v]
+
+            # Type conversion
+            acc_vec = tRS_rD.load()
+            tRS_rD_out.store(acc_vec.to(self.c_dtype))
+
+            # Copy from D registers to shared memory
+            epi_buffer = (num_prev_epi_tiles + epi_idx) % cute.size(
+                tRS_sD, mode=[3]
+            )
+            cute.copy(
+                tiled_copy_r2s,
+                tRS_rD_out,
+                tRS_sD[(None, None, None, epi_buffer)],
+            )
+
+            cute.arch.fence_proxy(
+                "async.shared",
+                space="cta",
+            )
+            self.epilog_sync_barrier.arrive_and_wait()
+
+            gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
+            # Copy from shared memory to global memory
+            if warp_idx == self.epi_store_warp_id:
+                cute.copy(
+                    tma_atom_c,
+                    bSG_sD[(None, epi_buffer)],
+                    bSG_gD[(None, gmem_coord)],
+                    tma_desc_ptr=desc_c,
+                )
+                tma_store_pipeline.producer_commit()
+                tma_store_pipeline.producer_acquire()
+
+            self.epilog_sync_barrier.arrive_and_wait()
 
     @staticmethod
     def _compute_stages(
@@ -1252,6 +1377,7 @@ class HopperWgmmaGemmPersistentKernel:
         swizzle_size: int,
         raster_along_m: bool,
         max_active_clusters: cutlass.Constexpr,
+        splits: int = 1,
     ) -> tuple[int, int, int]:
         """Compute grid shape for the output tensor C.
 
@@ -1271,6 +1397,9 @@ class HopperWgmmaGemmPersistentKernel:
         c_shape = cute.slice_(tile_shape_mnk, (None, None, 0))
         gc = cute.zipped_divide(c, tiler=c_shape)
         num_ctas_mnl = gc[(0, (None, None, None))].shape
+        if cutlass.const_expr(splits > 1):
+            # MegaBake: C has one L slice; split-K tiles add the split mode.
+            num_ctas_mnl = (num_ctas_mnl[0], num_ctas_mnl[1], splits)
         cluster_shape_mnl = (*cluster_shape_mn, 1)
 
         tile_sched_params = utils.PersistentTileSchedulerParams(
@@ -1576,20 +1705,25 @@ def build_table_descriptors(
     b_address: cutlass.Int64,
     c_address: cutlass.Int64,
     mnk: cutlass.Constexpr,
+    c_m_major: cutlass.Constexpr = False,
+    splits: cutlass.Constexpr = 1,
 ):
     """Write one GEMM phase's descriptors from its variant's templates.
 
     Called by one full warp: the descriptor update is warp-collective, so a
     single thread deadlocks. The caller publishes the writes with
     ``fence_tma_desc_release`` before the grid barrier, and the GEMM body
-    acquires them before its first TMA copy."""
+    acquires them before its first TMA copy. Split-K variants see A and B as
+    ``(rows, k / splits, splits)``: the L mode selects a split's K range."""
     m, n, k = mnk
     tensor_bindings, epilogue, _ = prepared
     atoms = (tensor_bindings[0], tensor_bindings[2], epilogue[0])
+    chunk = k // splits
     tensors = (
-        _bf16_tensor(a_address, (m, k, 1), (k, 1, m * k)),
-        _bf16_tensor(b_address, (n, k, 1), (k, 1, n * k)),
-        _bf16_tensor(c_address, (m, n, 1), (n, 1, m * n)),
+        _bf16_tensor(a_address, (m, chunk, splits), (k, 1, chunk if splits > 1 else m * k)),
+        _bf16_tensor(b_address, (n, chunk, splits), (k, 1, chunk if splits > 1 else n * k)),
+        # swapAB writes C^T, so its C is M-major.
+        _bf16_tensor(c_address, (m, n, 1), (1, m, m * n) if c_m_major else (n, 1, m * n)),
     )
     for operand in cutlass.range_constexpr(3):
         pointer = table_descriptor(descriptors, gemm, operand, cute.AddressSpace.gmem)
@@ -1659,8 +1793,27 @@ class G0RangeBodyProvider:
             return reject("target lacks TMA or WGMMA")
 
         if policy.table_launch:
-            # Every table-launched GEMM shares one staged shared-memory layout,
+            # Every table-launched GEMM shares one staged shared-memory budget,
             # sized to leave room for the other bodies' scratch.
+            if policy.table_gemm_swap_ab:
+                if rows > SWAP_AB_MAX_ROWS:
+                    return reject(f"swapAB GEMMs need at most {SWAP_AB_MAX_ROWS} rows")
+                splits = (
+                    split_k_count(
+                        -(-columns // 64), reduction_size // 64, target.multiprocessor_count
+                    )
+                    if policy.table_gemm_split_k
+                    else 1
+                )
+                return CandidateSet(
+                    (
+                        _g0_config(
+                            region, program, (SWAP_AB_MAX_ROWS, 64), 8,
+                            TABLE_GEMM_SHARED_BYTES, swap_ab=True, splits=splits,
+                        ),
+                    ),
+                    (),
+                )
             return CandidateSet(
                 (_g0_config(region, program, (64, 64), 8, TABLE_GEMM_SHARED_BYTES),),
                 (),
@@ -1672,6 +1825,61 @@ class G0RangeBodyProvider:
             ),
             (),
         )
+
+
+# Mirage's linear_swapAB_hopper: with 1-16 token rows, a 64-row activation
+# tile is mostly padding, so each pipeline stage carries little weight data.
+# Swapping the operands puts 64 weight rows on WGMMA's M side and the tokens
+# on N=16. On 60 SMs this doubles decode GEMM bandwidth (0.84-1.04 to
+# 1.78-2.07 TB/s), matching cuBLAS.
+SWAP_AB_MAX_ROWS = 16
+
+
+# Split-K (Mirage splits small-N linears the same way): a decode projection
+# with fewer 64-row weight tiles than SMs leaves most SMs idle, and each busy
+# SM cannot pull its share of HBM bandwidth alone. Splitting K multiplies the
+# work tiles; the last split of each tile sums the FP32 partials in order.
+SPLIT_K_MAX = 16
+# Each split keeps at least this many 64-wide K tiles in its pipeline.
+SPLIT_K_MIN_K_TILES = 2
+
+
+def split_k_count(tiles: int, k_tiles: int, workers: int) -> int:
+    """The largest split of ``k_tiles`` that keeps ``tiles * splits`` within
+    ``workers`` and every split at least ``SPLIT_K_MIN_K_TILES`` deep."""
+    best = 1
+    for splits in range(2, SPLIT_K_MAX + 1):
+        if (
+            k_tiles % splits == 0
+            and k_tiles // splits >= SPLIT_K_MIN_K_TILES
+            and tiles * splits <= workers
+        ):
+            best = splits
+    return best
+
+
+def split_k(body: BodyConfig) -> int:
+    """K splits of a G0 GEMM body (1 without split-K)."""
+    match = re.search(r"_k(\d+)$", body.name)
+    return int(match.group(1)) if match else 1
+
+
+def is_swap_ab(body: BodyConfig) -> bool:
+    return body.provider == G0RangeBodyProvider.provider_name and body.name.startswith(
+        "g0_range_swapab_"
+    )
+
+
+def kernel_tile(body: BodyConfig) -> tuple[int, int]:
+    """The CUTLASS CTA tile. ``body.tiles.cta_shape`` is in output (rows,
+    columns) coordinates, which swapAB transposes."""
+    rows, columns = body.tiles.cta_shape[:2]
+    return (columns, rows) if is_swap_ab(body) else (rows, columns)
+
+
+def wants_swap_ab(shapes: Sequence[tuple[int, int]]) -> bool:
+    """Whether every ``(rows, columns)`` GEMM of a launch is small-M."""
+    return bool(shapes) and all(rows <= SWAP_AB_MAX_ROWS for rows, _ in shapes)
 
 
 def gemm_candidates(
@@ -1700,11 +1908,17 @@ def g0_range_body(config: BodyConfig) -> HopperWgmmaGemmPersistentKernel:
     )
 
 
-def cute_gemm_tensors(a, b, c):
+def cute_gemm_tensors(a, b, c, splits: int = 1):
+    """CuTe ``(A, B, C)`` with an L mode. Split-K views A and B as
+    ``(rows, k / splits, splits)``, so L selects a split's K range."""
     from cutlass.cute.runtime import from_dlpack
 
+    # Activations can arrive as [batch, sequence, hidden]; swapAB binds them
+    # as B rather than A.
     if a.ndim > 2:
         a = a.reshape(-1, a.shape[-1])
+    if b.ndim > 2:
+        b = b.reshape(-1, b.shape[-1])
     if any(tensor.data_ptr() % 16 for tensor in (a, b, c)):
         raise ValueError("GEMM tensor base addresses must be 16-byte aligned")
 
@@ -1716,6 +1930,14 @@ def cute_gemm_tensors(a, b, c):
             leading_dim=leading_dim
         )
 
+    def split_view(tensor):
+        rows, reduction = tensor.shape
+        chunk = reduction // splits
+        split = tensor.as_strided((rows, chunk, splits), (tensor.stride(0), 1, chunk))
+        return from_dlpack(split, assumed_align=16).mark_layout_dynamic(leading_dim=1)
+
+    if splits > 1:
+        return split_view(a), split_view(b), view(c)
     return view(a), view(b), view(c)
 
 
@@ -1782,10 +2004,16 @@ def _g0_config(
     tile: tuple[int, int],
     stages: int,
     shared_bytes: int,
+    *,
+    swap_ab: bool = False,
+    splits: int = 1,
 ) -> BodyConfig:
     return BodyConfig(
         provider=G0RangeBodyProvider.provider_name,
-        name=f"g0_range_{tile[0]}x{tile[1]}",
+        name=(
+            f"g0_range_{'swapab_' if swap_ab else ''}{tile[0]}x{tile[1]}"
+            + (f"_k{splits}" if splits > 1 else "")
+        ),
         semantic=SemanticContract(
             operation_family="view_plus_gemm"
             if region.semantic_facts.get("family") == "view_plus_gemm"
@@ -1807,7 +2035,11 @@ def _g0_config(
         tiles=TileContract(
             cta_shape=tile,
             cluster_shape=(1, 1),
-            work_partition="persistent range of output tiles",
+            work_partition=(
+                f"persistent range of output tiles, K split {splits} ways"
+                if splits > 1
+                else "persistent range of output tiles"
+            ),
             mma_family="wgmma",
             reduction_tile=(64,),
         ),

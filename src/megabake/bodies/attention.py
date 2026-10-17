@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import textwrap
+
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -75,6 +77,10 @@ class GeneratedAttentionBody:
     tile_count: int = 1
     work_iterator_dtype: str = "torch.int64"
     work_iterator_encoding: str = "one row-block base per CTA tile"
+    # Phase scratch (FP32 elements, Int32 counters) the body takes as its
+    # epilogue argument: (floats, counters, float offset, counter offset).
+    phase_floats: int = 0
+    phase_counters: int = 0
 
 
 class AttentionBodyProvider:
@@ -183,6 +189,8 @@ class AttentionBodyProvider:
         elif mask.get("kind") == "stateful_causal":
             if not program.state_accesses:
                 return reject("stateful causal mask has no KV state contract")
+        elif mask.get("kind") == "none":
+            pass
         elif mask.get("kind") == "typed_where":
             if (
                 mask.get("window_offsets") is not None
@@ -255,6 +263,8 @@ ATTENTION_SCRATCH_BYTES = 32 * 1024
 
 # Value-sum keys loaded together before accumulation in the decode body.
 _VALUE_BLOCK = 8
+# Keys per warp iteration of the split-context decode value sum.
+_VALUE_UNROLL = 8
 
 
 def attention_scratch_rows(kv_length: int) -> int:
@@ -407,8 +417,18 @@ def _attention_config(region: Region, program: Any, name: str) -> BodyConfig:
     )
 
 
+# Split-context decode: a query row's visible keys split into up to this many
+# chunks, each one CTA work item, with at least this many keys per chunk.
+DECODE_MAX_CHUNKS = 16
+DECODE_MIN_CHUNK_KEYS = 64
+
+
 def emit_attention_body(
-    program: Any, config: BodyConfig, *, defer_length_publish: bool = False
+    program: Any,
+    config: BodyConfig,
+    *,
+    defer_length_publish: bool = False,
+    workers: int | None = None,
 ) -> GeneratedAttentionBody:
     """Emit an attention device body.
 
@@ -462,6 +482,11 @@ def emit_attention_body(
         if warps < 1:
             raise UnsupportedAttentionBody(
                 "stateful attention scratch must hold one score row per warp"
+            )
+        if defer_length_publish and workers is not None and head_dim % 32 == 0:
+            return _split_decode_attention_body(
+                program, loads, row_count, query_heads, group_size, head_dim,
+                kv_length, scale, threads, workers,
             )
         if defer_length_publish:
             # One warp-sized group of rows per CTA tile.
@@ -620,6 +645,8 @@ def run(
             mask_code = (
                 f"score = (score.to(cutlass.Float32) + cutlass.Float32({masked_value!r})).to(cutlass.BFloat16) if not {mask_access} else score"
             )
+    elif mask.get("kind") == "none":
+        mask_code = "pass"
     else:
         raise UnsupportedAttentionBody("unsupported attention mask hook")
 
@@ -705,4 +732,336 @@ def run(
         threads_per_cta=threads,
         tile_count=tile_count,
         work_iterator_encoding="one query-row block base per CTA tile",
+    )
+
+
+def decode_chunks(rows: int, workers: int) -> int:
+    """Chunks per query row for split-context decode at long contexts.
+
+    Time per key scales with ``passes / chunks``, where ``passes`` is how
+    many rounds of ``rows * chunks`` items ``workers`` CTAs take; every pass
+    after the first also waits on the chunk exchanges, so it costs extra.
+    """
+    best, best_cost = 1, float("inf")
+    for chunks in range(1, min(DECODE_MAX_CHUNKS, workers) + 1):
+        passes = -(-rows * chunks // workers)
+        cost = passes / chunks * (1 + 0.15 * (passes - 1))
+        if cost < best_cost - 1e-9:
+            best, best_cost = chunks, cost
+    return best
+
+
+def _split_decode_attention_body(
+    program: Any,
+    loads: Mapping[str, int],
+    row_count: int,
+    query_heads: int,
+    group_size: int,
+    head_dim: int,
+    kv_length: int,
+    scale: float,
+    threads: int,
+    workers: int,
+) -> GeneratedAttentionBody:
+    """One-token decode with the visible keys of each query row split into
+    chunks that run on different CTAs (flash decoding), keeping the captured
+    rounding points: BF16 scores, FP32 softmax statistics, BF16 normalized
+    probabilities, and an FP32 value sum.
+
+    Work item ``row * CHUNKS + chunk`` covers one chunk. All warps of the CTA
+    share it: warps take keys and lanes the head dimensions. Chunks of a row
+    exchange their maxima and exponential sums through phase scratch: each
+    publishes, then waits until every chunk in use has. The waits cannot
+    deadlock because a row's items are consecutive and there are at most as
+    many chunks as CTAs, so a waiting CTA only waits on items that are some
+    CTA's current or next item. The last chunk to finish sums the chunks'
+    FP32 value partials in chunk order, so the result does not depend on
+    which CTA finishes last, and resets the row's counters.
+    """
+    warps = threads // 32
+    chunks = decode_chunks(row_count, workers)
+    q_index = loads["attention:q"]
+    k_index = loads["attention:k"]
+    v_index = loads["attention:v"]
+    new_k_index = loads["attention:new_k"]
+    new_v_index = loads["attention:new_v"]
+    length_index = loads["attention:valid_length"]
+    output_index = len(program.loads)
+    # Phase scratch: scores (rows x keys), per-chunk max and sum, and
+    # per-chunk value partials; three counters per row.
+    stats_base = row_count * kv_length
+    partial_base = stats_base + row_count * chunks * 2
+    floats = partial_base + row_count * chunks * head_dim
+    binding_type = ", ".join("cute.Tensor" for _ in range(len(program.loads) + 1))
+    dims_per_lane = head_dim // 32
+
+    def lines(template: str, indent: str, **values: object) -> str:
+        return "\n".join(
+            indent + template.format(j=j, d=f"lane + {32 * j}", **values)
+            for j in range(dims_per_lane)
+        )
+
+    # Value sum: warps take keys, lanes the head dimensions. Each iteration
+    # issues VALUE_UNROLL keys' loads before accumulating them in key order;
+    # keys past the cached range read the last cached key with probability 0.
+    unroll = _VALUE_UNROLL
+    value_loads = "\n".join(
+        f"                    key_{u} = base + {u * warps}\n"
+        f"                    probability_{u} = cutlass.Float32(0.0)\n"
+        f"                    if key_{u} < cached_stop:\n"
+        f"                        probability_{u} = (\n"
+        f"                            cute.arch.load(floats.iterator + scores + key_{u}, cutlass.Float32, cop=\"cg\") / denominator\n"
+        f"                        ).to(cutlass.BFloat16).to(cutlass.Float32)\n"
+        f"                    else:\n"
+        f"                        key_{u} = cached_stop - cutlass.Int32(1)\n"
+        + lines(
+            "row_{u}_{j} = tensor_bindings[" + str(v_index) + "][b, key_{u}, kv_head, {d}].to(cutlass.Float32)",
+            "                    ",
+            u=u,
+        )
+        for u in range(unroll)
+    )
+    value_sums = "\n".join(
+        lines("value_{j} = value_{j} + probability_{u} * row_{u}_{j}", "                    ", u=u)
+        for u in range(unroll)
+    )
+    value_pass = (
+        lines("value_{j} = cutlass.Float32(0.0)", "                ")
+        + f"\n                for base in cutlass.range(start + warp, cached_stop, {unroll * warps}):\n"
+        + value_loads
+        + "\n"
+        + value_sums
+        + "\n                if stop == keys:\n"
+        "                    if warp == 0:\n"
+        "                        probability = (\n"
+        "                            cute.arch.load(floats.iterator + scores + current_length, cutlass.Float32, cop=\"cg\") / denominator\n"
+        "                        ).to(cutlass.BFloat16).to(cutlass.Float32)\n"
+        + lines(
+            "value_{j} = value_{j} + probability * tensor_bindings[" + str(new_v_index) + "][b, 0, kv_head, {d}].to(cutlass.Float32)",
+            "                        ",
+        )
+        + "\n"
+        + lines("scratch[" + str(warps) + " + warp * " + str(head_dim) + " + {d}] = value_{j}", "                ")
+        + "\n                cute.arch.sync_threads()\n"
+    )
+    score_pass = f"""                query = tensor_bindings[{q_index}][(b, 0, h, None)].load().to(cutlass.Float32)
+                # Scores: one key per thread, whole rows per load.
+                maximum = cutlass.Float32(-1.0e30)
+                for key in cutlass.range(start + thread, cached_stop, {threads}):
+                    row = tensor_bindings[{k_index}][(b, key, kv_head, None)].load().to(cutlass.Float32)
+                    score = cutlass.Float32((query * row).reduce(cute.ReductionOp.ADD, cutlass.Float32(0.0), 0))
+                    score = score.to(cutlass.BFloat16).to(cutlass.Float32)
+                    score = score * cutlass.Float32({scale!r})
+                    cute.arch.store(floats.iterator + scores + key, score, cop="cg")
+                    maximum = cute.arch.fmax(maximum, score, nan=True)
+                if stop == keys:
+                    if thread == 0:
+                        row = tensor_bindings[{new_k_index}][(b, 0, kv_head, None)].load().to(cutlass.Float32)
+                        score = cutlass.Float32((query * row).reduce(cute.ReductionOp.ADD, cutlass.Float32(0.0), 0))
+                        score = score.to(cutlass.BFloat16).to(cutlass.Float32)
+                        score = score * cutlass.Float32({scale!r})
+                        cute.arch.store(floats.iterator + scores + current_length, score, cop="cg")
+                        maximum = cute.arch.fmax(maximum, score, nan=True)
+                maximum = cute.arch.warp_reduction_max(maximum)
+"""
+
+    def wait(counter: str) -> str:
+        return (
+            "                    cute.arch.sync_threads()\n"
+            "                    if thread == 0:\n"
+            "                        seen = cutlass.Int32(0)\n"
+            "                        while seen < in_use:\n"
+            "                            seen = cute.arch.atomic_cas(\n"
+            f"                                counters.iterator + counter_base + bh * 3 + {counter},\n"
+            "                                cmp=in_use,\n"
+            "                                val=in_use,\n"
+            '                                sem="acquire",\n'
+            '                                scope="gpu",\n'
+            "                            )\n"
+            "                    cute.arch.sync_threads()\n"
+            "                    cute.arch.fence_acq_rel_gpu()\n"
+        )
+
+    def publish(counter: str) -> str:
+        return (
+            "                    if thread == 0:\n"
+            "                        cute.arch.atomic_add(\n"
+            f"                            counters.iterator + counter_base + bh * 3 + {counter},\n"
+            "                            cutlass.Int32(1),\n"
+            '                            sem="release",\n'
+            '                            scope="gpu",\n'
+            "                        )\n"
+        )
+
+    source = f'''import cutlass
+import cutlass.cute as cute
+from cutlass._mlir.dialects import llvm
+
+
+@cute.kernel
+def run(
+    work_iterator: cute.Tensor,
+    tensor_bindings: tuple[{binding_type}],
+    scratch: cute.Tensor,
+    epilogue,
+):
+    block, _, _ = cute.arch.block_idx()
+    thread, _, _ = cute.arch.thread_idx()
+    workers, _, _ = cute.arch.grid_dim()
+    floats, counters, float_base, counter_base = epilogue
+    current_length = tensor_bindings[{length_index}][0].to(cutlass.Int32)
+    if current_length < 0:
+        llvm.intr_trap()
+    if current_length + cutlass.Int32(1) > cutlass.Int32({kv_length}):
+        llvm.intr_trap()
+    keys = current_length + cutlass.Int32(1)
+    in_use = (keys + cutlass.Int32({DECODE_MIN_CHUNK_KEYS - 1})) // cutlass.Int32({DECODE_MIN_CHUNK_KEYS})
+    if in_use > cutlass.Int32({chunks}):
+        in_use = cutlass.Int32({chunks})
+    chunk_keys = (keys + in_use - cutlass.Int32(1)) // in_use
+    warp = thread // 32
+    lane = thread % 32
+    # Only the chunks in use are items, row-major so a row's items are
+    # consecutive (see the deadlock note above).
+    for item in cutlass.range(block, cutlass.Int32({row_count}) * in_use, workers):
+        bh = item // in_use
+        chunk = item % in_use
+        if True:
+            b = bh // {query_heads}
+            h = bh % {query_heads}
+            kv_head = h // {group_size}
+            start = chunk * chunk_keys
+            stop = start + chunk_keys
+            if stop > keys:
+                stop = keys
+            scores = float_base + bh * {kv_length}
+            stats = float_base + {stats_base} + bh * {chunks * 2}
+            # Cached keys come from the cache; the new key at current_length
+            # (in the last chunk) from new_k and new_v.
+            cached_stop = stop
+            if cached_stop > current_length:
+                cached_stop = current_length
+            # Every chunk in use runs the whole exchange, even with no keys.
+            if True:
+{score_pass}                if lane == 0:
+                    scratch[warp] = maximum
+                cute.arch.sync_threads()
+                if thread == 0:
+                    chunk_maximum = scratch[0]
+                    for other in cutlass.range_constexpr(1, {warps}):
+                        chunk_maximum = cute.arch.fmax(chunk_maximum, scratch[other], nan=True)
+                    cute.arch.store(floats.iterator + stats + chunk * 2, chunk_maximum, cop="cg")
+                    scratch[0] = chunk_maximum
+                cute.arch.fence_acq_rel_gpu()
+                if in_use > cutlass.Int32(1):
+{publish("0")}{wait("0")}                    if thread == 0:
+                        row_maximum = cute.arch.load(floats.iterator + stats, cutlass.Float32, cop="cg")
+                        for other in cutlass.range(1, in_use):
+                            row_maximum = cute.arch.fmax(
+                                row_maximum,
+                                cute.arch.load(floats.iterator + stats + other * 2, cutlass.Float32, cop="cg"),
+                                nan=True,
+                            )
+                        scratch[0] = row_maximum
+                cute.arch.sync_threads()
+                row_maximum = scratch[0]
+                # Exponentials of this chunk's scores and their sum.
+                total = cutlass.Float32(0.0)
+                for key in cutlass.range(start + thread, stop, {threads}):
+                    probability = cute.exp(
+                        cute.arch.load(floats.iterator + scores + key, cutlass.Float32, cop="cg") - row_maximum
+                    )
+                    cute.arch.store(floats.iterator + scores + key, probability, cop="cg")
+                    total = total + probability
+                total = cute.arch.warp_reduction_sum(total)
+                cute.arch.sync_threads()
+                if lane == 0:
+                    scratch[warp] = total
+                cute.arch.sync_threads()
+                if thread == 0:
+                    chunk_total = scratch[0]
+                    for other in cutlass.range_constexpr(1, {warps}):
+                        chunk_total = chunk_total + scratch[other]
+                    cute.arch.store(floats.iterator + stats + chunk * 2 + 1, chunk_total, cop="cg")
+                    scratch[0] = chunk_total
+                cute.arch.fence_acq_rel_gpu()
+                if in_use > cutlass.Int32(1):
+{publish("1")}{wait("1")}                    if thread == 0:
+                        row_total = cutlass.Float32(0.0)
+                        for other in cutlass.range(0, in_use):
+                            row_total = row_total + cute.arch.load(
+                                floats.iterator + stats + other * 2 + 1, cutlass.Float32, cop="cg"
+                            )
+                        scratch[0] = row_total
+                cute.arch.sync_threads()
+                denominator = scratch[0]
+                if denominator <= cutlass.Float32(0.0):
+                    denominator = cutlass.Float32(1.0)
+                cute.arch.sync_threads()
+{value_pass}                if in_use == cutlass.Int32(1):
+                    for d in cutlass.range(thread, {head_dim}, {threads}):
+                        value = scratch[{warps} + d]
+                        for other in cutlass.range_constexpr(1, {warps}):
+                            value = value + scratch[{warps} + other * {head_dim} + d]
+                        tensor_bindings[{output_index}][bh, 0, d] = value.to(cutlass.BFloat16)
+                else:
+                    partials = float_base + {partial_base} + bh * {chunks * head_dim}
+                    for d in cutlass.range(thread, {head_dim}, {threads}):
+                        value = scratch[{warps} + d]
+                        for other in cutlass.range_constexpr(1, {warps}):
+                            value = value + scratch[{warps} + other * {head_dim} + d]
+                        cute.arch.store(
+                            floats.iterator + partials + chunk * {head_dim} + d, value, cop="cg"
+                        )
+                    cute.arch.fence_acq_rel_gpu()
+                    cute.arch.sync_threads()
+                    if thread == 0:
+                        arrived = cute.arch.atomic_add(
+                            counters.iterator + counter_base + bh * 3 + 2,
+                            cutlass.Int32(1),
+                            sem="acq_rel",
+                            scope="gpu",
+                        )
+                        scratch[0] = cutlass.Float32(0.0)
+                        if arrived == in_use - cutlass.Int32(1):
+                            scratch[0] = cutlass.Float32(1.0)
+                    cute.arch.sync_threads()
+                    if scratch[0] != cutlass.Float32(0.0):
+                        cute.arch.fence_acq_rel_gpu()
+                        for d in cutlass.range(thread, {head_dim}, {threads}):
+                            value = cutlass.Float32(0.0)
+                            for other in cutlass.range(0, in_use):
+                                value = value + cute.arch.load(
+                                    floats.iterator + partials + other * {head_dim} + d,
+                                    cutlass.Float32,
+                                    cop="cg",
+                                )
+                            tensor_bindings[{output_index}][bh, 0, d] = value.to(cutlass.BFloat16)
+                        if thread == 0:
+                            # Every chunk has passed both waits: reset for the next phase.
+                            for counter in cutlass.range_constexpr(3):
+                                cute.arch.atomic_exch(
+                                    counters.iterator + counter_base + bh * 3 + counter,
+                                    cutlass.Int32(0),
+                                    sem="relaxed",
+                                    scope="gpu",
+                                )
+                cute.arch.sync_threads()
+            # Keys before current_length come from the cache and the new key
+            # from new_k, so appending here cannot race with readers.
+            if chunk == 0:
+                if h % {group_size} == 0:
+                    if warp == 0:
+                        for d in cutlass.range(lane, {head_dim}, 32):
+                            tensor_bindings[{k_index}][b, current_length, kv_head, d] = tensor_bindings[{new_k_index}][b, 0, kv_head, d]
+                            tensor_bindings[{v_index}][b, current_length, kv_head, d] = tensor_bindings[{new_v_index}][b, 0, kv_head, d]
+            cute.arch.sync_threads()
+'''
+    return GeneratedAttentionBody(
+        source=source,
+        threads_per_cta=threads,
+        tile_count=row_count * chunks,
+        work_iterator_encoding="one (query row, key chunk) item per CTA tile",
+        phase_floats=floats,
+        phase_counters=row_count * 3,
     )

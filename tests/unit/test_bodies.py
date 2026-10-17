@@ -161,7 +161,7 @@ def test_emit_reduction_body_generates_sum_mean_and_norm_sources():
         "epilogue",
     )
     for body in (sum_body, mean_body):
-        assert "cutlass.range(thread, 1003, 128)" in body.source
+        assert "cutlass.range(thread, 1003, 128, unroll_full=True)" in body.source
         assert "cute.arch.warp_reduction_sum(accumulator)" in body.source
         assert "cute.arch.sync_threads()" in body.source
         assert "output[o0] = value" in body.source
@@ -479,3 +479,25 @@ def test_emit_map_body_binds_each_load_once():
     for index, _ in enumerate(region.tensor_programs[0].loads):
         assert body.source.count(f"load_{index} = ") == 1
     assert "value = " in body.source and "tensor_bindings[0][o0, o1]" in body.source
+
+
+def test_swap_ab_serves_small_m_launches_with_transposed_tiles():
+    from types import SimpleNamespace
+
+    from megabake.bodies.gemm import is_swap_ab, kernel_tile, wants_swap_ab
+
+    assert wants_swap_ab([(4, 2048), (4, 8192), (4, 49152)])
+    assert wants_swap_ab([(16, 576)])
+    assert not wants_swap_ab([(4, 2048), (256, 2048)])
+    assert not wants_swap_ab([])
+    body = SimpleNamespace(
+        provider="g0_range",
+        name="g0_range_swapab_16x64",
+        tiles=SimpleNamespace(cta_shape=(16, 64)),
+    )
+    assert is_swap_ab(body)
+    assert kernel_tile(body) == (64, 16)
+    body.name = "g0_range_64x64"
+    body.tiles.cta_shape = (64, 64)
+    assert not is_swap_ab(body)
+    assert kernel_tile(body) == (64, 64)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import operator
 import copy
+import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -269,6 +270,48 @@ def _kv_attention_fake(
 KV_ATTENTION_OP = torch.ops.megabake.kv_attention.default
 
 
+@torch.library.custom_op("megabake::attention", mutates_args=())
+def attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    mask: torch.Tensor | None,
+    scale: float,
+) -> torch.Tensor:
+    """Softmax attention with Hugging Face eager numerics.
+
+    ``query`` is ``[batch, query, heads, dim]``; ``key`` and ``value`` are
+    ``[batch, key, kv_heads, dim]`` with ``heads`` a multiple of ``kv_heads``;
+    ``mask`` is additive and broadcasts to ``[batch, heads, query, key]``.
+    Returns ``[batch * heads, query, dim]``, the layout of ``kv_attention``.
+    """
+    query = query.transpose(1, 2)
+    key = key.transpose(1, 2)
+    value = value.transpose(1, 2)
+    if query.shape[1] != key.shape[1]:
+        group_size = query.shape[1] // key.shape[1]
+        key = key.repeat_interleave(group_size, dim=1)
+        value = value.repeat_interleave(group_size, dim=1)
+    scores = torch.matmul(query, key.transpose(2, 3)) * scale
+    if mask is not None:
+        scores = scores + mask
+    probabilities = torch.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
+    output = torch.matmul(probabilities, value)
+    return output.reshape(-1, output.shape[2], output.shape[3])
+
+
+@attention.register_fake
+def _attention_fake(query, key, value, mask, scale):
+    return torch.empty(
+        (query.shape[0] * query.shape[2], query.shape[1], query.shape[3]),
+        dtype=query.dtype,
+        device=query.device,
+    )
+
+
+ATTENTION_OP = torch.ops.megabake.attention.default
+
+
 def _node_value(node: torch.fx.Node, graph: ComputeGraph) -> Value:
     value_id = f"value:{node.name}"
     value = graph.values.get(value_id)
@@ -460,6 +503,175 @@ def _unary_program(
         return Unary(operator, loads[0], _result_value(op, graph).dtype or "")
 
     return _elementwise_program(node, op, graph, "elementwise", build)
+
+
+def _logical_program(
+    node: torch.fx.Node, op: Op, graph: ComputeGraph, operator: str
+) -> TensorProgram:
+    operands = [argument for argument in node.args if isinstance(argument, torch.fx.Node)]
+    if len(operands) != 2 or any(
+        _node_value(operand, graph).dtype != "torch.bool" for operand in operands
+    ):
+        raise UnsupportedLowering(f"{operator} is lowered for boolean tensors only")
+    return _binary_program(node, op, graph, operator)
+
+
+def _indexed_program(
+    node: torch.fx.Node,
+    op: Op,
+    graph: ComputeGraph,
+    loads: Sequence[IndexedLoad],
+    expression: ScalarExpression,
+    decomposition: str,
+) -> TensorProgram:
+    """An elementwise program over the result with explicitly indexed loads."""
+    result = _result_value(op, graph)
+    domains = _domains("o", result.shape)
+    return TensorProgram(
+        family="elementwise",
+        source_target=str(node.target),
+        decomposition=decomposition,
+        iteration_domains=domains,
+        reduction_axes=(),
+        loads=tuple(loads),
+        init=None,
+        combine=expression,
+        post=None,
+        accumulator_dtype=None,
+        store=TensorStore(
+            result.id, result.shape, result.dtype or "", result.strides, True
+        ),
+        predicates=_predicates(domains),
+    )
+
+
+def _within(axis: str, start: int, end: int) -> ScalarExpression:
+    index = AxisIndex(axis, "torch.int64")
+    return Binary(
+        "bitwise_and",
+        Binary("ge", index, Constant(start, "torch.int64"), "torch.bool"),
+        Binary("lt", index, Constant(end, "torch.int64"), "torch.bool"),
+        "torch.bool",
+    )
+
+
+def _value_load(load: IndexedLoad) -> Load:
+    return Load(load.id, load.dtype)
+
+
+def _slice_scatter_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorProgram:
+    """``out = base`` with ``src`` written into ``base[..., start:end, ...]``."""
+    result = _result_value(op, graph)
+    base, source = (_node_value(argument, graph) for argument in node.args[:2])
+    rank = len(result.shape)
+    dim = (node.args[2] if len(node.args) > 2 else node.kwargs.get("dim", 0)) % rank
+    size = result.shape[dim]
+    start = node.args[3] if len(node.args) > 3 else node.kwargs.get("start")
+    end = node.args[4] if len(node.args) > 4 else node.kwargs.get("end")
+    step = node.args[5] if len(node.args) > 5 else node.kwargs.get("step", 1)
+    start = 0 if start is None else (start + size if start < 0 else start)
+    end = size if end is None else min(end + size if end < 0 else end, size)
+    if not isinstance(step, int) or step < 1:
+        raise UnsupportedLowering("slice_scatter needs a positive integer step")
+    axes = [f"o{index}" for index in range(rank)]
+    base_load = _load(base, axes, 0)
+    source_axes = list(axes)
+    # Inside the slice o = start + step * j, so j = o // step - start // step.
+    source_axes[dim] = _affine(AxisTerm(axes[dim], divisor=step), offset=-(start // step))
+    source_load = _load(source, source_axes, 1)
+    inside = _within(axes[dim], start, end)
+    if step != 1:
+        offset = Binary(
+            "sub", AxisIndex(axes[dim], "torch.int64"), Constant(start, "torch.int64"), "torch.int64"
+        )
+        on_step = Binary(
+            "eq",
+            Binary("remainder", offset, Constant(step, "torch.int64"), "torch.int64"),
+            Constant(0, "torch.int64"),
+            "torch.bool",
+        )
+        inside = Binary("bitwise_and", inside, on_step, "torch.bool")
+    expression = Where(
+        inside,
+        _value_load(source_load),
+        _value_load(base_load),
+        result.dtype or "",
+    )
+    return _indexed_program(
+        node, op, graph, (base_load, source_load), expression, "select source inside the slice"
+    )
+
+
+def _select_scatter_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorProgram:
+    """``out = base`` with ``src`` written into ``base.select(dim, index)``."""
+    result = _result_value(op, graph)
+    base, source = (_node_value(argument, graph) for argument in node.args[:2])
+    rank = len(result.shape)
+    dim, index = node.args[2] % rank, node.args[3]
+    index = index + result.shape[dim] if index < 0 else index
+    axes = [f"o{position}" for position in range(rank)]
+    base_load = _load(base, axes, 0)
+    source_load = _load(source, axes[:dim] + axes[dim + 1 :], 1)
+    expression = Where(
+        _within(axes[dim], index, index + 1),
+        _value_load(source_load),
+        _value_load(base_load),
+        result.dtype or "",
+    )
+    return _indexed_program(
+        node, op, graph, (base_load, source_load), expression, "select source at the index"
+    )
+
+
+def _constant_pad_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorProgram:
+    """``constant_pad_nd``: a shifted load; out-of-range reads take the fill value."""
+    result = _result_value(op, graph)
+    source = _node_value(node.args[0], graph)
+    pad = node.args[1]
+    fill = node.args[2] if len(node.args) > 2 else node.kwargs.get("value", 0)
+    rank = len(result.shape)
+    axes: list[Any] = [f"o{index}" for index in range(rank)]
+    inside: ScalarExpression | None = None
+    for pair in range(len(pad) // 2):
+        dim = rank - 1 - pair
+        low = pad[2 * pair]
+        axes[dim] = _affine(AxisTerm(f"o{dim}"), offset=-low)
+        within = _within(f"o{dim}", low, low + source.shape[dim])
+        inside = within if inside is None else Binary("bitwise_and", inside, within, "torch.bool")
+    load = _load(source, axes, 0)
+    expression: ScalarExpression = _value_load(load)
+    if fill != 0 and inside is not None:
+        # Loads outside the source read zero; other fill values need a select.
+        expression = Where(inside, expression, _typed_constant(fill, result.dtype or ""), result.dtype or "")
+    return _indexed_program(node, op, graph, (load,), expression, "shifted load with fill")
+
+
+def _functional_copy_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorProgram:
+    """``aten.copy(self, src)``: ``src`` broadcast to ``self`` and cast to its dtype."""
+    result = _result_value(op, graph)
+    source = _node_value(node.args[1], graph)
+    load = _load(source, _broadcast_axes(source, result.shape), 0)
+    expression = Cast(
+        _value_load(load),
+        result.dtype or "",
+        _cast_rounding(source.dtype or "", result.dtype or ""),
+    )
+    return _indexed_program(node, op, graph, (load,), expression, "broadcast copy")
+
+
+def _state_write_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorProgram:
+    """``aten.copy_(state, src)`` on a graph input: write ``src`` into the
+    input's storage. AOT keeps input mutations as these trailing copies; the
+    storage-order dependencies run the write after every read of the old state.
+    """
+    destination = _node_value(node.args[0], graph)
+    if destination.id not in graph.inputs:
+        raise UnsupportedLowering("in-place copies are lowered into graph inputs only")
+    program = _functional_copy_program(node, op, graph)
+    result = _result_value(op, graph)
+    if result.storage_relation.storage_id != destination.storage_relation.storage_id:
+        raise UnsupportedLowering("in-place copy result does not alias its destination")
+    return replace(program, store=replace(program.store, owns_storage=False))
 
 
 def _where_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorProgram:
@@ -1316,12 +1528,12 @@ def _reduction_identity(dtype: str, operator: str) -> Constant:
     return Constant(torch.iinfo(torch_dtype).min, dtype)
 
 
-def _int_tuple(value: Any, name: str, length: int) -> tuple[int, ...]:
+def _int_tuple(value: Any, name: str, length: int, minimum: int = 1) -> tuple[int, ...]:
     if not isinstance(value, Sequence) or len(value) != length:
         raise UnsupportedLowering(f"{name} must have {length} values")
     values = tuple(value)
-    if any(not isinstance(item, int) or item <= 0 for item in values):
-        raise UnsupportedLowering(f"{name} values must be positive integers")
+    if any(not isinstance(item, int) or item < minimum for item in values):
+        raise UnsupportedLowering(f"{name} values must be integers of at least {minimum}")
     return values
 
 
@@ -1333,9 +1545,14 @@ def _convolution_program(
     input_value = _node_value(node.args[0], graph)
     weight_value = _node_value(node.args[1], graph)
     bias_node = node.args[2]
-    stride = _int_tuple(node.args[3], "convolution stride", 2)
-    padding = _int_tuple(node.args[4], "convolution padding", 2)
-    dilation = _int_tuple(node.args[5], "convolution dilation", 2)
+    if input_value.shape is None or weight_value.shape is None:
+        raise UnsupportedLowering("convolution operands lack static shapes")
+    spatial = len(input_value.shape) - 2
+    if spatial not in (1, 2) or len(weight_value.shape) != spatial + 2:
+        raise UnsupportedLowering("only static 1-D and 2-D convolution is supported")
+    stride = _int_tuple(node.args[3], "convolution stride", spatial)
+    padding = _int_tuple(node.args[4], "convolution padding", spatial, minimum=0)
+    dilation = _int_tuple(node.args[5], "convolution dilation", spatial)
     if node.args[6] or any(value for value in node.args[7]):
         raise UnsupportedLowering("transposed convolution is not supported")
     groups = node.args[8]
@@ -1343,32 +1560,49 @@ def _convolution_program(
         raise UnsupportedLowering("convolution groups must be a positive integer")
 
     result = _result_value(op, graph)
-    if (
-        input_value.shape is None
-        or weight_value.shape is None
-        or len(input_value.shape) != 4
-        or len(weight_value.shape) != 4
-    ):
-        raise UnsupportedLowering("only static 2-D convolution is supported")
-    batch, input_channels, input_height, input_width = input_value.shape
-    output_channels, channels_per_group, kernel_height, kernel_width = weight_value.shape
+    # A 1-D convolution is the 2-D one with a single row.
+    batch, input_channels, *input_extent = input_value.shape
+    output_channels, channels_per_group, *kernel = weight_value.shape
     if input_channels != channels_per_group * groups or output_channels % groups:
         raise UnsupportedLowering("convolution groups do not match its operands")
     output_shape = (
         batch,
         output_channels,
-        (input_height + 2 * padding[0] - dilation[0] * (kernel_height - 1) - 1)
-        // stride[0]
-        + 1,
-        (input_width + 2 * padding[1] - dilation[1] * (kernel_width - 1) - 1)
-        // stride[1]
-        + 1,
+        *(
+            (extent + 2 * pad - dilate * (size - 1) - 1) // step + 1
+            for extent, pad, dilate, size, step in zip(
+                input_extent, padding, dilation, kernel, stride, strict=True
+            )
+        ),
     )
     if result.shape != output_shape:
         raise UnsupportedLowering("convolution result shape does not match its operands")
 
-    kernel_extent = kernel_height * kernel_width
+    kernel_width = kernel[-1]
+    kernel_extent = math.prod(kernel)
     channels_per_output_group = output_channels // groups
+    width = _affine(
+        AxisTerm(f"o{spatial + 1}", scale=stride[-1]),
+        AxisTerm("r0", scale=dilation[-1], modulus=kernel_width),
+        offset=-padding[-1],
+    )
+    if spatial == 2:
+        kernel_height = kernel[0]
+        input_spatial = (
+            _affine(
+                AxisTerm("o2", scale=stride[0]),
+                AxisTerm("r0", scale=dilation[0], divisor=kernel_width, modulus=kernel_height),
+                offset=-padding[0],
+            ),
+            width,
+        )
+        weight_spatial = (
+            _affine(AxisTerm("r0", divisor=kernel_width, modulus=kernel_height)),
+            _affine(AxisTerm("r0", modulus=kernel_width)),
+        )
+    else:
+        input_spatial = (width,)
+        weight_spatial = (_affine(AxisTerm("r0", modulus=kernel_width)),)
     input_load = _load(
         input_value,
         (
@@ -1377,31 +1611,13 @@ def _convolution_program(
                 AxisTerm("o1", scale=channels_per_group, divisor=channels_per_output_group),
                 AxisTerm("r0", divisor=kernel_extent),
             ),
-            _affine(
-                AxisTerm("o2", scale=stride[0]),
-                AxisTerm(
-                    "r0", scale=dilation[0], divisor=kernel_width, modulus=kernel_height
-                ),
-                offset=-padding[0],
-            ),
-            _affine(
-                AxisTerm("o3", scale=stride[1]),
-                AxisTerm("r0", scale=dilation[1], modulus=kernel_width),
-                offset=-padding[1],
-            ),
+            *input_spatial,
         ),
         0,
     )
     weight_load = _load(
         weight_value,
-        (
-            "o1",
-            _affine(AxisTerm("r0", divisor=kernel_extent)),
-            _affine(
-                AxisTerm("r0", divisor=kernel_width, modulus=kernel_height)
-            ),
-            _affine(AxisTerm("r0", modulus=kernel_width)),
-        ),
+        ("o1", _affine(AxisTerm("r0", divisor=kernel_extent)), *weight_spatial),
         1,
     )
     loads = [input_load, weight_load]
@@ -1730,8 +1946,153 @@ def _kv_attention_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> T
     )
 
 
+def attention_access_axes(
+    head_axis: int, batch_axis: AxisAffine, head: AxisAffine, sequence_axis: str
+) -> tuple[AxisExpression, ...]:
+    if head_axis == 2:
+        return (batch_axis, sequence_axis, head, "d")
+    return (batch_axis, head, sequence_axis, "d")
+
+
+def attention_tensor_program(
+    output_id: str,
+    q_root: str,
+    k_root: str,
+    v_root: str,
+    q: Any,
+    k: Any,
+    v: Any,
+    axes: tuple[int, int, int],
+    mask_value: str | None,
+    graph: ComputeGraph,
+) -> TensorProgram | None:
+    output = graph.values[output_id]
+    if output.shape is None or output.dtype is None or output.strides is None:
+        return None
+    if q.shape is None or k.shape is None or v.shape is None:
+        return None
+    q_head_axis, k_head_axis, v_head_axis = axes
+    batch = q.shape[0]
+    query_heads = q.shape[q_head_axis]
+    query_length = q.shape[3 - q_head_axis]
+    kv_heads = k.shape[k_head_axis]
+    kv_length = k.shape[3 - k_head_axis]
+    head_dim = q.shape[-1]
+    group_size = query_heads // kv_heads
+    batch_head = AxisAffine((AxisTerm("bh", divisor=query_heads),))
+    query_head = AxisAffine((AxisTerm("bh", modulus=query_heads),))
+    kv_head = AxisAffine(
+        (AxisTerm("bh", divisor=query_heads, modulus=group_size),)
+    )
+
+    loads = (
+        IndexedLoad(
+            "attention:q",
+            q_root,
+            attention_access_axes(q_head_axis, batch_head, query_head, "s"),
+            q.strides or (),
+            q.dtype or "",
+            q.shape,
+        ),
+        IndexedLoad(
+            "attention:k",
+            k_root,
+            attention_access_axes(k_head_axis, batch_head, kv_head, "k"),
+            k.strides or (),
+            k.dtype or "",
+            k.shape,
+        ),
+        IndexedLoad(
+            "attention:v",
+            v_root,
+            attention_access_axes(v_head_axis, batch_head, kv_head, "k"),
+            v.strides or (),
+            v.dtype or "",
+            v.shape,
+        ),
+    )
+    if mask_value is not None:
+        mask = graph.values[mask_value]
+        if mask.shape is None or mask.strides is None or mask.dtype is None:
+            return None
+        mask_head = 0 if mask.shape[1] == 1 else query_head
+        loads = (
+            *loads,
+            IndexedLoad(
+                "attention:mask",
+                mask_value,
+                (batch_head, mask_head, "s", "k"),
+                mask.strides,
+                mask.dtype,
+                mask.shape,
+            ),
+        )
+    zero = Constant(0.0, "torch.float32")
+    return TensorProgram(
+        family="attention",
+        source_target="megabake.attention",
+        decomposition="stable softmax attention with grouped heads and typed masks",
+        iteration_domains=(
+            IterationDomain("bh", batch * query_heads),
+            IterationDomain("s", query_length),
+            IterationDomain("d", head_dim),
+            IterationDomain("k", kv_length),
+        ),
+        reduction_axes=("k",),
+        loads=loads,
+        init=zero,
+        combine=zero,
+        post=zero,
+        accumulator_dtype="torch.float32",
+        store=TensorStore(
+            output.id,
+            output.shape,
+            output.dtype,
+            output.strides,
+            True,
+        ),
+        predicates=(
+            AxisPredicate("bh", batch * query_heads),
+            AxisPredicate("s", query_length),
+            AxisPredicate("d", head_dim),
+        ),
+    )
+
+
+def _attention_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorProgram:
+    query, key, value = (_node_value(argument, graph) for argument in node.args[:3])
+    mask = node.args[3]
+    if mask is not None and not isinstance(mask, torch.fx.Node):
+        raise UnsupportedLowering("attention mask must be a tensor or None")
+    if any(
+        operand.shape is None or len(operand.shape) != 4 or operand.dtype != "torch.bfloat16"
+        for operand in (query, key, value)
+    ):
+        raise UnsupportedLowering("attention supports four-dimensional BF16 operands")
+    if query.shape[2] % key.shape[2] or key.shape != value.shape:
+        raise UnsupportedLowering("attention needs whole KV-head groups and matching K and V")
+    # Operands are [batch, sequence, heads, dim] by the op contract, so the
+    # head axis is known and no stride heuristic is needed.
+    program = attention_tensor_program(
+        _result_value(op, graph).id,
+        query.id,
+        key.id,
+        value.id,
+        query,
+        key,
+        value,
+        (2, 2, 2),
+        None if mask is None else _node_value(mask, graph).id,
+        graph,
+    )
+    if program is None:
+        raise UnsupportedLowering("attention operands lack static layouts")
+    return program
+
+
 LOWERERS: dict[Any, LoweringRule] = {
     KV_ATTENTION_OP: _kv_attention_program,
+    ATTENTION_OP: _attention_program,
     torch.ops.aten.add.Tensor: lambda node, op, graph: _binary_program(node, op, graph, "add"),
     torch.ops.aten.add.Scalar: lambda node, op, graph: _binary_program(node, op, graph, "add"),
     torch.ops.aten.sub.Tensor: lambda node, op, graph: _binary_program(node, op, graph, "sub"),
@@ -1768,6 +2129,49 @@ LOWERERS: dict[Any, LoweringRule] = {
     torch.ops.aten.rsqrt.default: lambda node, op, graph: _unary_program(node, op, graph, "rsqrt"),
     torch.ops.aten.exp.default: lambda node, op, graph: _unary_program(node, op, graph, "exp"),
     torch.ops.aten.cos.default: lambda node, op, graph: _unary_program(node, op, graph, "cos"),
+    **{
+        getattr(torch.ops.aten, name).default: (
+            lambda node, op, graph, name=name: _unary_program(node, op, graph, name)
+        )
+        for name in (
+            "sqrt", "reciprocal", "exp2", "expm1", "log", "log1p", "log2",
+            "erf", "floor", "ceil", "trunc",
+        )
+    },
+    **{
+        getattr(torch.ops.aten, name).default: (
+            lambda node, op, graph, name=name: _logical_program(node, op, graph, name)
+        )
+        for name in ("logical_and", "logical_or", "logical_xor")
+    },
+    torch.ops.aten.bitwise_or.Tensor: lambda node, op, graph: _binary_program(
+        node, op, graph, "bitwise_or"
+    ),
+    torch.ops.aten.bitwise_xor.Tensor: lambda node, op, graph: _binary_program(
+        node, op, graph, "bitwise_xor"
+    ),
+    torch.ops.aten.maximum.default: lambda node, op, graph: _binary_program(
+        node, op, graph, "maximum"
+    ),
+    torch.ops.aten.minimum.default: lambda node, op, graph: _binary_program(
+        node, op, graph, "minimum"
+    ),
+    torch.ops.aten.clamp_min.default: lambda node, op, graph: _binary_program(
+        node, op, graph, "maximum"
+    ),
+    torch.ops.aten.clamp_max.default: lambda node, op, graph: _binary_program(
+        node, op, graph, "minimum"
+    ),
+    torch.ops.aten.select.int: _view_program,
+    torch.ops.aten.slice_scatter.default: _slice_scatter_program,
+    torch.ops.aten.select_scatter.default: _select_scatter_program,
+    torch.ops.aten.constant_pad_nd.default: _constant_pad_program,
+    torch.ops.aten.copy.default: _functional_copy_program,
+    torch.ops.aten.copy_.default: _state_write_program,
+    torch.ops.aten.squeeze.dim: _view_program,
+    torch.ops.aten.squeeze.dims: _view_program,
+    torch.ops.aten.squeeze.default: _view_program,
+    torch.ops.aten.alias.default: _view_program,
     torch.ops.aten.sin.default: lambda node, op, graph: _unary_program(node, op, graph, "sin"),
     torch.ops.aten._to_copy.default: _cast_program,
     torch.ops.aten.to.dtype: _cast_program,
@@ -2046,8 +2450,8 @@ def lower_semantics(graph: ComputeGraph) -> ComputeGraph:
             if node.op == "get_attr"
             else LOWERERS.get(target) or LOWERERS.get(str(target))
         )
-        stateful_attention = target == KV_ATTENTION_OP
-        unsupported_effects = not stateful_attention and bool(
+        declared_effects = target in (KV_ATTENTION_OP, torch.ops.aten.copy_.default)
+        unsupported_effects = not declared_effects and bool(
             operation.effects.get("unknown")
             or operation.effects.get("mutates_inputs")
             or operation.effects.get("may_mutate_inputs")
