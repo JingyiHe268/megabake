@@ -552,7 +552,10 @@ def search_plans(
         try:
             dependencies = derive_dependencies(selection)
             schedule = make_phase_schedule(
-                selection, dependencies, worker_count=worker_count
+                selection,
+                dependencies,
+                worker_count=worker_count,
+                fold_small_intervals=selected_policy.table_launch,
             )
             plan = assign_storage(schedule)
             verify_plan(plan)

@@ -109,10 +109,10 @@ def _view(tensor):
     return result.mark_layout_dynamic(leading_dim=leading_dimension)
 
 
-def _run_body(body, tensors, threads):
+def _run_body(body, tensors, tile_elements):
     count = tensors[-1].numel()
-    tile_count = (count + threads - 1) // threads
-    work = torch.arange(tile_count, device="cuda", dtype=torch.int64) * threads
+    tile_count = (count + tile_elements - 1) // tile_elements
+    work = torch.arange(tile_count, device="cuda", dtype=torch.int64) * tile_elements
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     views = [_view(work), *(_view(tensor) for tensor in tensors)]
     compiled = cute.compile(body, *views, stream)
@@ -143,8 +143,10 @@ def test_map_body_launcher_handles_two_expressions_partial_tiles_and_strides(
     cast_module, cast_body = _load_body(cast_program, cast_config, "cast", tmp_path)
 
     assert add_body.threads_per_cta == cast_body.threads_per_cta == 128
-    assert "tensor_bindings[1][0, o1]" in add_body.source
-    assert "linear_index < output_count" in add_body.source
+    assert "tensor_bindings[1][0, o1_0]" in add_body.source
+    # A partial last tile: 350 elements in one 512-element tile.
+    assert add_body.tile_elements == 512 and add_body.tile_count == 1
+    assert "linear_3 < output_count" in add_body.source
     assert ".to(cutlass.BFloat16)" in cast_body.source
 
     add_launcher = _load_launcher(
@@ -163,8 +165,8 @@ def test_map_body_launcher_handles_two_expressions_partial_tiles_and_strides(
     cast_output = torch.full(
         (rows, columns), float("nan"), device="cuda", dtype=torch.bfloat16
     )
-    _run_body(add_launcher, (gpu_left, gpu_right, add_output), 128)
-    _run_body(cast_launcher, (gpu_value, cast_output), 128)
+    _run_body(add_launcher, (gpu_left, gpu_right, add_output), add_body.tile_elements)
+    _run_body(cast_launcher, (gpu_value, cast_output), cast_body.tile_elements)
 
     torch.testing.assert_close(add_output, gpu_left + gpu_right)
     torch.testing.assert_close(cast_output, gpu_value.to(torch.bfloat16))

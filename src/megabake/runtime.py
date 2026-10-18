@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 import uuid
 from typing import Protocol
 
@@ -21,19 +22,46 @@ class InvalidRuntime(ValueError):
 _MAX_INT32 = 2**31 - 1
 
 
+# MEGABAKE_PHASE_TIMER=1 makes table launches stamp the global timer after
+# every grid barrier (see tools/phase_profile.py). The stamps follow the
+# barrier state in the ready buffer, so the kernel signature is unchanged.
+PHASE_TIMER_SLOTS = 8192 if os.environ.get("MEGABAKE_PHASE_TIMER") == "1" else 0
+
+
 def ready_slots(workers: int) -> int:
-    """Barrier state: per-worker slots, the release flag, and the arrival counter."""
-    return workers + 2
+    """Barrier state: per-worker slots, the release flag, the arrival counter,
+    any phase-timer stamps, and the call counter."""
+    return workers + 3 + PHASE_TIMER_SLOTS
+
+
+# Host-mapped buffers holding table launches' per-call boundary addresses;
+# launch ``n`` reads entry ``n % DYNAMIC_ADDRESS_RING``.
+DYNAMIC_ADDRESS_RING = 64
+
+
+def call_counter_offset() -> int:
+    """Offset of the call counter from ``workers`` in the ready buffer.
+
+    Table launches derive their barrier epochs from this counter, which the
+    kernel advances itself, so no kernel argument changes between calls.
+    """
+    return 2 + PHASE_TIMER_SLOTS
+
+
+def _arrival_counter(ready: torch.Tensor) -> int:
+    return ready.numel() - 2 - PHASE_TIMER_SLOTS
 
 
 def make_ready(workers: int, device: torch.device | str) -> torch.Tensor:
     ready = torch.full((ready_slots(workers),), -1, dtype=torch.int32, device=device)
+    ready[_arrival_counter(ready)] = 0
     ready[-1] = 0
     return ready
 
 
 def reset_ready(ready: torch.Tensor) -> None:
     ready.fill_(-1)
+    ready[_arrival_counter(ready)] = 0
     ready[-1] = 0
 
 
@@ -77,6 +105,32 @@ def grid_barrier(ready: cute.Tensor, workers: cutlass.Int32, epoch: cutlass.Int3
                     scope="gpu",
                 )
                 released = seen == epoch
+    cute.arch.sync_threads()
+
+
+@cute.jit
+def counting_grid_barrier(
+    ready: cute.Tensor, workers: cutlass.Int32, ordinal: cutlass.Int32
+):
+    """Grid barrier on an arrival counter that only grows.
+
+    Barrier ``ordinal`` (counted densely from the last ready reset) completes
+    once the counter reaches ``(ordinal + 1) * workers``. Each CTA arrives
+    with one release reduction and polls with acquire loads, so the last
+    arrival is itself the release: one memory round trip on the critical
+    path instead of an arrival, a counter reset, and a flag release. The
+    caller keeps ``(ordinal + 1) * workers`` within int32 and resets the
+    ready buffer before it would wrap.
+    """
+    thread, _, _ = cute.arch.thread_idx()
+    cute.arch.sync_threads()
+    if thread == 0:
+        counter = ready.iterator + workers + 1
+        cute.arch.red(counter, cutlass.Int32(1), op="add", dtype="s32", sem="release", scope="gpu")
+        target = (ordinal + cutlass.Int32(1)) * workers
+        seen = cute.arch.load(counter, cutlass.Int32, sem="acquire", scope="gpu")
+        while seen < target:
+            seen = cute.arch.load(counter, cutlass.Int32, sem="acquire", scope="gpu")
     cute.arch.sync_threads()
 
 
@@ -237,7 +291,10 @@ def execute_phase_plan(
     admission: RuntimeAdmission | None = None,
     ready: torch.Tensor | None = None,
     epoch: int | None = None,
+    synchronize: bool = True,
 ) -> RuntimeInvocation:
+    """Launch ``kernel`` on ``stream``. With ``synchronize=False`` the call
+    returns once the launch is enqueued; its results are stream-ordered."""
     active_stream = stream or torch.cuda.current_stream()
     device = active_stream.device
     with torch.cuda.device(device):
@@ -252,7 +309,8 @@ def execute_phase_plan(
         )
         selected_epoch = 0 if epoch is None else epoch
         kernel(selected_ready, selected_epoch, active_stream)
-        active_stream.synchronize()
+        if synchronize:
+            active_stream.synchronize()
 
     return RuntimeInvocation(
         invocation_id, selected_epoch, selected_admission.barrier_count
@@ -289,6 +347,7 @@ def execute_event_plan(
     events: torch.Tensor | None = None,
     epoch: int | None = None,
     validate_counters: bool = True,
+    synchronize: bool = True,
 ) -> EventRuntimeInvocation:
     active_stream = stream or torch.cuda.current_stream()
     device = active_stream.device
@@ -327,7 +386,8 @@ def execute_event_plan(
                             f"event {event.id} counters do not match epoch {selected_epoch}"
                         )
         kernel(selected_events, selected_epoch, active_stream)
-        active_stream.synchronize()
+        if synchronize:
+            active_stream.synchronize()
 
     return EventRuntimeInvocation(
         invocation_id,

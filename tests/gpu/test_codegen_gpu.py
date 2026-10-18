@@ -117,23 +117,32 @@ def _run_generic(generated, source):
     phase_table = torch.tensor(
         generated.launch.phase_table, dtype=torch.int32, device="cuda"
     )
+    # Ring entry 0, stamped with call 0, holds this call's boundary addresses.
     dynamic_addresses = torch.tensor(
-        [tensors[slot].data_ptr() for slot in generated.launch.dynamic_slots] or [0],
+        [0, *(tensors[slot].data_ptr() for slot in generated.launch.dynamic_slots)],
         dtype=torch.int64,
     ).pin_memory()
     dynamic_slots = torch.tensor(
         list(generated.launch.dynamic_slots) or [0], dtype=torch.int32, device="cuda"
     )
+    phase_floats = torch.empty(
+        max(generated.launch.phase_float_elements, 4), dtype=torch.float32, device="cuda"
+    )
+    phase_counters = torch.zeros(
+        max(generated.launch.phase_counter_count, 4), dtype=torch.int32, device="cuda"
+    )
     views = [
         _view(ready),
         cutlass.Int32(generated.launch.grid_size),
-        cutlass.Int32(0),
         _view(addresses),
         _view(phase_table),
         iterator_views,
         # Per-call boundary addresses: a host-mapped buffer and its slots.
         cutlass.Int64(dynamic_addresses.data_ptr()),
         _view(dynamic_slots),
+        # Phase scratch: FP32 elements and zeroed Int32 counters.
+        _view(phase_floats),
+        _view(phase_counters),
     ]
     compiled = cute.compile(module.launch, *views, stream)
     compiled(*views, stream)

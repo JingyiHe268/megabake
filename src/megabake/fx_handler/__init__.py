@@ -6,6 +6,8 @@ __all__ = [
     "capture_exported_program",
     "capture_transformer",
     "dump_graph",
+    "register_transformers_attention",
+    "DecodeStep",
 ]
 
 
@@ -14,6 +16,10 @@ def __getattr__(name: str):
         from . import export
 
         return getattr(export, name)
+    if name in {"register_transformers_attention", "DecodeStep"}:
+        from . import hf_attention
+
+        return getattr(hf_attention, name)
     if name in {"TransformerCapture", "capture_transformer"}:
         from . import transformers
 

@@ -57,9 +57,22 @@ def enumerate_body_selections(
     if max_plans < 1:
         raise ValueError("max_plans must be positive")
     policy = _validated_policy(graph, policy)
-    return _enumerate_body_selections(
+    # The preflight and the measured search enumerate the same selections;
+    # sharing them lets both reuse the same cached tile maps.
+    key = (id(graph), target, policy, max_plans)
+    entry = _SELECTION_CACHE.get(key)
+    if entry is not None and entry[0] is graph:
+        return entry[1]
+    selections = _enumerate_body_selections(
         graph, target, policy, max_plans=max_plans
     )[0]
+    if len(_SELECTION_CACHE) >= 8:
+        _SELECTION_CACHE.pop(next(iter(_SELECTION_CACHE)))
+    _SELECTION_CACHE[key] = (graph, selections)
+    return selections
+
+
+_SELECTION_CACHE: dict[tuple[Any, ...], tuple[ComputeGraph, tuple[BodySelectionPlan, ...]]] = {}
 
 
 def _validated_policy(
@@ -450,7 +463,38 @@ def _contraction_body_order(
 
 
 def make_tile_maps(selection: BodySelectionPlan) -> tuple[TileMap, ...]:
-    return tuple(_make_tile_map(selected, selection.conversions) for selected in selection.selections)
+    return tuple(_cached_tile_map(selected, selection.conversions) for selected in selection.selections)
+
+
+# Tile maps enumerate every output tile and its input tiles, which for large
+# graphs costs minutes, and plan search, scheduling, and storage planning each
+# ask for the same region's map. A map depends only on the selected body and
+# the conversions into it, so it is built once per (body, conversions) pair.
+# Entries hold their keys' objects, so an id is never reused while cached.
+_TILE_MAP_CACHE: dict[tuple[int, tuple[int, ...]], tuple[Any, tuple[Any, ...], TileMap]] = {}
+_TILE_MAP_CACHE_LIMIT = 8192
+
+
+def _cached_tile_map(
+    selected: SelectedBody, conversions: Sequence[ConversionBody]
+) -> TileMap:
+    relevant = tuple(
+        conversion
+        for conversion in conversions
+        if conversion.target_region_id == selected.region_id
+        or conversion.source_region_id == selected.region_id
+    )
+    key = (id(selected), tuple(id(conversion) for conversion in relevant))
+    entry = _TILE_MAP_CACHE.get(key)
+    if entry is not None and entry[0] is selected and all(
+        old is new for old, new in zip(entry[1], relevant, strict=True)
+    ):
+        return entry[2]
+    tile_map = _make_tile_map(selected, conversions)
+    if len(_TILE_MAP_CACHE) >= _TILE_MAP_CACHE_LIMIT:
+        _TILE_MAP_CACHE.pop(next(iter(_TILE_MAP_CACHE)))
+    _TILE_MAP_CACHE[key] = (selected, relevant, tile_map)
+    return tile_map
 
 
 def _body_cost(config: BodyConfig) -> tuple[int, int]:
@@ -617,7 +661,21 @@ def _make_tile_map(
 def _output_tile_shape(program: TensorProgram, body: BodyConfig) -> tuple[int, ...]:
     output_shape = program.store.shape
     if program.family == "reduction":
-        return (1,) * len(output_shape)
+        # One tile per reduced row, as the reduction body runs: axes that only
+        # the post-reduction expression reads (a norm's feature axis) span
+        # the whole tile.
+        from .bodies.generic import reduced_row_axes
+
+        row_axes = reduced_row_axes(program)
+        output_axes = [
+            domain.axis
+            for domain in program.iteration_domains
+            if domain.axis not in program.reduction_axes
+        ]
+        return tuple(
+            1 if row_axes is None or axis in row_axes else size
+            for axis, size in zip(output_axes, output_shape, strict=True)
+        )
     if body.tiles.work_partition == "one output element per thread":
         return _row_major_tile_shape(output_shape, body.participants.participating_threads)
     if len(body.tiles.cta_shape) != len(output_shape):

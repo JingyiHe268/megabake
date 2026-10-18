@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from math import prod
@@ -145,6 +147,14 @@ _BINARY_SYMBOLS = {
     "mul": "*",
     "div": "/",
     "bitwise_and": "&",
+    # Integer coordinates only; float remainder follows Python and differs.
+    "remainder": "%",
+    "bitwise_or": "|",
+    "bitwise_xor": "^",
+    # Logical operators are lowered for boolean operands only.
+    "logical_and": "&",
+    "logical_or": "|",
+    "logical_xor": "^",
     "eq": "==",
     "ne": "!=",
     "lt": "<",
@@ -178,28 +188,53 @@ def emit_map_body(program: TensorProgram, config: BodyConfig) -> GeneratedMapBod
     ordered_loads = sorted(
         program.loads, key=lambda load: load.id not in index_load_ids
     )
-    hoisted_lines = ""
-    for load in ordered_loads:
-        if load.id not in index_load_ids:
-            hoisted_lines += _gather_bounds_lines(load, hoisted_names)
-        hoisted_lines += (
-            f"            {hoisted_names[load.id]} = "
-            f"{_load_access(load, load_indices[load.id], program.loads, axis_coordinates).code}\n"
+    # Each thread covers MAP_ELEMENTS_PER_THREAD elements of a tile, strided by
+    # the CTA size. Every element's loads are issued before any store, so a
+    # tile costs one round of memory latency; a store between them would
+    # serialize the loads (the pointers may alias). Coordinates wrap modulo
+    # each axis, so an element past the end loads in bounds; only its store
+    # is guarded.
+    elements = MAP_ELEMENTS_PER_THREAD
+    tile_elements = threads * elements
+    load_lines = ""
+    value_lines = ""
+    store_lines = ""
+    for element in range(elements):
+        names = {axis: f"{name}_{element}" for axis, name in axis_coordinates.items()}
+        hoisted = {load_id: f"{name}_{element}" for load_id, name in hoisted_names.items()}
+        index = f"linear_{element}"
+        load_lines += f"        {index} = base + {element * threads}\n"
+        load_lines += f"        remainder_{element} = {index}\n"
+        coordinates = _coordinate_lines(
+            program.store.shape, program.store.strides, f"remainder_{element}"
         )
-    token = _HOISTED_LOADS.set(hoisted_names)
-    try:
-        value = _emit_expression(
-            program.combine, load_indices, axis_coordinates, program.loads
+        load_lines += re.sub(r"\bo(\d+)\b", rf"o\1_{element}", coordinates).replace(
+            "            ", "        "
         )
-    finally:
-        _HOISTED_LOADS.reset(token)
-    value = _cast_expression(value, program.store.dtype)
+        for load in ordered_loads:
+            if load.id not in index_load_ids:
+                load_lines += _gather_bounds_lines(load, hoisted).replace(
+                    "            ", "        ", 1
+                ).replace("\n            ", "\n        ")
+            load_lines += (
+                f"        {hoisted[load.id]} = "
+                f"{_load_access(load, load_indices[load.id], program.loads, names).code}\n"
+            )
+        token = _HOISTED_LOADS.set(hoisted)
+        try:
+            value = _emit_expression(program.combine, load_indices, names, program.loads)
+        finally:
+            _HOISTED_LOADS.reset(token)
+        value = _cast_expression(value, program.store.dtype)
+        value_lines += f"        value_{element} = {value.code}\n"
+        output_index = ", ".join(
+            names[domain.axis] for domain in program.iteration_domains
+        ) or "0"
+        store_lines += (
+            f"        if {index} < output_count:\n"
+            f"            output[{output_index}] = value_{element}\n"
+        )
 
-    coordinate_lines = _coordinate_lines(program.store.shape, program.store.strides)
-    output_coordinates = ", ".join(
-        axis_coordinates[domain.axis] for domain in program.iteration_domains
-    )
-    output_index = output_coordinates or "0"
     binding_type = ", ".join(
         "cute.Tensor" for _ in range(len(input_value_ids) + 1)
     )
@@ -223,19 +258,16 @@ def run(
     output = tensor_bindings[{len(input_value_ids)}]
     output_count = cute.size(output)
     for tile in cutlass.range(block, cute.size(work_iterator), workers):
-        linear_index = work_iterator[tile] + thread
-        if linear_index < output_count:
-{coordinate_lines}{hoisted_lines}            value = {value.code}
-            output[{output_index}] = value
-'''
+        base = work_iterator[tile] + thread
+{load_lines}{value_lines}{store_lines}'''
     element_count = 1
     for size in program.store.shape:
         element_count *= size
-    tile_count = (element_count + threads - 1) // threads
+    tile_count = (element_count + tile_elements - 1) // tile_elements
     return GeneratedMapBody(
         source=source,
         threads_per_cta=threads,
-        tile_elements=threads,
+        tile_elements=tile_elements,
         tile_count=tile_count,
     )
 
@@ -348,7 +380,7 @@ def run(
         output_index = work_iterator[tile]
         if output_index < output_count:
 {coordinate_lines}            accumulator = {accumulator_type}({accumulator.code})
-            for reduction_index in cutlass.range(thread, {reduction_domain.size}, {threads}):
+            for reduction_index in {_strided_range("thread", reduction_domain.size, threads)}:
                 {reduction_coordinate} = reduction_index
                 accumulator = {combine.code}
             warp_partial = {warp_reduction}
@@ -403,6 +435,53 @@ def _expression_axes(expression: Any, loads: Sequence[IndexedLoad]) -> set[str] 
         else:
             return None
     return axes
+
+
+# Elements each thread of a map body covers per tile (see emit_map_body).
+MAP_ELEMENTS_PER_THREAD = 4
+
+
+def reduced_row_axes(program: TensorProgram) -> set[str] | None:
+    """Output axes a reduction's combine and init read: one reduction runs
+    per coordinate of these. The other output axes only take the post
+    expression. None when an index is data dependent."""
+    axes = _expression_axes(program.combine, program.loads)
+    if axes is None:
+        return None
+    return axes | (_expression_axes(program.init, program.loads) or set())
+
+
+def single_cta_rounds(program: TensorProgram, threads: int) -> int:
+    """Rounds of dependent memory latency one CTA spends running every tile
+    of a map or reduction body: map tiles, or reduced rows."""
+    elements = prod(program.store.shape)
+    if program.family != "reduction":
+        return -(-elements // (threads * MAP_ELEMENTS_PER_THREAD))
+    output_domains = [
+        domain
+        for domain in program.iteration_domains
+        if domain.axis not in program.reduction_axes
+    ]
+    reduced_axes = reduced_row_axes(program)
+    row_domains = [
+        domain
+        for domain in output_domains
+        if reduced_axes is None or domain.axis in reduced_axes
+    ]
+    if len(row_domains) == len(output_domains):
+        return elements
+    return prod(domain.size for domain in row_domains)
+
+
+# Strided per-thread loops with at most this many iterations unroll fully, so
+# their independent loads are in flight together instead of one per trip.
+_UNROLL_ITERATIONS = 16
+
+
+def _strided_range(start: str, size: int, threads: int) -> str:
+    """``cutlass.range`` over ``start, start + threads, ...`` below ``size``."""
+    unroll = ", unroll_full=True" if -(-size // threads) <= _UNROLL_ITERATIONS else ""
+    return f"cutlass.range({start}, {size}, {threads}{unroll})"
 
 
 def _row_major_lines(domains: Sequence[Any], names: Mapping[str, str], value: str, indent: str) -> str:
@@ -470,6 +549,22 @@ def _emit_row_reduction_body(
         for domain in program.iteration_domains
         if domain.axis not in program.reduction_axes
     )
+    post_steps = -(-post_count // threads)
+    if post_steps <= _UNROLL_ITERATIONS:
+        # Straight-line output loop: every step's loads first, then every
+        # step's stores, so the loads are in flight together; a store before
+        # a later load would serialize them (the pointers may alias).
+        post_loop = _staged_post_lines(
+            program, threads, post_steps, post_count, post_domains, axis_coordinates,
+            hoisted_names, load_indices,
+        )
+    else:
+        post_loop = (
+            f"            for post_index in {_strided_range('thread', post_count, threads)}:\n"
+            f"{_row_major_lines(post_domains, axis_coordinates, 'post_index', '                ')}"
+            f"{load_lines}"
+            f"                output[{output_coordinates}] = {post.code}\n"
+        )
     binding_type = ", ".join("cute.Tensor" for _ in range(len(input_value_ids) + 1))
     accumulator_type = _cutlass_type(program.accumulator_dtype or "")
     warp_reduction = (
@@ -510,7 +605,7 @@ def run(
         row_index = work_iterator[tile]
         if row_index < {row_count}:
 {_row_major_lines(row_domains, axis_coordinates, "row_index", "            ")}            accumulator = {accumulator_type}({accumulator.code})
-            for reduction_index in cutlass.range(thread, {reduction_domain.size}, {threads}):
+            for reduction_index in {_strided_range("thread", reduction_domain.size, threads)}:
                 {reduction_coordinate} = reduction_index
                 accumulator = {combine.code}
             warp_partial = {warp_reduction}
@@ -520,9 +615,7 @@ def run(
             accumulator = {accumulator_type}({accumulator.code})
             for warp_index in cutlass.range(warps):
                 {merge_partial}
-            for post_index in cutlass.range(thread, {post_count}, {threads}):
-{_row_major_lines(post_domains, axis_coordinates, "post_index", "                ")}{load_lines}                output[{output_coordinates}] = {post.code}
-            cute.arch.sync_threads()
+{post_loop}            cute.arch.sync_threads()
 '''
     return GeneratedReductionBody(
         source=source,
@@ -531,6 +624,60 @@ def run(
         tile_count=row_count,
         scratch_elements=warps,
     )
+
+
+def _staged_post_lines(
+    program: TensorProgram,
+    threads: int,
+    steps: int,
+    post_count: int,
+    post_domains: Sequence[Any],
+    axis_coordinates: Mapping[str, str],
+    hoisted_names: Mapping[str, str],
+    load_indices: Mapping[str, int],
+) -> str:
+    """The row reduction's output loop, unrolled at generation time.
+
+    Step ``s`` covers ``thread + s * threads``. Coordinates wrap modulo each
+    axis, so the loads of a step past the end stay in bounds; only its store
+    is guarded.
+    """
+    loads_by_id = {load.id: load for load in program.loads}
+    output_axes = [
+        domain.axis
+        for domain in program.iteration_domains
+        if domain.axis not in program.reduction_axes
+    ]
+    post_axes = {domain.axis for domain in post_domains}
+    load_lines: list[str] = []
+    store_lines: list[str] = []
+    for step in range(steps):
+        names = {
+            axis: f"{name}_{step}" if axis in post_axes else name
+            for axis, name in axis_coordinates.items()
+        }
+        index = f"post_index_{step}"
+        load_lines.append(f"            {index} = thread + {step * threads}\n")
+        load_lines.append(_row_major_lines(post_domains, names, index, "            "))
+        step_names = {load_id: f"{name}_{step}" for load_id, name in hoisted_names.items()}
+        for load_id, name in step_names.items():
+            access = _load_access(
+                loads_by_id[load_id], load_indices[load_id], program.loads, names
+            ).code
+            load_lines.append(f"            {name} = {access}\n")
+        token = _HOISTED_LOADS.set(step_names)
+        try:
+            value = _emit_expression(program.post, load_indices, names, program.loads)
+        finally:
+            _HOISTED_LOADS.reset(token)
+        coordinates = ", ".join(names[axis] for axis in output_axes)
+        guard = (step + 1) * threads > post_count
+        if guard:
+            store_lines.append(f"            if {index} < {post_count}:\n")
+            store_lines.append(f"                output[{coordinates}] = {value.code}\n")
+        else:
+            store_lines.append(f"            output[{coordinates}] = {value.code}\n")
+    return "".join(load_lines) + "".join(store_lines)
 
 
 def emit_contraction_body(
@@ -953,6 +1100,8 @@ def _emit_expression(
             code = f"cute.pow({left.code}, {right.code})"
         elif expression.operator == "maximum":
             code = _maximum_code(left.code, right.code)
+        elif expression.operator == "minimum":
+            code = f"cute.arch.fmin({left.code}, {right.code}, nan=True)"
         else:
             symbol = _BINARY_SYMBOLS.get(expression.operator)
             if symbol is None:
@@ -1085,22 +1234,47 @@ def _unary_code(operator: str, operand: _TypedExpression) -> str:
     if operator == "logical_not":
         false = f"{_cutlass_type(operand.dtype)}(False)"
         return f"(({operand.code}) == {false})"
-    functions = {
-        "abs": "cute.abs",
-        "sigmoid": "sigmoid",
-        "tanh": "cute.tanh",
-        "rsqrt": "cute.rsqrt",
-        "sqrt": "cute.sqrt",
-        "exp": "cute.exp",
-        "cos": "cute.cos",
-        "sin": "cute.sin",
-    }
-    function = functions.get(operator)
+    function = _UNARY_FUNCTIONS.get(operator)
     if function is None:
         raise UnsupportedMapBody(f"unsupported unary operator {operator}")
+    if operand.dtype in _HALF_DTYPES:
+        # PyTorch's opmath: half-precision math runs in float32 and rounds once.
+        widened = _cast_expression(operand, "torch.float32")
+        return _cast_expression(
+            _TypedExpression(_unary_function_code(function, widened), "torch.float32"),
+            operand.dtype,
+        ).code
+    return _unary_function_code(function, operand)
+
+
+_UNARY_FUNCTIONS = {
+    "abs": "cute.abs",
+    "sigmoid": "sigmoid",
+    "reciprocal": "reciprocal",
+    "tanh": "cute.tanh",
+    "rsqrt": "cute.rsqrt",
+    "sqrt": "cute.sqrt",
+    "exp": "cute.exp",
+    "exp2": "cute.math.exp2",
+    "expm1": "cute.math.expm1",
+    "log": "cute.math.log",
+    "log1p": "cute.math.log1p",
+    "log2": "cute.math.log2",
+    "erf": "cute.math.erf",
+    "floor": "cute.math.floor",
+    "ceil": "cute.math.ceil",
+    "trunc": "cute.math.trunc",
+    "cos": "cute.cos",
+    "sin": "cute.sin",
+}
+
+
+def _unary_function_code(function: str, operand: _TypedExpression) -> str:
+    one = f"{_cutlass_type(operand.dtype)}(1.0)"
     if function == "sigmoid":
-        one = f"{_cutlass_type(operand.dtype)}(1.0)"
         return f"({one} / ({one} + cute.exp(-({operand.code}))))"
+    if function == "reciprocal":
+        return f"({one} / ({operand.code}))"
     return f"{function}({operand.code})"
 
 

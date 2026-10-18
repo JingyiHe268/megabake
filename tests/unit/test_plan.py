@@ -519,3 +519,140 @@ def test_mode_policy_rejects_prefill_for_stateful_cache():
 
     with pytest.raises(ValueError, match="prefill mode cannot compile"):
         select_bodies(graph, _target(), SelectionPolicy(mode="prefill"))
+
+
+
+def _region_check_fixture():
+    from types import SimpleNamespace
+
+    def step(value, weight, cache):
+        projected = torch.mm(value, weight)
+        cache.add_(projected)
+        return (torch.relu(projected) * 2,)
+
+    traced = torch.fx.symbolic_trace(step)
+    nodes = list(traced.graph.nodes)
+    by_name = {node.name: node for node in nodes}
+    order = {node.name: index for index, node in enumerate(nodes)}
+    value = torch.randn(4, 8, dtype=torch.bfloat16)
+    weight = torch.randn(8, 16, dtype=torch.bfloat16)
+    cache = torch.zeros(4, 16, dtype=torch.bfloat16)
+    projected = torch.mm(value, weight)
+    values = {"value:mm": projected, "value:mul": torch.relu(projected) * 2}
+    inputs = {"value": value, "weight": weight, "cache": cache}
+    region = SimpleNamespace(
+        region_id="region:relu:fused",
+        source_op_ids=("op:relu", "op:mul"),
+        outputs=("value:mul",),
+    )
+    return region, values, inputs, by_name, order
+
+
+def test_region_check_accepts_rounding_and_rejects_wrong_values():
+    from megabake.compiler import _region_failure
+
+    region, values, inputs, by_name, order = _region_check_fixture()
+    assert _region_failure(region, values, inputs, {"cache"}, by_name, order) is None
+    # Rounding-order noise in an input does not matter: the reference uses the
+    # candidate's own input.
+    values["value:mm"] = values["value:mm"] * 1.01
+    values["value:mul"] = torch.relu(values["value:mm"]) * 2
+    assert _region_failure(region, values, inputs, {"cache"}, by_name, order) is None
+    values["value:mul"] = values["value:mul"] * 1.05
+    assert "from PyTorch on its own inputs" in _region_failure(
+        region, values, inputs, {"cache"}, by_name, order
+    )
+
+
+def test_region_check_rejects_non_finite_and_unverifiable_regions():
+    from types import SimpleNamespace
+
+    from megabake.compiler import _region_failure
+
+    region, values, inputs, by_name, order = _region_check_fixture()
+    values["value:mul"] = values["value:mul"].clone()
+    values["value:mul"][0, 0] = float("nan")
+    assert "non-finite" in _region_failure(region, values, inputs, {"cache"}, by_name, order)
+    hidden = SimpleNamespace(
+        region_id="region:relu:fused", source_op_ids=("op:relu",), outputs=("value:relu",)
+    )
+    assert "no output to verify" in _region_failure(
+        hidden, values, inputs, {"cache"}, by_name, order
+    )
+
+
+def test_region_check_leaves_captured_state_untouched():
+    from types import SimpleNamespace
+
+    from megabake.compiler import _region_failure
+
+    _, values, inputs, by_name, order = _region_check_fixture()
+    writer = SimpleNamespace(
+        region_id="region:add_:state", source_op_ids=("op:mm", "op:add_"), outputs=("value:mm",)
+    )
+    assert _region_failure(writer, values, inputs, {"cache"}, by_name, order) is None
+    assert torch.equal(inputs["cache"], torch.zeros(4, 16, dtype=torch.bfloat16))
+
+
+def test_region_check_reads_graph_constants():
+    from types import SimpleNamespace
+
+    from megabake.compiler import _region_failure
+
+    class Scaled(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("scale", torch.full((4,), 3.0))
+
+        def forward(self, value):
+            return (value * self.scale,)
+
+    module = torch.fx.symbolic_trace(Scaled())
+    nodes = list(module.graph.nodes)
+    value = torch.randn(4)
+    region = SimpleNamespace(
+        region_id="region:mul", source_op_ids=("op:scale", "op:mul"), outputs=("value:mul",)
+    )
+    assert (
+        _region_failure(
+            region,
+            {"value:mul": value * 3.0},
+            {"value": value},
+            set(),
+            {node.name: node for node in nodes},
+            {node.name: index for index, node in enumerate(nodes)},
+            module,
+        )
+        is None
+    )
+
+
+def test_region_check_recomputes_unmaterialized_views():
+    from types import SimpleNamespace
+
+    from megabake.compiler import _region_failure
+
+    def step(value):
+        return ((value[:, :4] * 3),)
+
+    traced = torch.fx.symbolic_trace(step)
+    nodes = list(traced.graph.nodes)
+    value = torch.randn(2, 8)
+    names = [node.name for node in nodes]
+    slice_name = next(name for name in names if "getitem" in name)
+    multiply = next(name for name in names if "mul" in name)
+    region = SimpleNamespace(
+        region_id="region:mul", source_op_ids=(f"op:{multiply}",), outputs=(f"value:{multiply}",)
+    )
+    assert slice_name not in ("value",)
+    assert (
+        _region_failure(
+            region,
+            {f"value:{multiply}": value[:, :4] * 3},
+            {"value": value},
+            set(),
+            {node.name: node for node in nodes},
+            {node.name: index for index, node in enumerate(nodes)},
+        )
+        is None
+    )

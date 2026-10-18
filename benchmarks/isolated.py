@@ -169,7 +169,7 @@ class _MegaBakeKernel:
             self.state.ready.zero_()
             self.stride = 1
         else:
-            self.state.ready.fill_(-1)
+            self.state.reset_ready()
             self.stride = max(
                 max(
                     (phase.index for phase in plan.phases if phase.barrier is not None),
@@ -188,22 +188,17 @@ class _MegaBakeKernel:
         # Each invocation owns a fresh epoch, exactly as the bound callable does.
         epoch = self.epoch
         self.epoch += self.stride
-        return self.state.arguments(epoch, self.stream)
+        # Table launches number their calls and stage per-call addresses.
+        return self.state.prepare_launch(self.executor, epoch, torch.cuda.current_stream())
 
     def packed(self):
-        arguments = self.arguments()
-        packed = self.executor.generate_execution_args(*arguments)
-        execution = (
-            packed[0] if isinstance(packed, tuple) and len(packed) == 2 else packed
-        )
-        # Keep the adapted arguments alive until the launch has consumed them.
-        return execution, packed, arguments
+        return self.arguments()
 
     def launch_fast(self, token):
-        self.executor.run_compiled_program(token[0])
+        self.state.run_launch(self.executor, token, torch.cuda.current_stream())
 
-    def launch_call(self, arguments):
-        self.executor(*arguments)
+    def launch_call(self, token):
+        self.state.run_launch(self.executor, token, torch.cuda.current_stream())
 
 
 def main() -> None:

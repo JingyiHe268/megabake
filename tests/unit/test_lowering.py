@@ -747,7 +747,7 @@ def test_lower_semantics_turns_rule_failure_into_an_opaque_reason():
     assert "IndexError" in operation.numerical_rules["reason"]
 
 
-def test_lower_semantics_reports_common_unsupported_fx_decompositions():
+def test_lower_semantics_covers_softmax_clamp_and_exact_gelu():
     class Model(torch.nn.Module):
         def forward(self, x):
             return (
@@ -769,11 +769,7 @@ def test_lower_semantics_reports_common_unsupported_fx_decompositions():
         if operation.attributes["target"] == "aten.amax.default"
     )
     assert amax_operation.tensor_program is not None
-    assert {
-        "aten.clamp_min.default",
-        "aten.clamp_max.default",
-        "aten.erf.default",
-    }.issubset(unknown_targets)
+    assert unknown_targets == set()
 
 
 def test_task25_softmax_max_primitive_has_exact_generic_expansion():
@@ -961,3 +957,79 @@ def test_task23_runtime_gather_uses_validated_conservative_read_domain():
         if tile.value_id == "value:arg0_1"
     )
     assert source_tile.shape[1] == 3
+
+
+class _ScatterPadCopy(torch.nn.Module):
+    def forward(self, base, row, block):
+        updated = base.clone()
+        updated[:, 2:5] = block  # slice_scatter
+        updated[1] = row  # select_scatter
+        updated[:, 1:8:3] = block  # stepped slice_scatter, as in Qwen3.5's mrope
+        padded = torch.nn.functional.pad(updated, (1, 2, 0, 1))
+        filled = torch.nn.functional.pad(updated, (2, 0), value=1.5)
+        return padded, filled, updated.to(torch.float64).to(torch.float32)
+
+
+def test_scatter_pad_and_copy_lower_without_unknown_targets():
+    graph = lower_semantics(
+        _import(_ScatterPadCopy(), torch.randn(3, 8), torch.randn(8), torch.randn(3, 3))
+    )
+    targets = {operation.attributes["target"] for operation in graph.ops.values()}
+    unknown = {
+        operation.attributes["target"]
+        for operation in graph.ops.values()
+        if operation.tensor_program is None
+    }
+    assert {"aten.slice_scatter.default", "aten.select_scatter.default"} <= targets
+    assert "aten.constant_pad_nd.default" in targets
+    assert unknown == set()
+
+
+class _CausalConv1d(torch.nn.Module):
+    """Qwen3.5's depthwise causal convolution over the token axis."""
+
+    def forward(self, source, weight):
+        length = source.shape[-1]
+        mixed = torch.nn.functional.conv1d(
+            source, weight, padding=weight.shape[-1] - 1, groups=source.shape[1]
+        )
+        return torch.nn.functional.silu(mixed[..., :length])
+
+
+def test_depthwise_causal_conv1d_lowers_as_a_contraction():
+    graph = lower_semantics(_import(_CausalConv1d(), torch.randn(2, 8, 6), torch.randn(8, 1, 4)))
+    convolution = next(
+        operation
+        for operation in graph.ops.values()
+        if operation.attributes["target"] == "aten.convolution.default"
+    )
+    assert convolution.tensor_program.family == "contraction"
+    assert all(operation.tensor_program is not None for operation in graph.ops.values())
+
+
+class _RecurrentStep(torch.nn.Module):
+    """A recurrent state updated in place, like a gated delta rule step."""
+
+    def forward(self, source, state):
+        updated = state * 0.5 + source
+        state.copy_(updated)
+        return updated * 2
+
+
+def test_in_place_state_write_lowers_into_the_input():
+    from megabake import canonicalize_semantics, make_backend
+
+    backend = make_backend(mode="decode", compile_kernel=False, cache=False)
+    state = torch.zeros(4, 8)
+    with torch.no_grad():
+        torch.compile(_RecurrentStep(), backend=backend, fullgraph=True)(torch.ones(4, 8), state)
+    prepared = backend.megabake_last_prepared
+    graph = canonicalize_semantics(import_fx(prepared.graph, prepared.context))
+    write = next(
+        operation
+        for operation in graph.ops.values()
+        if operation.attributes["target"] == "aten.copy_.default"
+    )
+    assert write.tensor_program is not None
+    assert write.tensor_program.store.owns_storage is False
+    assert write.operands[0] in graph.inputs

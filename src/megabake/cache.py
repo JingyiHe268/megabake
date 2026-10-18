@@ -13,6 +13,7 @@ import torch
 
 from .graph import ComputeGraph
 from .plan import BodySelectionPlan, KernelPlan
+from .runtime import PHASE_TIMER_SLOTS
 
 if TYPE_CHECKING:
     from .frontend import CaptureContext
@@ -70,6 +71,8 @@ def make_plan_key(
         "context": _context_data(context),
         "scheduler": scheduler,
         "toolchain": dict(toolchain or {}) or _toolchain_versions(),
+        # Timed kernels write stamps past the barrier state of an untimed buffer.
+        "phase_timer_slots": PHASE_TIMER_SLOTS,
     }
     encoded = json.dumps(
         _canonical(payload), sort_keys=True, separators=(",", ":"), allow_nan=False

@@ -299,6 +299,23 @@ def assign_storage(
     )
 
 
+def distinct_workspace(plan: KernelPlan) -> KernelPlan:
+    """The same plan with every workspace value in its own slice.
+
+    Table launches read workspace addresses from the device address table, so
+    the compiled kernel runs unchanged on this storage, and every intermediate
+    is still readable after the call."""
+    workspace = []
+    end = 0
+    for assignment in plan.storage.workspace:
+        offset = _round_up(end, assignment.alignment_bytes)
+        workspace.append(replace(assignment, offset_bytes=offset))
+        end = offset + assignment.size_bytes
+    distinct = replace(plan, storage=replace(plan.storage, workspace=tuple(workspace)))
+    verify_plan(distinct)
+    return distinct
+
+
 def verify_plan(plan: KernelPlan) -> None:
     if not isinstance(plan, KernelPlan):
         raise InvalidStorage("verify_plan expects a KernelPlan")
@@ -393,6 +410,20 @@ def _tile_maps(selection: BodySelectionPlan) -> tuple[TileMap, ...]:
 
 
 def _consumers(selection: BodySelectionPlan) -> dict[str, tuple[str, ...]]:
+    # Boundary bindings ask once per value; build the map once per selection.
+    cached = _CONSUMERS_CACHE.get(id(selection))
+    if cached is not None and cached[0] is selection:
+        return cached[1]
+    result = _build_consumers(selection)
+    _CONSUMERS_CACHE.clear()
+    _CONSUMERS_CACHE[id(selection)] = (selection, result)
+    return result
+
+
+_CONSUMERS_CACHE: dict[int, tuple[BodySelectionPlan, dict[str, tuple[str, ...]]]] = {}
+
+
+def _build_consumers(selection: BodySelectionPlan) -> dict[str, tuple[str, ...]]:
     consumers: dict[str, list[str]] = {}
     graph = selection.graph
     for selected in selection.selections:
@@ -636,6 +667,17 @@ def _boundary_bindings(
                         "state" if value_id in state_value_ids else "alias",
                     )
                 )
+    # A region output that aliases a boundary tensor and has no reader, such
+    # as the result of an in-place state write, still needs its binding.
+    direct_boundary_ids = _direct_boundary_ids(graph)
+    bound = {binding.value_id for binding in bindings}
+    for selected in selection.selections:
+        for value_id in selected.outputs:
+            if value_id not in bound and _aliases_boundary(value_id, graph, direct_boundary_ids):
+                bindings.append(
+                    _make_boundary_binding(value_id, selection, tile_maps, "alias")
+                )
+                bound.add(value_id)
     return bindings
 
 

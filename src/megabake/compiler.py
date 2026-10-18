@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import collections
 import copy
+import functools
+import os
 from dataclasses import dataclass, replace
 from importlib.util import module_from_spec, spec_from_file_location
 from statistics import median
@@ -20,14 +23,14 @@ import torch
 from torch.utils import _pytree as pytree
 
 from .bodies import SelectionPolicy, TargetFacts
-from .bodies.gemm import cute_gemm_tensors
+from .bodies.gemm import cute_gemm_tensors, is_swap_ab, swap_ab_rows, wants_swap_ab
 from .cache import PlanCache, make_plan_key
 from .codegen import GeneratedCuTeModule, emit_cute
 from .diagnostics import CompilerDiagnostic, CompilerError
 from .frontend import CaptureContext, PreparedFX
 from .graph import ComputeGraph, import_fx
 from .lowering import DataIndex, TensorProgram, canonicalize_semantics, semantic_coverage
-from .memory import verify_plan
+from .memory import distinct_workspace, verify_plan
 from .plan import (
     BodySelectionPlan,
     KernelPlan,
@@ -40,6 +43,7 @@ from .planner import enumerate_body_selections
 from .schedule import EventSchedule, make_region_event_schedule
 from .regions import form_regions
 from .runtime import (
+    DYNAMIC_ADDRESS_RING,
     EventRuntimeAdmission,
     RuntimeAdmission,
     admit_event_runtime,
@@ -93,11 +97,13 @@ def _structural_plan_exists(
     policy: SelectionPolicy | None,
     scheduler: str,
 ) -> bool:
+    # One structurally complete plan proves existence; the measured search
+    # that follows builds its own candidates.
     result = search_plans(
         graph,
         target,
         policy,
-        SearchBudget(evaluator=None),
+        SearchBudget(evaluator=None, max_plans=1),
     )
     return any(
         candidate.plan is not None and candidate.status == "unmeasured"
@@ -199,8 +205,33 @@ class CallableTrace:
 _TABLE_LAUNCH_OPS = 1_000
 
 
+# CUDA kernel parameters are limited to 32 KiB; launches passing one CuTe
+# tensor per value switch to the table launch well before that.
+_TABLE_LAUNCH_PARAMETER_BYTES = 24_000
+
+
 def _uses_table_launch(graph: ComputeGraph) -> bool:
-    return len(graph.ops) > _TABLE_LAUNCH_OPS
+    """Large graphs, and graphs whose tensors would overflow the kernel
+    parameter space even with few ops (wide models with few layers), use
+    the table-driven launch. The estimate counts every shaped value as a
+    pointer plus a dynamic shape and stride per axis."""
+    if len(graph.ops) > _TABLE_LAUNCH_OPS:
+        return True
+    parameter_bytes = sum(
+        8 + 16 * len(value.shape) for value in graph.values.values() if value.shape is not None
+    )
+    return parameter_bytes > _TABLE_LAUNCH_PARAMETER_BYTES
+
+
+def _gemm_shapes(graph: ComputeGraph) -> tuple[tuple[int, int], ...]:
+    """Output ``(rows, columns)`` of every two-dimensional contraction."""
+    return tuple(
+        tuple(operation.tensor_program.store.shape)
+        for operation in graph.ops.values()
+        if isinstance(operation.tensor_program, TensorProgram)
+        and operation.tensor_program.family == "contraction"
+        and len(operation.tensor_program.store.shape) == 2
+    )
 # A measured candidate must match the captured reference within this
 # relative L2 error before it can be selected. Deep table-launched graphs
 # accumulate bf16 rounding differences: on the 30-layer pinned SmolLM the
@@ -208,6 +239,148 @@ def _uses_table_launch(graph: ComputeGraph) -> bool:
 # from an fp32 reference, so those graphs use the 2% model-level tolerance.
 _PLAN_RELATIVE_L2_LIMIT = 0.01
 _TABLE_PLAN_RELATIVE_L2_LIMIT = 0.02
+# A candidate outside these limits can still be exact: deep models amplify
+# bf16 rounding-order differences. On SmolLM-1.7B's first decode call every
+# region matches PyTorch on its own inputs (GEMMs to 3e-4, everything else
+# bit for bit), yet the logits end 4.2% from eager. Such a candidate passes
+# teacher-forced verification: each region must reproduce PyTorch evaluated
+# on the inputs the candidate itself produced.
+_REGION_RELATIVE_L2_LIMIT = 0.01
+
+
+@dataclass
+class _TeacherForcedCheck:
+    """Verify a candidate region by region, on inputs it computed itself."""
+
+    prepared: PreparedFX
+    snapshot: "_StateSnapshot"
+
+    def failure(self, compiled: "CompiledKernel", actual: Any) -> str | None:
+        """None when the candidate is verified, otherwise the reason it is not."""
+        plan = compiled.plan
+        if plan.graph is None or not _uses_table_launch(plan.graph):
+            # Only table launches read workspace addresses from device memory,
+            # so only they can rerun the same kernel without reuse.
+            return "needs a table launch"
+        distinct = replace(compiled, plan=distinct_workspace(plan))
+        bound = bind_callable(
+            distinct,
+            self.prepared.context,
+            parameter_tensors=_current_parameter_tensors(
+                distinct, self.prepared.context, self.snapshot.inputs
+            ),
+        )
+        self.snapshot.reset()
+        with torch.no_grad():
+            rerun = bound(*self.snapshot.inputs)
+        torch.cuda.synchronize()
+        # Same code and arithmetic order; only workspace addresses differ.
+        if not _outputs_identical(actual, rerun):
+            return "outputs change when workspace is not reused"
+        values = bound.megabake_runtime_state.values
+        originals = {id(private): original for private, original in self.snapshot.pairs}
+        nodes = list(self.prepared.graph.graph.nodes)
+        placeholders = [node.name for node in nodes if node.op == "placeholder"]
+        inputs = {
+            name: originals.get(id(value), value)
+            for name, value in zip(placeholders, self.snapshot.inputs, strict=True)
+        }
+        state = {name for name, value in inputs.items() if any(value is o for o in originals.values())}
+        by_name = {node.name: node for node in nodes}
+        order = {node.name: index for index, node in enumerate(nodes)}
+        for selected in plan.selection.selections:
+            reason = _region_failure(
+                selected, values, inputs, state, by_name, order, self.prepared.graph
+            )
+            if reason is not None:
+                return reason
+        return None
+
+
+def _region_failure(
+    selected, values, inputs, state, by_name, order, module=None
+) -> str | None:
+    members = sorted(
+        (op_id.removeprefix("op:") for op_id in selected.source_op_ids), key=order.__getitem__
+    )
+    env: dict[str, Any] = {}
+
+    def fetch(argument: Any) -> Any:
+        if not isinstance(argument, torch.fx.Node):
+            return argument
+        name = argument.name
+        if name in env:
+            return env[name]
+        if name in inputs:
+            # Mutating sources (KV writes) must not touch the captured state.
+            return inputs[name].clone() if name in state else inputs[name]
+        value = values.get(f"value:{name}")
+        if value is not None:
+            return value
+        parts = []
+        while (part := values.get(f"value:{name}.{len(parts)}")) is not None:
+            parts.append(part)
+        if parts:
+            return tuple(parts)
+        # Not materialized (a view of a materialized value, say): recompute it
+        # with PyTorch from what the candidate did materialize.
+        if argument.op == "placeholder" or getattr(argument.target, "_schema", None) is not None and argument.target._schema.is_mutable:
+            raise KeyError(f"{name} is not materialized")
+        env[name] = evaluate(argument)
+        return env[name]
+
+    def evaluate(node: torch.fx.Node) -> Any:
+        args = torch.fx.node.map_aggregate(node.args, fetch)
+        kwargs = torch.fx.node.map_aggregate(node.kwargs, fetch)
+        if node.op == "get_attr":
+            return functools.reduce(getattr, node.target.split("."), module)
+        if node.op == "call_method":
+            return getattr(args[0], node.target)(*args[1:], **kwargs)
+        return node.target(*args, **kwargs)
+
+    try:
+        for name in members:
+            env[name] = evaluate(by_name[name])
+    except Exception as error:
+        return f"cannot evaluate {selected.region_id}: {type(error).__name__}: {error}"
+    compared = 0
+    for value_id in selected.outputs:
+        actual = values.get(value_id)
+        name, _, index = value_id.removeprefix("value:").partition(".")
+        expected = env.get(name)
+        if index and isinstance(expected, (tuple, list)):
+            expected = expected[int(index)]
+        if not isinstance(actual, torch.Tensor) or not isinstance(expected, torch.Tensor):
+            continue
+        compared += 1
+        if actual.shape != expected.shape:
+            return f"{value_id} has shape {tuple(actual.shape)}, PyTorch {tuple(expected.shape)}"
+        if not expected.is_floating_point():
+            if not torch.equal(actual, expected):
+                return f"{value_id} differs from PyTorch on its own inputs"
+            continue
+        finite = torch.isfinite(expected)
+        if not torch.equal(finite, torch.isfinite(actual)):
+            return f"{value_id} is non-finite where PyTorch is finite, or the reverse"
+        difference = (actual.float() - expected.float())[finite].norm()
+        scale = expected.float()[finite].norm()
+        error = (difference / scale).item() if scale > 0 else difference.item()
+        if error > _REGION_RELATIVE_L2_LIMIT:
+            return f"{value_id} is {error:.3g} from PyTorch on its own inputs"
+    if compared == 0:
+        return f"{selected.region_id} has no output to verify"
+    return None
+
+
+def _outputs_identical(expected: Any, actual: Any) -> bool:
+    expected_values, _ = pytree.tree_flatten(expected)
+    actual_values, _ = pytree.tree_flatten(actual)
+    return len(expected_values) == len(actual_values) and all(
+        torch.equal(left, right)
+        if isinstance(left, torch.Tensor) and isinstance(right, torch.Tensor)
+        else left == right
+        for left, right in zip(expected_values, actual_values, strict=True)
+    )
 
 
 def _plan_relative_l2_limit(plan: KernelPlan) -> float:
@@ -238,9 +411,15 @@ def compile_post_grad(
             f"{prepared.context.mode!r}"
         )
     if policy is None:
+        table_launch = _uses_table_launch(graph)
+        shapes = _gemm_shapes(graph)
+        swap_ab = table_launch and wants_swap_ab(shapes)
         policy = SelectionPolicy(
             mode=prepared.context.mode,
-            table_launch=_uses_table_launch(graph),
+            table_launch=table_launch,
+            table_gemm_swap_ab=swap_ab,
+            table_gemm_swap_ab_rows=swap_ab_rows(shapes) if swap_ab else 16,
+            table_gemm_split_k=swap_ab and os.environ.get("MEGABAKE_SPLIT_K") == "1",
         )
     if isinstance(search_budget, int):
         if search_budget < 1:
@@ -290,6 +469,7 @@ def compile_post_grad(
                 torch.clone,
                 prepared.forward(*evaluation.example_inputs),
             )
+        teacher_check = _TeacherForcedCheck(prepared, state_snapshot)
         if scheduler == "auto":
             phase_result = _search_scheduler(
                 graph,
@@ -301,6 +481,7 @@ def compile_post_grad(
                 output_dir,
                 "phase",
                 state_snapshot.reset,
+                teacher_check,
             )
             event_result = _search_scheduler(
                 graph,
@@ -312,6 +493,7 @@ def compile_post_grad(
                 output_dir,
                 "region-events",
                 state_snapshot.reset,
+                teacher_check,
             )
             choices = (phase_result, event_result)
             chosen = min(
@@ -346,6 +528,7 @@ def compile_post_grad(
                 output_dir,
                 scheduler,
                 state_snapshot.reset,
+                teacher_check,
             )
         if result.selected is None or result.selected_compiled is None:
             reasons = "; ".join(
@@ -768,14 +951,18 @@ def bind_callable(
         index for index in range(len(context.input_order)) if index not in parameter_positions
     ]
     current_parameters = dict(parameter_tensors or {})
-    trace: list[CallableTrace] = []
+    # The most recent calls only; a decode loop would otherwise grow it forever.
+    trace: collections.deque[CallableTrace] = collections.deque(maxlen=_TRACE_LENGTH)
     runtime_lock = threading.Lock()
     state: _RuntimeState | None = None
     next_epoch = 0
     epoch_stride = _epoch_stride(compiled_kernel)
+    # Inputs of the previous call: tensors passed again as the same objects
+    # (parameters, KV state) keep their validation.
+    previous_inputs: list[Any] = []
 
     def forward(*args: Any, **kwargs: Any) -> Any:
-        nonlocal state, next_epoch
+        nonlocal state, next_epoch, previous_inputs
         if kwargs:
             raise CompilerError(
                 CompilerDiagnostic(
@@ -784,7 +971,12 @@ def bind_callable(
                     requirement="positional runtime arguments",
                 )
             )
-        runtime_values = pytree.tree_flatten(args)[0]
+        # Dynamo passes flat tensors; only nested arguments need flattening.
+        runtime_values = (
+            args
+            if all(isinstance(value, torch.Tensor) for value in args)
+            else pytree.tree_flatten(args)[0]
+        )
         if len(runtime_values) == len(context.input_order):
             full_inputs = list(runtime_values)
         elif len(runtime_values) == len(runtime_positions):
@@ -816,7 +1008,8 @@ def bind_callable(
             )
 
         with runtime_lock:
-            input_tensors = _input_tensors(graph, full_inputs)
+            input_tensors = _input_tensors(graph, full_inputs, previous_inputs)
+            previous_inputs = full_inputs
             if state is None:
                 # Structural: every graph input is bound on every call.
                 _validate_data_indices(compiled_kernel.plan, input_tensors)
@@ -836,7 +1029,7 @@ def bind_callable(
                 )
                 forward.megabake_runtime_state = state
             else:
-                state.rebind(input_tensors)
+                state.rebind(input_tensors, full_inputs)
 
             launches = 0
             uploads_before = state.address_table_uploads
@@ -845,9 +1038,7 @@ def bind_callable(
                 ready: torch.Tensor, epoch: int, stream: torch.cuda.Stream
             ) -> None:
                 nonlocal launches
-                arguments = state.arguments(epoch, cuda.CUstream(stream.cuda_stream))
-                compiled_kernel.compiled(*arguments)
-                state.record_launch(stream)
+                state.launch(compiled_kernel.compiled, epoch, stream)
                 launches += 1
 
             if compiled_kernel.event_schedule is None:
@@ -858,6 +1049,7 @@ def bind_callable(
                     admission=compiled_kernel.admission,
                     ready=state.ready,
                     epoch=next_epoch,
+                    synchronize=False,
                 )
             else:
                 invocation = execute_event_plan(
@@ -868,6 +1060,7 @@ def bind_callable(
                     events=state.ready,
                     epoch=next_epoch,
                     validate_counters=False,
+                    synchronize=False,
                 )
             outputs = tuple(
                 state.tensor_for_value(value_id) for value_id in graph.outputs
@@ -877,15 +1070,15 @@ def bind_callable(
                     invocation.invocation_id,
                     invocation.epoch,
                     active_stream,
-                    tuple(tensor.data_ptr() for tensor in input_tensors.values()),
+                    state.input_pointers(input_tensors),
                     tuple(
                         output.data_ptr()
                         for output in outputs
                         if isinstance(output, torch.Tensor)
                     ),
                     workload_kernel_launches=launches,
-                    # The phase and event runtimes synchronize once per launch.
-                    stream_synchronizations=launches,
+                    # Launches are stream-ordered; the call does not block.
+                    stream_synchronizations=0,
                     recurring_gpu_operations=_recurring_operations(
                         launches, state.address_table_uploads - uploads_before
                     ),
@@ -956,6 +1149,13 @@ class _StateSnapshot:
                 access.value_cache_value_id,
                 access.valid_length_value_id,
             )
+        } | {
+            # Inputs written by in-place copies (recurrent and convolution state).
+            value_id
+            for operation in graph.ops.values()
+            if operation.effects.get("mutates_inputs")
+            for value_id in operation.operands[:1]
+            if value_id in graph.inputs
         }
         inputs = list(example_inputs)
         pairs = []
@@ -977,6 +1177,7 @@ def _make_plan_evaluator(
     output_dir: Path | str | None,
     scheduler: str = "phase",
     reset_state: Callable[[], None] | None = None,
+    teacher_check: _TeacherForcedCheck | None = None,
 ):
     def evaluate(plan: KernelPlan, budget: SearchBudget) -> PlanMeasurement:
         try:
@@ -1004,12 +1205,21 @@ def _make_plan_evaluator(
                 actual = executable(*prepared.example_inputs)
             relative_error = _output_relative_l2(reference, actual)
             if relative_error >= _plan_relative_l2_limit(plan):
-                return PlanMeasurement(
-                    compiled=compiled,
-                    resources=compiled.resources,
-                    correct=False,
-                    error=f"relative L2 error {relative_error:.6g}",
+                failure = (
+                    teacher_check.failure(compiled, actual)
+                    if teacher_check is not None
+                    else "no teacher-forced check"
                 )
+                if failure is not None:
+                    return PlanMeasurement(
+                        compiled=compiled,
+                        resources=compiled.resources,
+                        correct=False,
+                        error=(
+                            f"relative L2 error {relative_error:.6g}; "
+                            f"teacher-forced verification: {failure}"
+                        ),
+                    )
             complete_samples, device_samples = _complete_call_samples(
                 executable,
                 prepared.example_inputs,
@@ -1053,12 +1263,13 @@ def _search_scheduler(
     output_dir: Path | str | None,
     scheduler: str,
     reset_state: Callable[[], None] | None = None,
+    teacher_check: _TeacherForcedCheck | None = None,
 ):
     evaluator = (
         budget.evaluator
         if scheduler == "phase" and budget.evaluator is not None
         else _make_plan_evaluator(
-            prepared, reference, output_dir, scheduler, reset_state
+            prepared, reference, output_dir, scheduler, reset_state, teacher_check
         )
     )
     scheduler_budget = replace(
@@ -1124,16 +1335,22 @@ def _isolated_kernel_samples(
     if compiled_kernel.event_schedule is not None:
         state.ready.zero_()
     else:
-        reset_ready(state.ready)
+        state.reset_ready()
     epoch_stride = _epoch_stride(compiled_kernel)
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    torch_stream = torch.cuda.current_stream()
+    stream = cuda.CUstream(torch_stream.cuda_stream)
+    table_launch = (
+        compiled_kernel.generated.launch.launch_policy == "megabake_cooperative_table"
+    )
     fast_path = hasattr(
         compiled_kernel.compiled, "generate_execution_args"
     ) and hasattr(compiled_kernel.compiled, "run_compiled_program")
     epoch = 0
 
-    def prepare() -> tuple[tuple[Any, ...], Any, tuple[Any, ...]]:
+    def prepare() -> tuple[Any, ...]:
         nonlocal epoch
+        if table_launch:
+            return state.prepare_launch(compiled_kernel.compiled, epoch, torch_stream)
         arguments = state.arguments(epoch, stream)
         epoch += epoch_stride
         if not fast_path:
@@ -1146,15 +1363,19 @@ def _isolated_kernel_samples(
         )
         return execution, packed, arguments
 
-    def launch(token: tuple[tuple[Any, ...], Any, tuple[Any, ...]]) -> None:
-        if fast_path:
+    def launch(token: tuple[Any, ...]) -> None:
+        if table_launch:
+            state.run_launch(compiled_kernel.compiled, token, torch_stream)
+        elif fast_path:
             compiled_kernel.compiled.run_compiled_program(token[0])
         else:
             compiled_kernel.compiled(*token[0])
 
     samples: list[float] = []
     # A stateful launch advances its state, so time one launch per reset.
-    launches_per_sample = count if reset_state is None else 1
+    launches_per_sample = (
+        1 if reset_state is not None else min(count, DYNAMIC_ADDRESS_RING)
+    )
     for _ in range(count):
         if reset_state is not None:
             reset_state()
@@ -1308,8 +1529,15 @@ def _common_cuda_device(example_inputs: Sequence[Any]) -> torch.device:
 
 
 def _input_tensors(
-    graph: ComputeGraph, example_inputs: Sequence[Any]
+    graph: ComputeGraph,
+    example_inputs: Sequence[Any],
+    previous: Sequence[Any] = (),
 ) -> dict[str, torch.Tensor]:
+    """Bind graph inputs by value id, checking each against its guarded metadata.
+
+    A tensor that is the same object as ``previous`` at its position was
+    checked on an earlier call and is not checked again.
+    """
     if len(example_inputs) != len(graph.inputs):
         raise CompilerError(
             CompilerDiagnostic(
@@ -1318,8 +1546,12 @@ def _input_tensors(
                 requirement="graph argument count",
             )
         )
-    result: dict[str, torch.Tensor] = {}
-    for value_id, value in zip(graph.inputs, example_inputs, strict=True):
+    result = dict(zip(graph.inputs, example_inputs))
+    if len(previous) != len(example_inputs):
+        previous = (None,) * len(example_inputs)
+    for value_id, value, earlier in zip(graph.inputs, example_inputs, previous):
+        if value is earlier:
+            continue
         if not isinstance(value, torch.Tensor):
             raise CompilerError(
                 CompilerDiagnostic(
@@ -1339,7 +1571,6 @@ def _input_tensors(
                 )
             )
         _validate_input_metadata(value_id, graph.values[value_id], value)
-        result[value_id] = value
     return result
 
 
@@ -1560,7 +1791,11 @@ def _with_worker_count(
     phases = tuple(
         replace(
             phase,
-            workers=_worker_assignments(phase.region_id, phase.work_items, worker_count),
+            workers=(
+                _recompute_assignments(phase.region_id, phase.work_items, worker_count)
+                if phase.recompute
+                else _worker_assignments(phase.region_id, phase.work_items, worker_count)
+            ),
             barrier=None
             if phase.barrier is None
             else replace(
@@ -1583,6 +1818,12 @@ def _with_worker_count(
     return replace(plan, phases=phases, storage=storage, launch=launch)
 
 
+def _recompute_assignments(region_id: str, work_items: Sequence[Any], worker_count: int):
+    from .schedule import _recompute_assignments as assignments
+
+    return assignments(region_id, tuple(work_items), worker_count)
+
+
 def _worker_assignments(region_id: str, work_items: Sequence[Any], worker_count: int):
     from .schedule import WorkerAssignment
 
@@ -1600,7 +1841,10 @@ def _worker_assignments(region_id: str, work_items: Sequence[Any], worker_count:
     return tuple(assignments)
 
 
-_DYNAMIC_ADDRESS_BUFFERS = 4
+# Barrier epochs stay below int32's maximum.
+_MAX_EPOCH = 2**31 - 1
+# Calls kept in a generated callable's ``megabake_trace``.
+_TRACE_LENGTH = 64
 
 
 @dataclass
@@ -1615,12 +1859,17 @@ class _TableRebind:
     empty_slots: np.ndarray
     # (root, shape, strides, element offset, is the root itself) per output.
     graph_outputs: tuple[tuple[int, tuple[int, ...], tuple[int, ...], int, bool], ...]
+    # Data pointer of every root for the current call.
+    pointers: np.ndarray | None = None
 
     def addresses(self, roots: Sequence[torch.Tensor]) -> np.ndarray:
-        pointers = np.fromiter(
+        self.pointers = np.fromiter(
             (tensor.data_ptr() for tensor in roots), dtype=np.int64, count=len(roots)
         )
-        addresses = pointers[self.slot_roots] + self.slot_offsets
+        return self.slot_addresses()
+
+    def slot_addresses(self) -> np.ndarray:
+        addresses = self.pointers[self.slot_roots] + self.slot_offsets
         addresses[self.empty_slots] = 0
         return addresses
 
@@ -1664,6 +1913,8 @@ class _RuntimeState:
         self._address_mirror: np.ndarray | None = None
         self._phase_table: tuple[torch.Tensor, Any] | None = None
         self._gemm_table: tuple[torch.Tensor, Any] | None = None
+        # Phase scratch of table launches: FP32 elements and Int32 counters.
+        self._phase_scratch: tuple[tuple[torch.Tensor, Any], tuple[torch.Tensor, Any]] | None = None
         # Per-invocation TMA descriptors (three 128-byte maps per table GEMM),
         # rewritten by every call's kernel prologue.
         self._tma_descriptors: tuple[torch.Tensor, Any] | None = None
@@ -1676,9 +1927,19 @@ class _RuntimeState:
         self._table_rebind: _TableRebind | None = None
         self._slot_addresses: np.ndarray | None = None
         self._dynamic_slot_table: tuple[torch.Tensor, Any] | None = None
-        # [pinned buffer, its NumPy view, event of the launch that read it]
-        self._dynamic_buffers: list[list[Any]] = []
-        self._dynamic_buffer_index = 0
+        self._dynamic_slot_indices: np.ndarray | None = None
+        # Table launches: (pinned [ring, slots + 1] buffer, its NumPy view,
+        # per-entry event of the launch that read it); see prepare_launch.
+        self._dynamic_ring: tuple[torch.Tensor, np.ndarray, list[Any]] | None = None
+        self._pending_dynamic_addresses: np.ndarray | None = None
+        # Mirror of the device call counter; it is the next launch's number.
+        self._calls = 0
+        self._prepared_calls = 0
+        self._calls_run = 0
+        # (bound views, the argument tuple, its stream handle)
+        self._table_argument_cache: tuple[tuple[Any, ...], tuple[Any, ...], int] | None = None
+        # (arguments, packed execution arguments, what keeps them alive)
+        self._packed_arguments: tuple[Any, Any, Any] | None = None
         self._work_iterator_views: tuple[Any, ...] | None = None
 
     @classmethod
@@ -1737,13 +1998,27 @@ class _RuntimeState:
         state._refresh_values(input_tensors)
         return state
 
-    def rebind(self, input_tensors: Mapping[str, torch.Tensor]) -> None:
-        if self._table_rebind is not None and self._fast_table_rebind(input_tensors):
+    def rebind(
+        self,
+        input_tensors: Mapping[str, torch.Tensor],
+        ordered: Sequence[torch.Tensor] | None = None,
+    ) -> None:
+        if self._table_rebind is not None and self._fast_table_rebind(
+            input_tensors, ordered
+        ):
             return
         self._refresh_values(input_tensors)
 
+    def input_pointers(self, input_tensors: Mapping[str, torch.Tensor]) -> tuple[int, ...]:
+        """Data pointers of this call's graph inputs, in graph order."""
+        rebind = self._table_rebind
+        if rebind is not None and rebind.pointers is not None:
+            return tuple(rebind.pointers[: len(rebind.inputs)].tolist())
+        return tuple(tensor.data_ptr() for tensor in input_tensors.values())
+
     def reset_ready(self) -> None:
         reset_ready(self.ready)
+        self._calls = 0
 
     def poison_workspace(self, value: int = 0xE5) -> None:
         self.workspace_base.fill_(value)
@@ -1836,23 +2111,7 @@ class _RuntimeState:
             self.generated.launch.launch_policy == "megabake_cooperative_table"
         )
         g0_tensors = tuple(
-            (
-                _g0_activation_view(
-                    selected.program.loads[0].value_id,
-                    _g0_source_tensor(
-                        selected.program.loads[0].value_id,
-                        plan.graph,
-                        input_tensors,
-                        values,
-                    ),
-                    plan.graph,
-                ),
-                *(
-                    _g0_source_tensor(load.value_id, plan.graph, input_tensors, values)
-                    for load in selected.program.loads[1:]
-                ),
-                values[selected.program.store.value_id],
-            )
+            _g0_operands(phase.body, selected, plan.graph, input_tensors, values)
             for phase in plan.phases
             if phase.body.provider == "g0_range"
             and (not table_launch or phase.index in template_phases)
@@ -1953,10 +2212,24 @@ class _RuntimeState:
         )
         self._slot_addresses = self._table_rebind.addresses(roots)
 
-    def _fast_table_rebind(self, input_tensors: Mapping[str, torch.Tensor]) -> bool:
+    def _fast_table_rebind(
+        self,
+        input_tensors: Mapping[str, torch.Tensor],
+        ordered: Sequence[torch.Tensor] | None = None,
+    ) -> bool:
+        """Rebind from root pointers; ``ordered`` lists the inputs in graph order.
+
+        Only inputs passed as new tensor objects are checked and have their
+        pointer re-read; parameters and state passed again cost nothing.
+        """
         rebind = self._table_rebind
         graph = self.plan.graph
-        inputs = [input_tensors[value_id] for value_id in graph.inputs]
+        inputs = (
+            list(ordered)
+            if ordered is not None
+            else [input_tensors[value_id] for value_id in graph.inputs]
+        )
+        pointers = rebind.pointers
         for position, (tensor, previous) in enumerate(zip(inputs, rebind.inputs)):
             if tensor is previous:
                 continue
@@ -1967,10 +2240,14 @@ class _RuntimeState:
                 or tensor.device != previous.device
             ):
                 return False
+            pointers[position] = tensor.data_ptr()
         device = self.workspace_base.device
         outputs = [_allocate(layout, device) for layout in rebind.output_layouts]
+        first_output = len(inputs) + 1
+        for index, tensor in enumerate(outputs):
+            pointers[first_output + index] = tensor.data_ptr()
         roots = [*inputs, self.workspace_base, *outputs]
-        self._slot_addresses = rebind.addresses(roots)
+        self._slot_addresses = rebind.slot_addresses()
         rebind.inputs = inputs
         self.input_tensors = input_tensors
         values = self._values
@@ -2005,9 +2282,7 @@ class _RuntimeState:
         self, epoch: int, stream: cuda.CUstream, *, include_constants: bool = False
     ) -> tuple[Any, ...]:
         if self.generated.launch.launch_policy == "megabake_cooperative_table":
-            return self._table_arguments(
-                epoch, stream, include_constants=include_constants
-            )
+            return self._table_arguments(stream, include_constants=include_constants)
         normal_views = {
             argument.name: self._cached_view(
                 self._normal_view_cache,
@@ -2081,8 +2356,15 @@ class _RuntimeState:
         return tuple(arguments)
 
     def _table_arguments(
-        self, epoch: int, stream: cuda.CUstream, *, include_constants: bool = False
+        self, stream: cuda.CUstream, *, include_constants: bool = False
     ) -> tuple[Any, ...]:
+        """Kernel arguments of a table launch.
+
+        None of them changes between calls: per-call boundary addresses go
+        through the dynamic-address ring and barrier epochs come from the
+        device call counter. The same tuple is returned while the bound
+        tables and views are unchanged, so its packed form can be reused.
+        """
         launch = self.generated.launch
         device = self.ready.device
         if self._slot_addresses is None:
@@ -2107,7 +2389,9 @@ class _RuntimeState:
             addresses = self._slot_addresses
         if launch.gemm_table:
             self._check_gemm_alignment(addresses)
-        dynamic_slots = np.asarray(launch.dynamic_slots, dtype=np.int64)
+        if self._dynamic_slot_indices is None:
+            self._dynamic_slot_indices = np.asarray(launch.dynamic_slots, dtype=np.int64)
+        dynamic_slots = self._dynamic_slot_indices
         static_addresses = addresses.copy()
         static_addresses[dynamic_slots] = 0
         if self._address_table is None or not np.array_equal(
@@ -2122,6 +2406,7 @@ class _RuntimeState:
                 self._address_table.copy_(table)
             self._address_mirror = static_addresses
             self.address_table_uploads += 1
+        self._pending_dynamic_addresses = addresses[dynamic_slots]
         if self._phase_table is None:
             phase_table = torch.tensor(
                 launch.phase_table, dtype=torch.int32, device=device
@@ -2139,18 +2424,25 @@ class _RuntimeState:
                 list(launch.dynamic_slots) or [0], dtype=torch.int32, device=device
             )
             self._dynamic_slot_table = (slot_table, _cute_view(slot_table))
-        arguments: list[Any] = [
-            self._ready_view[1],
-            cutlass.Int32(self.plan.launch.grid_size),
-            cutlass.Int32(epoch),
-            self._cached_view(
-                self._normal_view_cache, "addresses", self._address_table
-            ),
-            self._phase_table[1],
-            self._work_iterator_views,
-            cutlass.Int64(self._stage_dynamic_addresses(addresses[dynamic_slots])),
-            self._dynamic_slot_table[1],
-        ]
+
+        if self._phase_scratch is None:
+            # Counters start at zero, and every phase leaves its own at zero.
+            floats = torch.empty(
+                max(launch.phase_float_elements, 4), dtype=torch.float32, device=device
+            )
+            counters = torch.zeros(
+                max(launch.phase_counter_count, 4), dtype=torch.int32, device=device
+            )
+            self._phase_scratch = (
+                (floats, _cute_view(floats)),
+                (counters, _cute_view(counters)),
+            )
+        if self._dynamic_ring is None:
+            words = len(launch.dynamic_slots) + 1
+            host = torch.zeros(
+                (DYNAMIC_ADDRESS_RING, words), dtype=torch.int64
+            ).pin_memory()
+            self._dynamic_ring = (host, host.numpy(), [None] * DYNAMIC_ADDRESS_RING)
         if launch.gemm_table:
             if self._gemm_table is None:
                 gemm_table = torch.tensor(
@@ -2165,27 +2457,134 @@ class _RuntimeState:
                     descriptors,
                     from_dlpack(descriptors, assumed_align=128),
                 )
+            gemm_views = tuple(
+                self._cached_gemm_tensors(index, tensors)
+                for index, tensors in enumerate(self.g0_tensors)
+            )
+        else:
+            gemm_views = ()
+        parts = (
+            self._ready_view[1],
+            self._cached_view(self._normal_view_cache, "addresses", self._address_table),
+            self._phase_table[1],
+            self._work_iterator_views,
+            self._dynamic_slot_table[1],
+            self._phase_scratch[0][1],
+            self._phase_scratch[1][1],
+            *(
+                (self._gemm_table[1], self._tma_descriptors[1], *gemm_views)
+                if launch.gemm_table
+                else ()
+            ),
+        )
+        cached = self._table_argument_cache
+        handle = int(stream)
+        if (
+            not include_constants
+            and cached is not None
+            and cached[2] == handle
+            and len(cached[0]) == len(parts)
+            and all(old is new for old, new in zip(cached[0], parts))
+        ):
+            return cached[1]
+        arguments: list[Any] = [
+            self._ready_view[1],
+            cutlass.Int32(self.plan.launch.grid_size),
+            parts[1],
+            self._phase_table[1],
+            self._work_iterator_views,
+            cutlass.Int64(self._dynamic_ring[0].data_ptr()),
+            self._dynamic_slot_table[1],
+            self._phase_scratch[0][1],
+            self._phase_scratch[1][1],
+        ]
+        if launch.gemm_table:
             arguments.extend(
-                (
-                    self._gemm_table[1],
-                    self._tma_descriptors[1],
-                    tuple(
-                        self._cached_gemm_tensors(index, tensors)
-                        for index, tensors in enumerate(self.g0_tensors)
-                    ),
-                )
+                (self._gemm_table[1], self._tma_descriptors[1], gemm_views)
             )
             if include_constants:
                 arguments.append(self._max_active_clusters)
         arguments.append(stream)
-        return tuple(arguments)
+        result = tuple(arguments)
+        if not include_constants:
+            self._table_argument_cache = (parts, result, handle)
+        return result
+
+    def prepare_launch(
+        self, compiled: Any, epoch: int, stream: torch.cuda.Stream
+    ) -> tuple[Any, ...]:
+        """Bind this launch's arguments; ``run_launch`` enqueues it.
+
+        Table launches are numbered in order: launch ``n`` reads ring entry
+        ``n % DYNAMIC_ADDRESS_RING``, which is stamped with ``n``, and the
+        kernel traps if the stamp does not match its device call counter.
+        Up to ``DYNAMIC_ADDRESS_RING`` launches can be prepared ahead, and
+        they must run in the order they were prepared.
+        """
+        cu_stream = cuda.CUstream(stream.cuda_stream)
+        if self.generated.launch.launch_policy != "megabake_cooperative_table":
+            arguments = self.arguments(epoch, cu_stream)
+            execution, keep = _pack_arguments(compiled, arguments)
+            return (None, arguments, execution, keep)
+        # Counting barriers reach (ordinal + 1) * workers within a call.
+        stride = max(self.generated.launch.barrier_epochs, 1)
+        if (self._calls + 1) * stride * self.plan.launch.grid_size > _MAX_EPOCH:
+            if self._prepared_calls != self._calls_run:
+                raise CompilerError(
+                    CompilerDiagnostic(
+                        "runtime-binding",
+                        "the call counter wraps while launches are still prepared",
+                        requirement="ordered table launches",
+                    )
+                )
+            self.reset_ready()
+        arguments = self._table_arguments(cu_stream)
+        call = self._calls
+        host, rows, events = self._dynamic_ring
+        entry = call % DYNAMIC_ADDRESS_RING
+        if events[entry] is not None:
+            # The launch that read this entry DYNAMIC_ADDRESS_RING calls ago.
+            events[entry].synchronize()
+        rows[entry, 0] = call
+        rows[entry, 1 : 1 + len(self._pending_dynamic_addresses)] = (
+            self._pending_dynamic_addresses
+        )
+        self._calls += 1
+        self._prepared_calls += 1
+        packed = self._packed_arguments
+        if packed is None or packed[0] is not arguments:
+            packed = (arguments, *_pack_arguments(compiled, arguments))
+            self._packed_arguments = packed
+        return (call, arguments, packed[1], packed[2])
+
+    def run_launch(
+        self, compiled: Any, token: tuple[Any, ...], stream: torch.cuda.Stream
+    ) -> None:
+        call, arguments, execution, _ = token
+        if execution is not None:
+            compiled.run_compiled_program(execution)
+        else:
+            compiled(*arguments)
+        if call is None:
+            return
+        self._calls_run += 1
+        _, _, events = self._dynamic_ring
+        entry = call % DYNAMIC_ADDRESS_RING
+        event = events[entry] or torch.cuda.Event()
+        event.record(stream)
+        events[entry] = event
+
+    def launch(self, compiled: Any, epoch: int, stream: torch.cuda.Stream) -> None:
+        """Enqueue one launch of ``compiled`` on ``stream`` without blocking."""
+        self.run_launch(compiled, self.prepare_launch(compiled, epoch, stream), stream)
 
     def _check_gemm_alignment(self, addresses: np.ndarray) -> None:
         """TMA descriptors need 16-byte-aligned operand base addresses."""
         gemm_slots = getattr(self, "_gemm_slots", None)
         if gemm_slots is None:
             gemm_slots = np.unique(
-                np.asarray(self.generated.launch.gemm_table, dtype=np.int64)[:, 1:]
+                # Columns 1-3 are the A, B and C slots.
+                np.asarray(self.generated.launch.gemm_table, dtype=np.int64)[:, 1:4]
             )
             self._gemm_slots = gemm_slots
         misaligned = gemm_slots[addresses[gemm_slots] % 16 != 0]
@@ -2199,37 +2598,6 @@ class _RuntimeState:
                     requirement="16-byte-aligned GEMM operand",
                 )
             )
-
-    def _stage_dynamic_addresses(self, addresses: np.ndarray) -> int:
-        """Write this call's boundary addresses to a host-mapped pinned buffer
-        and return its address, which the kernel prologue reads directly.
-
-        A small ring keeps a buffer untouched until the launch that read it
-        has finished, without adding GPU work.
-        """
-        if not self._dynamic_buffers:
-            for _ in range(_DYNAMIC_ADDRESS_BUFFERS):
-                host = torch.zeros(max(len(addresses), 1), dtype=torch.int64).pin_memory()
-                self._dynamic_buffers.append([host, host.numpy(), None])
-        entry = self._dynamic_buffers[self._dynamic_buffer_index]
-        self._dynamic_buffer_index = (
-            self._dynamic_buffer_index + 1
-        ) % _DYNAMIC_ADDRESS_BUFFERS
-        if entry[2] is not None:
-            entry[2].synchronize()
-        entry[1][: len(addresses)] = addresses
-        self._pending_dynamic_buffer = entry
-        return entry[0].data_ptr()
-
-    def record_launch(self, stream: torch.cuda.Stream) -> None:
-        """Mark the dynamic-address buffer of the launch just enqueued."""
-        entry = getattr(self, "_pending_dynamic_buffer", None)
-        if entry is None:
-            return
-        event = entry[2] or torch.cuda.Event()
-        event.record(stream)
-        entry[2] = event
-        self._pending_dynamic_buffer = None
 
     def _check_slot_layout(
         self, slot: int, argument: Any, tensor: torch.Tensor
@@ -2278,9 +2646,30 @@ class _RuntimeState:
             or len(entry[0]) != len(tensors)
             or any(old != new for old, new in zip(entry[0], identities))
         ):
-            entry = (identities, cute_gemm_tensors(*tensors))
+            splits = self.generated.launch.gemm_splits
+            entry = (
+                identities,
+                cute_gemm_tensors(
+                    *tensors, splits=splits[group_index] if splits else 1
+                ),
+            )
             self._g0_view_cache[group_index] = entry
         return entry[1]
+
+
+def _pack_arguments(compiled: Any, arguments: tuple[Any, ...]) -> tuple[Any, Any]:
+    """CuTe execution arguments for ``arguments`` and what keeps them alive,
+    or ``(None, None)`` when the executor cannot launch packed arguments."""
+    if not (
+        hasattr(compiled, "generate_execution_args")
+        and hasattr(compiled, "run_compiled_program")
+    ):
+        return None, None
+    generated = compiled.generate_execution_args(*arguments)
+    execution = (
+        generated[0] if isinstance(generated, tuple) and len(generated) == 2 else generated
+    )
+    return execution, generated
 
 
 def _tensor_identity(tensor: torch.Tensor) -> tuple[Any, ...]:
@@ -2397,6 +2786,32 @@ def _internal_alias(
         relation = value.storage_relation
         candidates.extend((*relation.aliases, relation.storage_id))
     return None
+
+
+def _g0_operands(
+    body: Any,
+    selected: Any,
+    graph: ComputeGraph,
+    input_tensors: Mapping[str, torch.Tensor],
+    values: Mapping[str, torch.Tensor],
+) -> tuple[torch.Tensor, ...]:
+    """CUTLASS ``(A, B, C)`` for a G0 GEMM: activation, weight and output, or
+    weight, activation and the transposed output for swapAB."""
+    # A bias (addmm) is read by the GEMM epilogue, not bound as an operand.
+    activation_load, *weight_loads = selected.program.loads[:2]
+    activation = _g0_activation_view(
+        activation_load.value_id,
+        _g0_source_tensor(activation_load.value_id, graph, input_tensors, values),
+        graph,
+    )
+    weights = tuple(
+        _g0_source_tensor(load.value_id, graph, input_tensors, values)
+        for load in weight_loads
+    )
+    output = values[selected.program.store.value_id]
+    if is_swap_ab(body):
+        return (*weights, activation, output.t())
+    return (activation, *weights, output)
 
 
 def _g0_source_tensor(

@@ -5,6 +5,7 @@ from .frontend import (
     make_backend,
     prepare_fx_graph,
 )
+from .buckets import DEFAULT_BUCKETS, PaddingDependence, bucketed
 from .cache import PlanCache, PlanCacheEntry, PlanCacheResult, make_plan_key
 from .graph import ComputeGraph, import_fx
 from .lowering import (
@@ -56,6 +57,9 @@ from .schedule import (
 )
 
 __all__ = [
+    "DEFAULT_BUCKETS",
+    "PaddingDependence",
+    "bucketed",
     "CaptureCache",
     "PlanCache",
     "PlanCacheEntry",

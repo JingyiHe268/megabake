@@ -73,7 +73,8 @@ def test_emit_cute_deduplicates_equivalent_bodies_and_saves_diagnostics(tmp_path
         (1, 0),
     ]
     assert generated.launch.phase_table[0][2:] != generated.launch.phase_table[1][2:]
-    assert generated.launch.barrier_epochs == 4
+    # Dense barrier ordinals per call: the address barrier and one phase barrier.
+    assert generated.launch.barrier_epochs == 2
     assert generated.source_path.exists()
     assert generated.source_map_path.exists()
 
@@ -89,7 +90,7 @@ def test_emit_cute_deduplicates_equivalent_bodies_and_saves_diagnostics(tmp_path
     source_lines = generated.source.splitlines()
     for symbol, expected in (
         ("_body_0", "sync_threads"),
-        ("megabake_kernel", "grid_barrier(ready, workers, epoch + phase + 1)"),
+        ("megabake_kernel", "counting_grid_barrier(ready, workers, _ordinal + phase_table[phase, 1])"),
         ("launch", ".launch("),
     ):
         entry = next(

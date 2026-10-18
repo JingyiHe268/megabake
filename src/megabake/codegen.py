@@ -10,7 +10,13 @@ import textwrap
 from typing import Any
 from collections.abc import Mapping, Sequence
 
-from .bodies.gemm import HopperWgmmaGemmPersistentKernel
+from .bodies.gemm import (
+    HopperWgmmaGemmPersistentKernel,
+    has_bias,
+    is_swap_ab,
+    kernel_tile,
+    split_k,
+)
 from .bodies.attention import emit_attention_body
 from .bodies.blackwell import emit_blackwell_gemm
 from .bodies.generic import (
@@ -33,6 +39,7 @@ from .lowering import (
 )
 from .memory import verify_plan
 from .plan import ConversionBody, CuTeLayout, KernelPlan, SelectedBody
+from .runtime import DYNAMIC_ADDRESS_RING, PHASE_TIMER_SLOTS, call_counter_offset
 from .schedule import EventSchedule
 
 
@@ -104,6 +111,15 @@ class LaunchMetadata:
     # descriptor templates on the host.
     gemm_table: tuple[tuple[int, ...], ...] = ()
     gemm_template_phases: tuple[int, ...] = ()
+    # K splits per GEMM variant (split-K).
+    gemm_splits: tuple[int, ...] = ()
+    # Phase scratch: FP32 and Int32 global buffers for bodies whose CTAs
+    # cooperate within a phase (split-K GEMMs, split-context attention).
+    # Counters start at zero and each phase leaves them at zero. Phases of
+    # one barrier interval get disjoint regions; columns 4 and 5 of a phase
+    # row hold its float and counter offsets.
+    phase_float_elements: int = 0
+    phase_counter_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -374,7 +390,7 @@ def _emit_generic_module(
             1
             if selection.program.family in {"reduction", "attention"}
             or selection.body.provider == "blackwell_mma"
-            else generated.threads_per_cta
+            else getattr(generated, "tile_elements", generated.threads_per_cta)
         )
         work_iterators.append(
             WorkIteratorBinding(
@@ -744,9 +760,12 @@ def _emit_table_module(
     )
     gemm_variants: dict[tuple[Any, ...], int] = {}
     gemm_definitions: list[str] = []
-    gemm_shapes: list[tuple[int, int, int]] = []
+    gemm_shapes: list[tuple[int, int, int, bool]] = []
     gemm_template_phases: list[int] = []
     gemm_rows: list[tuple[int, ...]] = []
+    gemm_splits: list[int] = []
+    # Phase index -> (FP32 elements, Int32 counters) of phase scratch.
+    phase_scratch: dict[int, tuple[int, int]] = {}
     gemm_scratch_bytes: set[int] = set()
     variants: dict[tuple[Any, ...], tuple[str, int, Any]] = {}
     body_definitions: list[str] = []
@@ -818,13 +837,23 @@ def _emit_table_module(
                 for domain in program.iteration_domains
                 if domain.axis in program.reduction_axes
             )
-            tile = tuple(phase.body.tiles.cta_shape[:2])
+            tile = kernel_tile(phase.body)
+            splits = split_k(phase.body)
+            bias = has_bias(phase.body)
             gemm_scratch_bytes.add(phase.body.scratch.size_bytes)
-            gemm_key = (tile, phase.body.scratch.size_bytes, rows, columns, reduction)
+            gemm_key = (
+                tile, phase.body.scratch.size_bytes, rows, columns, reduction, splits, bias
+            )
             if gemm_key not in gemm_variants:
                 gemm_variant = len(gemm_variants)
                 gemm_variants[gemm_key] = gemm_variant
-                gemm_shapes.append((rows, columns, reduction))
+                # CUTLASS problem shape; swapAB computes the transposed product.
+                gemm_shapes.append(
+                    (columns, rows, reduction, True)
+                    if is_swap_ab(phase.body)
+                    else (rows, columns, reduction, False)
+                )
+                gemm_splits.append(splits)
                 gemm_template_phases.append(phase.index)
                 symbol = f"_gemm_{gemm_variant}"
                 variants[("g0_range", gemm_key)] = (symbol, len(variants), None)
@@ -837,6 +866,9 @@ def _emit_table_module(
                     "    True,\n"
                     f"    smem_capacity={phase.body.scratch.size_bytes},\n"
                     "    reallocate_registers=False,\n"
+                    f"    splits={splits},\n"
+                    f"    bias_features={columns if bias else 0},\n"
+                    f"    bias_along_m={is_swap_ab(phase.body)!r},\n"
                     ")"
                 )
             gemm_variant = gemm_variants[gemm_key]
@@ -848,6 +880,11 @@ def _emit_table_module(
                 )
                 for load in program.loads
             ]
+            # Row: variant, A, B, C, then the bias slot + 1 (0 without bias).
+            bias_slot = gemm_slots.pop() + 1 if bias else 0
+            if is_swap_ab(phase.body):
+                # CUTLASS A is the weight and B the activation.
+                gemm_slots = [gemm_slots[1], gemm_slots[0], *gemm_slots[2:]]
             gemm_slots.append(
                 _tensor_argument_index(
                     tensor_arguments,
@@ -857,10 +894,39 @@ def _emit_table_module(
                 )
             )
             gemm_index = len(gemm_rows)
-            gemm_rows.append((gemm_variant, *gemm_slots))
+            gemm_rows.append((gemm_variant, *gemm_slots, bias_slot))
+            if splits > 1:
+                output_tiles = -(-gemm_shapes[gemm_variant][0] // tile[0]) * -(
+                    -gemm_shapes[gemm_variant][1] // tile[1]
+                )
+                # FP32 partials of every split of every tile, one counter per tile.
+                phase_scratch[phase.index] = (
+                    output_tiles * splits * tile[0] * tile[1],
+                    output_tiles,
+                )
             runner_key = ("g0_range", gemm_variant)
             if runner_key not in runner_variants:
                 representative_phases.append(phase)
+                split_state = (
+                    [
+                        "                (",
+                        "                    phase_floats,",
+                        "                    phase_counters,",
+                        "                    phase_table[phase, 4],",
+                        "                    phase_table[phase, 5],",
+                        "                ),",
+                    ]
+                    if splits > 1
+                    else []
+                )
+                bias_state = (
+                    [
+                        "                None," if splits == 1 else "",
+                        "                addresses[gemm_table[phase_table[phase, 6], 4] - 1],",
+                    ]
+                    if bias
+                    else []
+                )
                 runner_variants[runner_key] = (
                     len(runner_variants),
                     0,
@@ -868,16 +934,18 @@ def _emit_table_module(
                         f"            {body_symbol}.run_table(",
                         f"                gemm_values[{gemm_variant}],",
                         "                _gemm_scratch,",
-                        "                table_descriptors(tma_descriptors, phase_table[phase, 4]),",
+                        "                table_descriptors(tma_descriptors, phase_table[phase, 6]),",
                         "                _rotated,",
+                        *split_state,
+                        *(line for line in bias_state if line),
                         "            )",
                     ],
                 )
             runner_id = runner_variants[runner_key][0]
             phase_rows.append(
-                (runner_id, int(phase.barrier is not None), 0, 0, gemm_index)
+                (runner_id, int(phase.barrier is not None), 0, 0, 0, 0, gemm_index)
             )
-            phase_tiles.append(len(phase.work_items))
+            phase_tiles.append(len(phase.work_items) * splits)
             phase_records.append(
                 PhaseEmission(
                     phase.index,
@@ -897,8 +965,14 @@ def _emit_table_module(
         # ends the attention's interval (see the phase loop below); without
         # such a barrier the body publishes from a single CTA itself.
         generated = _generate_device_body(
-            selection, defer_length_publish=phase.index in deferred_publishes
+            selection,
+            defer_length_publish=phase.index in deferred_publishes,
+            workers=plan.launch.grid_size,
         )
+        scratch_floats = getattr(generated, "phase_floats", 0)
+        scratch_counters = getattr(generated, "phase_counters", 0)
+        if scratch_floats or scratch_counters:
+            phase_scratch[phase.index] = (scratch_floats, scratch_counters)
         if generated.__dataclass_fields__.get("scratch_elements") is not None:
             scratch_elements[phase.index] = generated.scratch_elements
         body_symbol, body_variant_id = body_variant(
@@ -947,7 +1021,7 @@ def _emit_table_module(
                 1
                 if selection.program.family in {"reduction", "attention"}
                 or selection.body.provider == "blackwell_mma"
-                else generated.threads_per_cta,
+                else getattr(generated, "tile_elements", generated.threads_per_cta),
             )
         ]
         conversion_symbols: list[str] = []
@@ -1034,10 +1108,16 @@ def _emit_table_module(
                         f"                work_iterators[{iterator}],",
                         "                _rotated,",
                         "                _thread,",
-                        "                workers,",
+                        "                _workers,",
                         f"                ({tensors},),",
                         f"                {scratch_name if call_index == 0 else 'None'},",
-                        "                None,",
+                        (
+                            "                (phase_floats, phase_counters, "
+                            "phase_table[phase, 4], phase_table[phase, 5]),"
+                            if getattr(call_generated, "phase_floats", 0)
+                            or getattr(call_generated, "phase_counters", 0)
+                            else "                None,"
+                        ),
                         "            )",
                     )
                 )
@@ -1047,6 +1127,8 @@ def _emit_table_module(
             (
                 runner_id,
                 int(phase.barrier is not None),
+                0,
+                0,
                 0,
                 0,
                 *(slot for _, call_slots, _, _ in calls for slot in call_slots),
@@ -1068,13 +1150,33 @@ def _emit_table_module(
             )
         )
 
+    # Phases of one barrier interval run concurrently, so each takes its own
+    # phase-scratch region; later intervals reuse the regions.
+    float_elements = counter_count = 0
+    float_offset = counter_offset = 0
+    for index, phase in enumerate(plan.phases):
+        floats, counters = phase_scratch.get(phase.index, (0, 0))
+        if floats or counters:
+            row = phase_rows[index]
+            phase_rows[index] = (*row[:4], float_offset, counter_offset, *row[6:])
+            float_offset += floats
+            counter_offset += counters
+            float_elements = max(float_elements, float_offset)
+            counter_count = max(counter_count, counter_offset)
+        if phase.barrier is not None:
+            float_offset = counter_offset = 0
+
     # Every body starts its tiles at CTA 0. Phases in one barrier interval run
     # concurrently, so each starts where the previous phase's tiles ended.
+    # Recompute phases run every tile on every CTA; rotation -1 marks them.
     offset = 0
     for index, phase in enumerate(plan.phases):
         if index == 0 or plan.phases[index - 1].barrier is not None:
             offset = 0
         row = phase_rows[index]
+        if phase.recompute:
+            phase_rows[index] = (*row[:2], -1, *row[3:])
+            continue
         phase_rows[index] = (*row[:2], offset % plan.launch.grid_size, *row[3:])
         offset += phase_tiles[index]
     for index, length_slot in length_publishes.items():
@@ -1093,12 +1195,24 @@ def _emit_table_module(
         row = phase_rows[closing]
         phase_rows[closing] = (*row[:3], length_slot + 1, *row[4:])
     width = max(len(row) for row in phase_rows)
+    # Barriers of one call get dense ordinals: the address barrier, the GEMM
+    # descriptor barrier, then each phase barrier in order. Column 1 of a
+    # phase row holds its barrier's ordinal (0: no barrier).
+    phase_epoch_offset = 2 if has_gemm else 1
+    ordinal = phase_epoch_offset
+    for index, phase in enumerate(plan.phases):
+        if phase.barrier is not None:
+            row = phase_rows[index]
+            phase_rows[index] = (row[0], ordinal, *row[2:])
+            ordinal += 1
+    barrier_epochs = ordinal
     phase_table = tuple(row + (0,) * (width - len(row)) for row in phase_rows)
     dynamic_slots = tuple(
         index
         for index, argument in enumerate(tensor_arguments)
         if argument.kind in _DYNAMIC_BINDING_KINDS and argument.layout is not None
     )
+
 
     scratch_plan = _representative_scratch_plan(plan, representative_phases)
     shared_source = _shared_scratch_source(scratch_plan, scratch_elements)
@@ -1126,24 +1240,34 @@ def _emit_table_module(
         f"        if variant == {runner_id}:\n" + "\n".join(lines)
         for runner_id, _, lines in runner_variants.values()
     )
-    # Per-call boundary addresses arrive through one pointer to a host-mapped
-    # buffer instead of one kernel parameter per slot; the first CTA copies
-    # them into the device table before the first barrier.
+    # Per-call boundary addresses arrive through a host-mapped ring of
+    # buffers whose base never changes; the call counter selects this call's
+    # entry, whose first word repeats the counter. The first CTA checks it and
+    # copies the addresses into the device table before the first barrier.
+    ring_words = len(dynamic_slots) + 1
     dynamic_writes = (
         "        _dynamic = cute.make_tensor(\n"
         "            cute.make_ptr(\n"
-        "                cutlass.Int64, dynamic_addresses, cute.AddressSpace.gmem, assumed_align=8\n"
+        "                cutlass.Int64,\n"
+        f"                dynamic_addresses + cutlass.Int64(_call % {DYNAMIC_ADDRESS_RING}) * {ring_words * 8},\n"
+        "                cute.AddressSpace.gmem,\n"
+        "                assumed_align=8,\n"
         "            ),\n"
-        f"            cute.make_layout({len(dynamic_slots)}),\n"
+        f"            cute.make_layout({ring_words}),\n"
         "        )\n"
-        f"        for _position in cutlass.range(_thread, {len(dynamic_slots)}, {plan.launch.threads_per_block}, unroll=1):\n"
-        "            addresses[dynamic_slot_table[_position]] = _dynamic[_position]\n"
-        if dynamic_slots
-        else "        pass\n"
+        "        if _dynamic[0] != cutlass.Int64(_call):\n"
+        "            llvm.intr_trap()\n"
+        + (
+            f"        for _position in cutlass.range(_thread, {len(dynamic_slots)}, {plan.launch.threads_per_block}, unroll=1):\n"
+            "            addresses[dynamic_slot_table[_position]] = _dynamic[_position + 1]\n"
+            if dynamic_slots
+            else ""
+        )
+
     )
     # Phase barriers follow the address barrier and, with GEMMs, the
     # descriptor barrier.
-    phase_epoch_offset = 2 if has_gemm else 1
+
     gemm_kernel_arguments = (
         "    gemm_table: cute.Tensor,\n"
         "    tma_descriptors: cute.Tensor,\n"
@@ -1188,7 +1312,9 @@ def _emit_table_module(
         "                    addresses[gemm_table[gemm, 1]],\n"
         "                    addresses[gemm_table[gemm, 2]],\n"
         "                    addresses[gemm_table[gemm, 3]],\n"
-        f"                    {shape!r},\n"
+        f"                    {shape[:3]!r},\n"
+        f"                    {shape[3]!r},\n"
+        f"                    {gemm_splits[variant]!r},\n"
         "                )"
         for variant, shape in enumerate(gemm_shapes)
     )
@@ -1201,7 +1327,7 @@ def _emit_table_module(
         "            gemm_variant = gemm_table[gemm, 0]\n"
         f"{gemm_builds}\n"
         "        cute.nvgpu.cpasync.fence_tma_desc_release()\n"
-        "    grid_barrier(ready, workers, cutlass.Int32(1) + epoch)\n"
+        "    counting_grid_barrier(ready, workers, _ordinal + cutlass.Int32(1))\n"
         if has_gemm
         else ""
     )
@@ -1226,7 +1352,7 @@ from cuda.bindings import driver as cuda
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.tensor import _Tensor
 
-from megabake.runtime import grid_barrier
+from megabake.runtime import counting_grid_barrier
 {gemm_import}
 {chr(10).join(gemm_definitions)}
 
@@ -1241,7 +1367,7 @@ def _slot(
     layout: cutlass.Constexpr,
     alignment: cutlass.Constexpr,
 ):
-    address = addresses[phase_table[phase, 4 + column]]
+    address = addresses[phase_table[phase, 6 + column]]
     if cutlass.const_expr(dtype is cutlass.Boolean):
         # Boolean tensors are byte-backed, matching DLPack-bound tensors.
         storage = cute.make_tensor(
@@ -1263,30 +1389,46 @@ def _slot(
 def megabake_kernel(
     ready: cute.Tensor,
     workers: cutlass.Int32,
-    epoch: cutlass.Int32,
     addresses: cute.Tensor,
     phase_table: cute.Tensor,
     work_iterators: tuple[cute.Tensor, ...],
     dynamic_addresses: cutlass.Int64,
     dynamic_slot_table: cute.Tensor,
+    phase_floats: cute.Tensor,
+    phase_counters: cute.Tensor,
 {gemm_kernel_arguments}):
     _, _, _block = cute.arch.block_idx()
     _thread, _, _ = cute.arch.thread_idx()
+    # Every CTA reads the call counter before the first barrier; block 0
+    # advances it after that barrier, for the next launch on this stream.
+    _call = ready[workers + {call_counter_offset()}]
+    _ordinal = _call * cutlass.Int32({barrier_epochs})
 {scratch_prelude}
 {gemm_scratch}
 {"".join(body_definitions)}
     # Publish this call's boundary addresses before any phase reads them.
     if _block == 0:
 {dynamic_writes}
-    grid_barrier(ready, workers, epoch)
-{gemm_prologue}
+    counting_grid_barrier(ready, workers, _ordinal)
+    if _block == 0:
+        if _thread == 0:
+            ready[workers + {call_counter_offset()}] = _call + cutlass.Int32(1)
+{gemm_prologue}{_phase_timer_stamp(len(plan.phases), "    ")}
     for phase in cutlass.range({len(plan.phases)}, unroll=1):
         variant = phase_table[phase, 0]
         _rotated = (_block + workers - phase_table[phase, 2]) % workers
+        _workers = workers
+        if phase_table[phase, 2] < 0:
+            # A recompute phase: this CTA runs every tile itself.
+            _rotated = cutlass.Int32(0)
+            _workers = cutlass.Int32(1)
 {dispatch}
+        if phase_table[phase, 2] < 0:
+            # Later TMA reads in this interval see the generic-proxy writes.
+            cute.arch.fence_proxy("async.global")
         if phase_table[phase, 1] != 0:
-            grid_barrier(ready, workers, epoch + phase + {phase_epoch_offset})
-            # Every reader of this interval's KV valid length has finished.
+            counting_grid_barrier(ready, workers, _ordinal + phase_table[phase, 1])
+{_phase_timer_stamp("phase", "            ")}            # Every reader of this interval's KV valid length has finished.
             if phase_table[phase, 3] != 0:
                 if _block == 0:
                     if _thread == 0:
@@ -1310,23 +1452,25 @@ def megabake_kernel(
 def launch(
     ready: cute.Tensor,
     workers: cutlass.Int32,
-    epoch: cutlass.Int32,
     addresses: cute.Tensor,
     phase_table: cute.Tensor,
     work_iterators: tuple[cute.Tensor, ...],
     dynamic_addresses: cutlass.Int64,
     dynamic_slot_table: cute.Tensor,
+    phase_floats: cute.Tensor,
+    phase_counters: cute.Tensor,
 {gemm_launch_arguments}    stream: cuda.CUstream,
 ):
 {gemm_prepare}    megabake_kernel(
         ready,
         workers,
-        epoch,
         addresses,
         phase_table,
         work_iterators,
         dynamic_addresses,
         dynamic_slot_table,
+        phase_floats,
+        phase_counters,
 {gemm_kernel_call}    ).launch(
         grid=[1, 1, workers],
         block=[{plan.launch.threads_per_block}, 1, 1],
@@ -1345,12 +1489,13 @@ def launch(
         (
             "ready",
             "workers",
-            "epoch",
             "addresses",
             "phase_table",
             "work_iterators",
             "dynamic_addresses",
             "dynamic_slot_table",
+            "phase_floats",
+            "phase_counters",
             *(
                 ("gemm_table", "tma_descriptors", "gemm_tensors", "max_active_clusters")
                 if has_gemm
@@ -1367,11 +1512,30 @@ def launch(
         source_bytes=len(source.encode("utf-8")),
         phase_table=phase_table,
         dynamic_slots=dynamic_slots,
-        barrier_epochs=len(plan.phases) + phase_epoch_offset,
+        barrier_epochs=barrier_epochs,
         gemm_table=tuple(gemm_rows),
         gemm_template_phases=tuple(gemm_template_phases),
+        gemm_splits=tuple(gemm_splits),
+        phase_float_elements=float_elements,
+        phase_counter_count=counter_count,
+
     )
     return source, launch_metadata, _source_map(source, plan, phase_records)
+
+
+def _phase_timer_stamp(slot: int | str, indent: str) -> str:
+    """Block 0 records when every CTA has passed this barrier."""
+    if not PHASE_TIMER_SLOTS:
+        return ""
+    if isinstance(slot, int) and slot >= PHASE_TIMER_SLOTS:
+        raise UnsupportedCodegen(
+            f"phase timer holds {PHASE_TIMER_SLOTS} stamps, plan needs {slot + 1}"
+        )
+    return (
+        f"{indent}if _block == 0:\n"
+        f"{indent}    if _thread == 0:\n"
+        f"{indent}        ready[workers + 2 + {slot}] = cute.arch.globaltimer_lo()\n"
+    )
 
 
 def _value_layout(plan: KernelPlan, value_id: str) -> CuTeLayout | None:
@@ -1566,7 +1730,14 @@ def _normalize_generic_selection(
     )
 
 
-def _generate_device_body(selection: SelectedBody, *, defer_length_publish: bool = False):
+def _generate_device_body(
+    selection: SelectedBody,
+    *,
+    defer_length_publish: bool = False,
+    workers: int | None = None,
+):
+    """``workers`` is given for table launches, whose bodies may split work
+    across CTAs through phase scratch."""
     program = selection.program
     if selection.body.provider == "blackwell_mma":
         return emit_blackwell_gemm(program, selection.body)
@@ -1578,7 +1749,10 @@ def _generate_device_body(selection: SelectedBody, *, defer_length_publish: bool
         return emit_contraction_body(program, selection.body)
     if program.family == "attention":
         return emit_attention_body(
-            program, selection.body, defer_length_publish=defer_length_publish
+            program,
+            selection.body,
+            defer_length_publish=defer_length_publish,
+            workers=workers,
         )
     raise UnsupportedCodegen(f"unsupported device body family {program.family}")
 
@@ -2018,6 +2192,7 @@ def _source_map(
                 index
                 for index, line in enumerate(source_lines, 1)
                 if "grid_barrier(ready, workers, epoch + phase + " in line
+                or "counting_grid_barrier(ready, workers, _ordinal + phase_table[phase, 1])" in line
             )
             entries.append(
                 SourceMapEntry(
