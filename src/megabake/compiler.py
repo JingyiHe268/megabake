@@ -205,8 +205,22 @@ class CallableTrace:
 _TABLE_LAUNCH_OPS = 1_000
 
 
+# CUDA kernel parameters are limited to 32 KiB; launches passing one CuTe
+# tensor per value switch to the table launch well before that.
+_TABLE_LAUNCH_PARAMETER_BYTES = 24_000
+
+
 def _uses_table_launch(graph: ComputeGraph) -> bool:
-    return len(graph.ops) > _TABLE_LAUNCH_OPS
+    """Large graphs, and graphs whose tensors would overflow the kernel
+    parameter space even with few ops (wide models with few layers), use
+    the table-driven launch. The estimate counts every shaped value as a
+    pointer plus a dynamic shape and stride per axis."""
+    if len(graph.ops) > _TABLE_LAUNCH_OPS:
+        return True
+    parameter_bytes = sum(
+        8 + 16 * len(value.shape) for value in graph.values.values() if value.shape is not None
+    )
+    return parameter_bytes > _TABLE_LAUNCH_PARAMETER_BYTES
 
 
 def _gemm_shapes(graph: ComputeGraph) -> tuple[tuple[int, int], ...]:
