@@ -1,5 +1,7 @@
 # MegaBake
 
+*Author: Ayush Satyam* 
+
 **A PyTorch native Mega-kernel compiler that compiles any Hugging Face model step into one persistent CUDA Mega-kernel.**
 
 ## In one sentence
