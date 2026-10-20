@@ -165,6 +165,7 @@ class HopperWgmmaGemmPersistentKernel:
         splits: int = 1,
         bias_features: int = 0,
         bias_along_m: bool = False,
+        direct_store: bool = False,
     ):
         """
         Initializes the configuration for a Hopper dense GEMM kernel.
@@ -233,6 +234,14 @@ class HopperWgmmaGemmPersistentKernel:
         # GEMMs carry the features on CUTLASS M, the others on N.
         self.bias_features = bias_features
         self.bias_along_m = bias_along_m
+        # MegaBake: small-tile table GEMMs (swapAB decode) store each
+        # thread's results straight from registers to global memory, at the
+        # phase's own C address. That skips the shared-memory staging, the TMA
+        # store and the wait for its completion before the CTA can arrive at
+        # the next barrier; the barrier then orders the plain stores.
+        if direct_store and splits > 1:
+            raise ValueError("direct-store epilogues run single-split GEMMs only")
+        self.direct_store = direct_store
 
         self.ab_stage = None
         self.epi_stage = None
@@ -534,7 +543,14 @@ class HopperWgmmaGemmPersistentKernel:
 
     @cute.jit
     def run_table(
-        self, prepared, scratch, tma_descs, rotated_block=None, split_state=None, bias_address=None
+        self,
+        prepared,
+        scratch,
+        tma_descs,
+        rotated_block=None,
+        split_state=None,
+        bias_address=None,
+        c_address=None,
     ):
         """Run one table-launched phase whose TMA descriptors live in global
         memory. ``prepared`` is this variant's ``prepare`` result; the kernel
@@ -572,6 +588,7 @@ class HopperWgmmaGemmPersistentKernel:
             rotated_block,
             split_state,
             bias_address,
+            c_address,
         )
 
     @cute.kernel
@@ -629,6 +646,7 @@ class HopperWgmmaGemmPersistentKernel:
         rotated_block=None,
         split_state=None,
         bias_address=None,
+        c_address=None,
     ):
         """
         GPU device kernel performing the batched GEMM computation.
@@ -958,10 +976,31 @@ class HopperWgmmaGemmPersistentKernel:
                 num_stages=self.epi_stage,
                 producer_group=tma_store_producer_group,
             )
+            c_extent = (cute.size(mC_mnl, mode=[0]), cute.size(mC_mnl, mode=[1]))
+            if cutlass.const_expr(self.direct_store):
+                # This phase's C in memory: mC_mnl holds TMA coordinates of
+                # the variant template's C. swapAB writes C^T, so C is
+                # M-major (see build_table_descriptors).
+                gC_direct = cute.local_tile(
+                    cute.make_tensor(
+                        cute.make_ptr(
+                            self.c_dtype, c_address, cute.AddressSpace.gmem, assumed_align=16
+                        ),
+                        cute.make_layout(
+                            (c_extent[0], c_extent[1], 1),
+                            stride=(1, c_extent[0], c_extent[0] * c_extent[1]),
+                        ),
+                    ),
+                    cute.slice_(self.tile_shape_mnk, (None, None, 0)),
+                    (None, None, None),
+                )
 
             while work_tile.is_valid_tile:
                 tile_coord_mnl = work_tile.tile_idx
-                gC_mnl_slice = gC_mnl[(None, None, *tile_coord_mnl)]
+                if cutlass.const_expr(self.direct_store):
+                    gC_mnl_slice = gC_direct[(None, None, *tile_coord_mnl)]
+                else:
+                    gC_mnl_slice = gC_mnl[(None, None, *tile_coord_mnl)]
 
                 # MAINLOOP
                 mainloop_consumer_read_state.reset_count()
@@ -1058,19 +1097,21 @@ class HopperWgmmaGemmPersistentKernel:
                         thr_copy_r2s,
                         tile_coord_mnl,
                         bias_address,
+                        c_extent,
                     )
 
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
-            tma_store_pipeline.producer_tail()
-            # MegaBake: the tail only waits until shared memory has been read.
-            # Other CTAs read these outputs after the enclosing grid barrier,
-            # so wait for the global writes and order them with the generic
-            # proxy before returning.
-            if warp_idx == self.epi_store_warp_id:
-                cute.arch.cp_async_bulk_wait_group(0, read=False)
-                cute.arch.fence_proxy("async.global")
+            if cutlass.const_expr(not self.direct_store):
+                tma_store_pipeline.producer_tail()
+                # MegaBake: the tail only waits until shared memory has been
+                # read. Other CTAs read these outputs after the enclosing grid
+                # barrier, so wait for the global writes and order them with
+                # the generic proxy before returning.
+                if warp_idx == self.epi_store_warp_id:
+                    cute.arch.cp_async_bulk_wait_group(0, read=False)
+                    cute.arch.fence_proxy("async.global")
 
     @cute.jit
     def _reduce_splits(
@@ -1149,6 +1190,7 @@ class HopperWgmmaGemmPersistentKernel:
         thr_copy_r2s=None,
         tile_coord_mnl=None,
         bias_address=None,
+        c_extent=None,
     ):
         # Epilogue
         tCgC_for_tma_partition = cute.zipped_divide(gC_mnl_slice, self.epi_tile)
@@ -1169,7 +1211,7 @@ class HopperWgmmaGemmPersistentKernel:
         )
 
         num_prev_epi_tiles = tile_sched.num_tiles_executed * epi_tile_num
-        if cutlass.const_expr(self.bias_features > 0):
+        if cutlass.const_expr(self.bias_features > 0 or self.direct_store):
             # MegaBake: the source side of the per-thread register-to-shared
             # copy follows the MMA accumulator layout, so it locates each D
             # register in the epilogue subtile. (The MMA slice is per
@@ -1178,6 +1220,7 @@ class HopperWgmmaGemmPersistentKernel:
             epi_coordinates = thr_copy_r2s.partition_S(
                 cute.make_identity_tensor(self.epi_tile)
             )
+        if cutlass.const_expr(self.bias_features > 0):
             bias = cute.make_tensor(
                 cute.make_ptr(
                     cutlass.BFloat16, bias_address, cute.AddressSpace.gmem, assumed_align=2
@@ -1210,6 +1253,21 @@ class HopperWgmmaGemmPersistentKernel:
             # Type conversion
             acc_vec = tRS_rD.load()
             tRS_rD_out.store(acc_vec.to(self.c_dtype))
+
+            if cutlass.const_expr(self.direct_store):
+                # Each register to its element of C, inside C's bounds (the
+                # token tile pads the token count).
+                store_m, store_n = epi_tile_layout.get_hier_coord(epi_idx)
+                for epi_v in cutlass.range_constexpr(size_tRS_rD):
+                    coordinate = epi_coordinates[epi_v]
+                    row = store_m * self.epi_tile[0] + coordinate[0]
+                    column = store_n * self.epi_tile[1] + coordinate[1]
+                    if (
+                        tile_coord_mnl[0] * self.tile_shape_mnk[0] + row < c_extent[0]
+                        and tile_coord_mnl[1] * self.tile_shape_mnk[1] + column < c_extent[1]
+                    ):
+                        gC_mnl_slice[row, column] = tRS_rD_out[epi_v]
+                continue
 
             # Copy from D registers to shared memory
             epi_buffer = (num_prev_epi_tiles + epi_idx) % cute.size(

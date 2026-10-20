@@ -486,7 +486,7 @@ def emit_attention_body(
         if defer_length_publish and workers is not None and head_dim % 32 == 0:
             return _split_decode_attention_body(
                 program, loads, row_count, query_heads, group_size, head_dim,
-                kv_length, scale, threads, workers,
+                kv_length, scale, threads, workers, config.scratch.size_bytes,
             )
         if defer_length_publish:
             # One warp-sized group of rows per CTA tile.
@@ -762,6 +762,7 @@ def _split_decode_attention_body(
     scale: float,
     threads: int,
     workers: int,
+    scratch_bytes: int = 0,
 ) -> GeneratedAttentionBody:
     """One-token decode with the visible keys of each query row split into
     chunks that run on different CTAs (flash decoding), keeping the captured
@@ -777,9 +778,17 @@ def _split_decode_attention_body(
     CTA's current or next item. The last chunk to finish sums the chunks'
     FP32 value partials in chunk order, so the result does not depend on
     which CTA finishes last, and resets the row's counters.
+
+    A chunk's scores are read only by the CTA that computes them, so they stay
+    in shared scratch after the warp partials whenever a full KV row fits
+    there; otherwise they go through phase scratch. A single chunk in use
+    skips the statistics exchange and its fences.
     """
     warps = threads // 32
     chunks = decode_chunks(row_count, workers)
+    # Shared scratch: warp maxima or sums, then warp value partials, then scores.
+    shared_scores = warps + warps * head_dim
+    scores_in_shared = (shared_scores + kv_length) * 4 <= scratch_bytes
     q_index = loads["attention:q"]
     k_index = loads["attention:k"]
     v_index = loads["attention:v"]
@@ -805,12 +814,22 @@ def _split_decode_attention_body(
     # issues VALUE_UNROLL keys' loads before accumulating them in key order;
     # keys past the cached range read the last cached key with probability 0.
     unroll = _VALUE_UNROLL
+    def score_load(key: str) -> str:
+        if scores_in_shared:
+            return f"scratch[{shared_scores} + {key}]"
+        return f"cute.arch.load(floats.iterator + scores + {key}, cutlass.Float32, cop=\"cg\")"
+
+    def score_store(key: str, value: str) -> str:
+        if scores_in_shared:
+            return f"scratch[{shared_scores} + {key}] = {value}"
+        return f"cute.arch.store(floats.iterator + scores + {key}, {value}, cop=\"cg\")"
+
     value_loads = "\n".join(
         f"                    key_{u} = base + {u * warps}\n"
         f"                    probability_{u} = cutlass.Float32(0.0)\n"
         f"                    if key_{u} < cached_stop:\n"
         f"                        probability_{u} = (\n"
-        f"                            cute.arch.load(floats.iterator + scores + key_{u}, cutlass.Float32, cop=\"cg\") / denominator\n"
+        f"                            {score_load(f'key_{u}')} / denominator\n"
         f"                        ).to(cutlass.BFloat16).to(cutlass.Float32)\n"
         f"                    else:\n"
         f"                        key_{u} = cached_stop - cutlass.Int32(1)\n"
@@ -834,7 +853,7 @@ def _split_decode_attention_body(
         + "\n                if stop == keys:\n"
         "                    if warp == 0:\n"
         "                        probability = (\n"
-        "                            cute.arch.load(floats.iterator + scores + current_length, cutlass.Float32, cop=\"cg\") / denominator\n"
+        f"                            {score_load('current_length')} / denominator\n"
         "                        ).to(cutlass.BFloat16).to(cutlass.Float32)\n"
         + lines(
             "value_{j} = value_{j} + probability * tensor_bindings[" + str(new_v_index) + "][b, 0, kv_head, {d}].to(cutlass.Float32)",
@@ -852,7 +871,7 @@ def _split_decode_attention_body(
                     score = cutlass.Float32((query * row).reduce(cute.ReductionOp.ADD, cutlass.Float32(0.0), 0))
                     score = score.to(cutlass.BFloat16).to(cutlass.Float32)
                     score = score * cutlass.Float32({scale!r})
-                    cute.arch.store(floats.iterator + scores + key, score, cop="cg")
+                    {score_store("key", "score")}
                     maximum = cute.arch.fmax(maximum, score, nan=True)
                 if stop == keys:
                     if thread == 0:
@@ -860,7 +879,7 @@ def _split_decode_attention_body(
                         score = cutlass.Float32((query * row).reduce(cute.ReductionOp.ADD, cutlass.Float32(0.0), 0))
                         score = score.to(cutlass.BFloat16).to(cutlass.Float32)
                         score = score * cutlass.Float32({scale!r})
-                        cute.arch.store(floats.iterator + scores + current_length, score, cop="cg")
+                        {score_store("current_length", "score")}
                         maximum = cute.arch.fmax(maximum, score, nan=True)
                 maximum = cute.arch.warp_reduction_max(maximum)
 """
@@ -950,10 +969,11 @@ def run(
                     chunk_maximum = scratch[0]
                     for other in cutlass.range_constexpr(1, {warps}):
                         chunk_maximum = cute.arch.fmax(chunk_maximum, scratch[other], nan=True)
-                    cute.arch.store(floats.iterator + stats + chunk * 2, chunk_maximum, cop="cg")
+                    if in_use > cutlass.Int32(1):
+                        cute.arch.store(floats.iterator + stats + chunk * 2, chunk_maximum, cop="cg")
                     scratch[0] = chunk_maximum
-                cute.arch.fence_acq_rel_gpu()
                 if in_use > cutlass.Int32(1):
+                    cute.arch.fence_acq_rel_gpu()
 {publish("0")}{wait("0")}                    if thread == 0:
                         row_maximum = cute.arch.load(floats.iterator + stats, cutlass.Float32, cop="cg")
                         for other in cutlass.range(1, in_use):
@@ -968,10 +988,8 @@ def run(
                 # Exponentials of this chunk's scores and their sum.
                 total = cutlass.Float32(0.0)
                 for key in cutlass.range(start + thread, stop, {threads}):
-                    probability = cute.exp(
-                        cute.arch.load(floats.iterator + scores + key, cutlass.Float32, cop="cg") - row_maximum
-                    )
-                    cute.arch.store(floats.iterator + scores + key, probability, cop="cg")
+                    probability = cute.exp({score_load("key")} - row_maximum)
+                    {score_store("key", "probability")}
                     total = total + probability
                 total = cute.arch.warp_reduction_sum(total)
                 cute.arch.sync_threads()
@@ -982,10 +1000,11 @@ def run(
                     chunk_total = scratch[0]
                     for other in cutlass.range_constexpr(1, {warps}):
                         chunk_total = chunk_total + scratch[other]
-                    cute.arch.store(floats.iterator + stats + chunk * 2 + 1, chunk_total, cop="cg")
+                    if in_use > cutlass.Int32(1):
+                        cute.arch.store(floats.iterator + stats + chunk * 2 + 1, chunk_total, cop="cg")
                     scratch[0] = chunk_total
-                cute.arch.fence_acq_rel_gpu()
                 if in_use > cutlass.Int32(1):
+                    cute.arch.fence_acq_rel_gpu()
 {publish("1")}{wait("1")}                    if thread == 0:
                         row_total = cutlass.Float32(0.0)
                         for other in cutlass.range(0, in_use):

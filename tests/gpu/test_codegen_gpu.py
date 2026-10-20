@@ -111,15 +111,16 @@ def _run_generic(generated, source):
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     iterator_views = tuple(_view(iterator) for iterator in work_iterators)
     assert generated.launch.launch_policy == "megabake_cooperative_table"
-    addresses = torch.tensor(
-        [tensor.data_ptr() for tensor in tensors], dtype=torch.int64, device="cuda"
-    )
+    # Slot addresses, then each phase column's resolved slot address.
+    slot_addresses = [tensor.data_ptr() for tensor in tensors]
+    slot_addresses += [slot_addresses[slot] for slot in generated.launch.resolved_slots]
+    addresses = torch.tensor(slot_addresses, dtype=torch.int64, device="cuda")
     phase_table = torch.tensor(
         generated.launch.phase_table, dtype=torch.int32, device="cuda"
     )
     # Ring entry 0, stamped with call 0, holds this call's boundary addresses.
     dynamic_addresses = torch.tensor(
-        [0, *(tensors[slot].data_ptr() for slot in generated.launch.dynamic_slots)],
+        [0, *(slot_addresses[slot] for slot in generated.launch.dynamic_slots)],
         dtype=torch.int64,
     ).pin_memory()
     dynamic_slots = torch.tensor(

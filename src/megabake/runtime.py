@@ -9,6 +9,8 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cuda.bindings import driver as cuda
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import dsl_user_op
 
 from .memory import verify_plan
 from .plan import KernelPlan
@@ -25,13 +27,37 @@ _MAX_INT32 = 2**31 - 1
 # MEGABAKE_PHASE_TIMER=1 makes table launches stamp the global timer after
 # every grid barrier (see tools/phase_profile.py). The stamps follow the
 # barrier state in the ready buffer, so the kernel signature is unchanged.
-PHASE_TIMER_SLOTS = 8192 if os.environ.get("MEGABAKE_PHASE_TIMER") == "1" else 0
+# MEGABAKE_PHASE_TIMER=cta also stamps every CTA: once when it starts its
+# first phase, then for every phase when its work is done and when it leaves
+# the phase's barrier (or CTA synchronization). These follow the block-0
+# stamps, CTA_TIMER_STRIDE slots per CTA.
+_PHASE_TIMER_MODE = os.environ.get("MEGABAKE_PHASE_TIMER")
+GRID_TIMER_SLOTS = 8192
+CTA_TIMER_PHASES = 2048
+CTA_TIMER_WORKERS = 160
+CTA_TIMER_STRIDE = 1 + 2 * CTA_TIMER_PHASES
+CTA_TIMER = _PHASE_TIMER_MODE == "cta"
+PHASE_TIMER_SLOTS = (
+    GRID_TIMER_SLOTS + CTA_TIMER_WORKERS * CTA_TIMER_STRIDE
+    if CTA_TIMER
+    else GRID_TIMER_SLOTS
+    if _PHASE_TIMER_MODE == "1"
+    else 0
+)
 
 
 def ready_slots(workers: int) -> int:
     """Barrier state: per-worker slots, the release flag, the arrival counter,
     any phase-timer stamps, and the call counter."""
     return workers + 3 + PHASE_TIMER_SLOTS
+
+
+# Bytes of upcoming GEMM weights a table launch prefetches into L2 per GEMM
+# barrier interval (see codegen._weight_prefetch_schedule); 0 disables it.
+# Off by default: on a 60-SM H200 slice it slowed decode by 16-24% issued by
+# every CTA (artifacts/chunk3_2026-10-20) and by 8-10% issued only by CTAs
+# idle in the issuing phase (artifacts/chunk4_2026-10-20).
+L2_PREFETCH_BYTES = int(os.environ.get("MEGABAKE_L2_PREFETCH_BYTES", 0))
 
 
 # Host-mapped buffers holding table launches' per-call boundary addresses;
@@ -132,6 +158,71 @@ def counting_grid_barrier(
         while seen < target:
             seen = cute.arch.load(counter, cutlass.Int32, sem="acquire", scope="gpu")
     cute.arch.sync_threads()
+
+
+@dsl_user_op
+def prefetch_l2(address, size, *, loc=None, ip=None):
+    """Fetch ``size`` bytes (a multiple of 16) at the 16-byte-aligned global
+    ``address`` into L2 without waiting (``cp.async.bulk.prefetch.L2``)."""
+    llvm.inline_asm(
+        res=None,
+        operands_=[
+            cutlass.Int64(address).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(size).ir_value(loc=loc, ip=ip),
+        ],
+        asm_string="cp.async.bulk.prefetch.L2.global [$0], $1;",
+        constraints="l,r",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def prefetch_l1(pointer, *, loc=None, ip=None):
+    """Prefetch the line holding a global ``pointer`` into L1."""
+    llvm.inline_asm(
+        res=None,
+        operands_=[pointer.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)],
+        asm_string="prefetch.global.L1 [$0];",
+        constraints="l",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+# Table launches' GEMM rows hold (variant, A, B, C, bias), then for L2
+# prefetch: the weight operand's address slot, its row count, the bytes
+# between its rows, and how many leading bytes of each row to prefetch.
+@cute.jit
+def prefetch_gemm_weights(
+    addresses: cute.Tensor,
+    gemm_table: cute.Tensor,
+    first: cutlass.Int32,
+    count: cutlass.Int32,
+    thread: cutlass.Int32,
+    threads: cutlass.Int32,
+):
+    """Spread L2 prefetches of GEMMs ``first..first+count`` over ``threads``.
+
+    Each request covers the leading bytes of one weight row, so a partial
+    prefetch holds the first K tiles of every output tile, which is the
+    order the GEMM mainloop reads them in.
+    """
+    offset = cutlass.Int32(0)
+    for gemm in cutlass.range(first, first + count, unroll=1):
+        rows = gemm_table[gemm, 6]
+        stride = cutlass.Int64(gemm_table[gemm, 7])
+        size = gemm_table[gemm, 8]
+        base = addresses[gemm_table[gemm, 5]]
+        # Rotate the first row per GEMM so small weights spread over threads.
+        start = (thread + threads - offset % threads) % threads
+        for row in cutlass.range(start, rows, threads, unroll=1):
+            prefetch_l2(base + cutlass.Int64(row) * stride, size)
+        offset = offset + rows
 
 
 @cute.jit

@@ -1,8 +1,8 @@
 # MegaBake roadmap: from one model to many
 
-**2026-10-16, updated 2026-10-17. Status: evidence, plan, and progress. Section 6 has the measured state.**
+**2026-10-16, updated 2026-10-17 and 2026-10-21. Status: evidence, plan, and progress. Section 7 has the latest measured state and order of work; section 6 is the 2026-10-17 state.**
 
-MegaBake compiles SmolLM-135M into one kernel that beats `torch.compile` in decode. It does not yet generalize: three other models fail to compile, and the larger SmolLM-1.7B runs its kernel at 40–60% of the GPU's bandwidth. This document records why, what the reference systems do differently, and the order of work.
+MegaBake compiles SmolLM-135M into one kernel. In decode it beats a CUDA-graphed `torch.compile` only when calls are pipelined, and on most models only by 5–55%; it loses prefill on every model (§7). It does not yet generalize: three other models fail to compile, and the larger SmolLM-1.7B runs its kernel at 40–60% of the GPU's bandwidth. This document records why, what the reference systems do differently, and the order of work.
 
 ## 1. What is solid
 
@@ -74,6 +74,8 @@ No system gets both. The fast ones are per model; the general one relies on libr
 
 ### 4.2 Runtime
 
+Measured on 2026-10-21 (§7): the order below is superseded. Fusion (item 3) comes first, the L2 prefetch of item 2 slowed decode and is replaced by shared-memory weight streaming, and events (item 1) are worth at most the ~11% of kernel time spent in barrier release.
+
 1. **Events in the table launch.** Each phase gets a completion counter in the device table; a CTA waits only on its phase's producers, not on a grid barrier. This is MPK's `trigger_event`/`dependent_event`, with static assignment first.
 2. **Cross-phase weight prefetch.** While a CTA waits, it issues L2 prefetches (`cp.async.bulk.prefetch.L2`) for its tiles of the next GEMM. This is the TPU bank ring adapted to a GPU's L2.
 3. **Fewer serial steps per layer.** Fuse the residual add and SiLU·mul into GEMM epilogues, and RMSNorm into the following GEMM's prologue (Mirage's `rmsnorm_linear`, `linear_with_residual`).
@@ -111,22 +113,21 @@ Coverage, verification and the event runtime are target-independent. Body provid
 
 Each step has a measured exit criterion. Run `benchmarks/full_model.py` and `tools/phase_profile.py` before and after.
 
+Done so far: phase profiler and teacher-forced verification, single-KV-head attention matching, swapAB GEMM, declared `megabake::attention` with `DecodeStep`, primitive families, bias epilogue, interval folding, split-context decode attention, variable-length buckets (§6), and per-phase fixed latency (§7). L2 weight prefetch was built and rejected (§7).
+
 | # | Step | Status | Exit criterion |
 | ---: | --- | --- | --- |
-| 1 | Phase profiler; teacher-forced verification | done | SmolLM-1.7B decode compiles; 135M GPU tests pass |
-| 2 | Single-KV-head attention matching | done | Gemma 3 270M prefill compiles |
-| 3 | swapAB GEMM for small-M table launches | done | 1.7B decode GEMMs 3.66 → 1.92 ms (1.78 TB/s); call 5.77 → 4.39 ms |
-| 4 | Declared `megabake::attention` via HF `AttentionInterface`; `DecodeStep` for any HF attention model | done | Gemma 3 decode compiles with no per-model wrapper |
-| 5 | Primitive families: views, `split`→`slice`, pointwise (`log*`, `exp2`, `erf`, rounding, logical, min/max, clamp), scatters, padding, 1-D convolution, input writes (`copy_`) | done | Qwen3.5 decode lowers completely |
-| 6 | Declared gated delta rule (chunked prefill: `cumsum`, triangular solve) | not started | Qwen3.5 prefill compiles |
-| 7 | Bias epilogue in the TMA GEMM | done | Qwen2-0.5B decode on the tuned body, bit-exact with eager |
-| 8 | Fusion: small intervals recomputed by their consumers | done | 135M decode 11 → ~6 barrier intervals per layer |
-| 9 | Cross-phase L2 weight prefetch | not started | 1.7B decode GEMMs ≥ 1.9 TB/s effective |
-| 10 | Event counters in the table launch | not started | No grid barrier between independent phases |
-| 11 | Split-K, split-context attention | split-context done; split-K built, off | 1.7B decode kernel ≤ 2.0 ms (Inductor's kernels: 2.4 ms) |
-| 12 | Variable lengths: size buckets with checked padding; compile time independent of length | done | One compile per bucket serves every length up to it; compile time no longer grows with tokens |
+| 1 | Prefill regression since 2026-10-18 (§7); the direct-store epilogue is the first suspect | not started | Prefill kernel back to its 2026-10-18 time or better on every model |
+| 2 | Cross-GEMM fusion: RMSNorm as the next GEMM's prologue, residual add and SiLU·mul in GEMM epilogues and prologues, RoPE and the KV append inside attention (§4.2.3); needs GEMM hook slots and owned derived weights (`agent_space/megakernel_gap_research/report.md` §6) | not started | ≤ 8 serial phases per decoder layer; 135M decode kernel ≤ 0.9 ms |
+| 3 | Shared-memory weight streaming: CTAs load their tiles of the next GEMM into its pipeline stages during the norm, RoPE and attention phases before it, so GEMMs start with full stages | not started | 1.7B decode kernel ≤ 2.2 ms |
+| 4 | Qwen3.5 and Gemma 3 decode: profile with `phase_profile.py --cta`, remove generic-body fallbacks | not started | Both within 1.1x of graphed Inductor in decode |
+| 5 | Declared gated delta rule (chunked prefill: `cumsum`, triangular solve) | not started | Qwen3.5 prefill compiles |
+| 6 | Host work per call (Dynamo guards, binding) | not started | Synced decode call ≤ kernel + 150 µs |
+| 7 | Graphed baseline for `--decode-contexts`; re-measure long-context decode and bucketed prefill | not started | §6 context and bucket tables against graphed baselines |
+| 8 | Split-K for projections with fewer tiles than workers (built, off: no gain on the 60-SM slice) | re-measure after 2–3 | 1.7B decode kernel ≤ 2.0 ms (graphed Inductor's kernels: 2.7 ms) |
+| 9 | Event counters in the table launch | deprioritized | Only after 2–3, if barrier release is still ≥ 10% of the kernel |
 
-After step 3, the SmolLM-1.7B decode kernel spends 1.92 ms in GEMMs. The remaining 0.77 ms goes to 49 RMSNorms (5 µs each), 24 decode attentions (10 µs each) and elementwise phases, nearly all per-step latency across 267 barrier intervals. Steps 8–10 target exactly that.
+After swapAB, the SmolLM-1.7B decode kernel spent 1.92 ms in GEMMs. The remaining 0.77 ms went to 49 RMSNorms (5 µs each), 24 decode attentions (10 µs each) and elementwise phases, nearly all per-step latency across 267 barrier intervals.
 
 ## 6. Measured state (2026-10-17)
 
@@ -143,8 +144,8 @@ After step 3, the SmolLM-1.7B decode kernel spends 1.92 ms in GEMMs. The remaini
 | Split-context decode attention (chunks exchange max/sum through phase scratch; last chunk merges in order) | 135M decode at 2,000 cached tokens 22.7 → 2.3 ms; 1.7B 26.2 → 5.5 ms |
 | Counting grid barrier (one release reduction per CTA, acquire polling) | 1.08 → 0.70 µs per barrier |
 | Reduction bodies unroll and issue loads before stores | RMSNorm 5.0 → 2.8 µs on 1.7B |
-| Interval folding (step 8) and staged map bodies | 135M decode barriers 333 → 183; −5–7% (135M), −1–2% (1.7B) |
-| Bias epilogue (step 7) | Qwen2 q/k/v projections on the tuned GEMM |
+| Interval folding and staged map bodies | 135M decode barriers 333 → 183; −5–7% (135M), −1–2% (1.7B) |
+| Bias epilogue | Qwen2 q/k/v projections on the tuned GEMM |
 | swapAB up to 64 rows (16/32/64 token tile) | Prompts and batches up to 64 rows stay on the small-M GEMM |
 | Split-K | No gain on the 60-SM slice; off by default (`MEGABAKE_SPLIT_K=1`) |
 
@@ -164,7 +165,7 @@ After step 3, the SmolLM-1.7B decode kernel spends 1.92 ms in GEMMs. The remaini
 | | Inductor CUDA graphs | — | — | 2,162 |
 | | MegaBake | **2,282** (1,574 pipelined) | **1,578** | 2,354 |
 
-\* Inductor skips CUDA graphs in decode because the KV caches are mutated inputs.
+\* Inductor skips CUDA graphs in decode because the KV caches are mutated inputs. Its decode also runs MegaBake's reference `kv_attention`, which calls `.item()` in every layer, so these decode baselines include one host synchronization per layer. §7 compares against a CUDA-graphed decode instead.
 
 Decode against context length (ms per call, clock ramped):
 
@@ -179,11 +180,11 @@ Correctness: every region of 135M decode and Qwen2-0.5B decode is bit-exact with
 
 ### Where MegaBake still loses
 
-- **GPU time in decode:** 135M 1.50 ms vs Inductor's 1.38 ms of kernels; 1.7B 2.98 vs 2.42 ms. MegaBake wins end to end because Inductor makes 450–630 launches on a slow host.
+- **GPU time in decode:** 135M 1.50 ms vs Inductor's 1.38 ms of kernels; 1.7B 2.98 vs 2.42 ms. MegaBake wins end to end because this Inductor baseline makes 450–630 launches on a slow host and synchronizes in every layer; against a CUDA-graphed decode it about ties (§7).
 - **Prefill:** about even on 135M at 4 tokens, 13% slower on 1.7B, and worse at 32 tokens (135M 2.63 vs 1.81 ms; 1.7B 4.96 vs 3.37 ms).
 - **Compilation** is 1–6 minutes at 4 tokens and grows with token count (1.7B, 32-token prefill: 29 minutes), because shapes are static and the planner enumerates every tile in Python.
 
-### Step 12: variable lengths
+### Variable lengths
 
 Kernels keep static shapes; `megabake.bucketed` serves arbitrary lengths through a few compiled sizes, as vLLM does with CUDA-graph capture sizes. A call pads its sequence arguments at the end to the smallest bucket that holds it, runs that bucket's kernel, and cuts the outputs back. On the first call of each bucket, eager calls with two different paddings must agree bit for bit at the real positions, and padded and unpadded eager calls must agree there up to rounding; otherwise the wrapper raises `PaddingDependence` instead of returning wrong results. Causal decoders pass. A model whose outputs read other positions or the padded length does not.
 
@@ -227,3 +228,56 @@ The buckets work, but **prefill kernels are slow at larger sizes**: 3.1–3.5x I
 - Long chains of elementwise ops exceed the planner's recursion limit.
 - `x + mean * c + bias` with a broadcast is not fused into one region.
 - `test_phase_runtime_ports_delay_idle_rebinding_and_largest_grid` fails before and after this work; `test_task24_compiles_exact_rope_with_supported_stride` failed once in five runs.
+
+## 7. Measured state (2026-10-21)
+
+### Baselines
+
+- **Graphed decode baseline.** `benchmarks/full_model.py --variants inductor_graphed` captures one Inductor decode step in a CUDA graph by hand: the KV state tensors are the graph's static inputs and the position is copied in before each replay. During capture, `kv_attention` runs a static-capacity version (write at a device index, attend over the whole capacity with positions past the valid length masked), which is bit-identical to the reference. The `inductor` and `inductor_cudagraphs` decode baselines of §6 were never graphed and synchronize once per layer. `--decode-contexts` does not have the graphed variant yet.
+- **Per-CTA profile.** `tools/phase_profile.py --cta` stamps every CTA when its work in each phase is done and when it leaves the phase's barrier. It splits each interval into the slowest CTA's work, straggler wait and barrier release, and reports per-phase times for the slowest, median and fastest CTA.
+
+### What the profile showed (SmolLM-135M decode, 603 phases, 184 intervals)
+
+- The critical path is per-phase work, not barriers: barrier release is ~150 µs (~0.8 µs each, ~11%) of a ~1.4 ms span. Events in the table launch can remove at most that.
+- Every phase had a fixed cost on every CTA, including CTAs with no tiles in it: ~0.5 µs per elementwise phase and ~1.2 µs per GEMM phase. The least-loaded CTA spent 632 µs just walking phases. The cost is dependent global loads (phase table → address table → work iterator → data) and per-body setup. GEMM stages occupy most of shared memory, so the tables are not L1-resident.
+- On 1.7B, the 32-tile projections (2,048 output rows) run on 32 of 60 SMs; split-K never applies to them (two splits need 64 CTAs).
+
+### What changed
+
+| Change | Effect |
+| --- | --- |
+| A CTA skips the body of a phase it has no tiles in (work units in a `phase_table` column) | Idle GEMM phase 1.2 → 0.3 µs; 135M decode kernel −8.5% |
+| Decode attention keeps a chunk's scores in shared memory; a single chunk skips the statistics exchange and its fences | 1.7B decode kernel −5% together with the next row |
+| Single-split swapAB GEMMs store results from registers to global memory (no shared staging, TMA store or store wait) | (with the row above) |
+| Resolved slot addresses (one load per tensor instead of two); work-iterator entries computed instead of loaded; next phase's table row prefetched into L1 | Recompute phases −0.3 µs each; decode kernel −3–11% across models |
+
+### Results
+
+`benchmarks/full_model.py`, 40 calls, KV capacity 128 (context < 100 tokens), 4-token prefill. Kernel is profiled GPU time of one call. Before is 2026-10-18 (`artifacts/full_model_2026-10-18`); now is `artifacts/full_model_2026-10-21`. Clock noise on the shared slice is 10–15%.
+
+| Model | Decode kernel, before → now (µs) | Decode pipelined: MegaBake / graphed Inductor (µs) | Decode synced call: MegaBake / graphed Inductor (µs) | Prefill kernel, before → now (µs) | Prefill call: MegaBake / Inductor CUDA graphs (µs) |
+| --- | --- | ---: | ---: | --- | ---: |
+| SmolLM-135M | 1,502 → 1,282 | **1,287** / 2,013 | **1,956** / 2,269 | 1,381 → 1,400 | 2,175 / **1,791** |
+| SmolLM-1.7B | 2,974 → 2,816 | **2,704** / 3,007 | 3,186 / **3,096** | 2,639 → 2,536 | 3,230 / **2,920** |
+| Qwen2-0.5B | 1,584 → 1,395 | **1,379** / 2,152 | **2,167** / 2,362 | 1,605 → 1,848 | 2,612 / **2,056** |
+| DeepSeek-V3 draft 0.6B | 1,591 → 1,416 | **1,398** / 2,133 | **2,195** / 2,352 | 1,590 → 1,847 | 2,605 / **2,035** |
+| Beam DFlash2 draft | 2,591 → 2,553 | **2,527** / 2,665 | 2,981 / **2,723** | 2,626 → 2,821 | 3,233 / **2,763** |
+| gemma-2b | 3,590 → 3,464 | **3,450** / 3,611 | 4,096 / **3,692** | 3,341 → 3,755 | 4,364 / **3,583** |
+| Gemma-3-270M | 2,080 → 1,872 | 1,858 / **1,412** | 2,537 / **1,584** | 1,833 → 1,788 | 2,536 / **1,477** |
+| Qwen3.5-0.8B | 5,621 → 5,057 | 5,061 / **2,312** | 5,931 / **2,489** | fails (`cumsum`) | — / 4,099 |
+
+GPU tests: 35 pass, 19 skip; `test_phase_runtime_ports_delay_idle_rebinding_and_largest_grid` still fails as before.
+
+### Measured and rejected
+
+- **L2 weight prefetch** (`cp.async.bulk.prefetch.L2` of the next GEMM interval's weights). Issued by every CTA it made decode 16–24% slower; issued only by CTAs idle in the issuing phase, 8–10% slower (`artifacts/chunk3_2026-10-20`, `chunk4_2026-10-20`). It stays built and off (`MEGABAKE_L2_PREFETCH_BYTES`, default 0).
+
+### Where MegaBake stands
+
+- MegaBake runs about as many serial units as graphed Inductor (135M: 603 phases vs 842 kernels); its decode lead is the cheaper gap between them (barriers ~0.3–0.8 µs vs kernel boundaries). None of the megakernel-only optimizations is built yet: weights stream only inside GEMM phases, and no op is fused across a GEMM boundary.
+- Bandwidth use in decode: ~55% on 1.7B (about 0.9 ms of norms, RoPE, attention and barriers with HBM idle) and ~10% on 135M (about 20 serial phases of 1–9 µs per layer).
+- Host work per synced call is ~600 µs (Dynamo guards plus MegaBake's binding), which loses the synced comparison on four models.
+- **Prefill regressed by 7–16%** on Qwen2, the DeepSeek draft, the Beam draft and gemma-2b since 2026-10-18. Not yet diagnosed; the direct-store epilogue is the first suspect, since 4-token prefill also takes the swapAB path.
+- Gemma 3 decode is 1.3x and Qwen3.5 decode 2.2x slower than graphed Inductor.
+
+The order of work from here is in §5.

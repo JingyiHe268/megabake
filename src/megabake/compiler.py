@@ -1926,6 +1926,7 @@ class _RuntimeState:
         # _prepare_table_rebind); None until the first full binding.
         self._table_rebind: _TableRebind | None = None
         self._slot_addresses: np.ndarray | None = None
+        self._resolved_index: np.ndarray | None = None
         self._dynamic_slot_table: tuple[torch.Tensor, Any] | None = None
         self._dynamic_slot_indices: np.ndarray | None = None
         # Table launches: (pinned [ring, slots + 1] buffer, its NumPy view,
@@ -2389,6 +2390,16 @@ class _RuntimeState:
             addresses = self._slot_addresses
         if launch.gemm_table:
             self._check_gemm_alignment(addresses)
+        if launch.resolved_slots:
+            # Each phase column's slot address follows the slot addresses.
+            if self._resolved_index is None:
+                self._resolved_index = np.concatenate(
+                    (
+                        np.arange(len(addresses), dtype=np.int64),
+                        np.asarray(launch.resolved_slots, dtype=np.int64),
+                    )
+                )
+            addresses = addresses[self._resolved_index]
         if self._dynamic_slot_indices is None:
             self._dynamic_slot_indices = np.asarray(launch.dynamic_slots, dtype=np.int64)
         dynamic_slots = self._dynamic_slot_indices

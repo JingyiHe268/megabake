@@ -8,6 +8,11 @@ therefore approximate, while interval totals are exact.
 
     .venv/bin/python tools/phase_profile.py --model HuggingFaceTB/SmolLM-1.7B --mode prefill
     .venv/bin/python tools/phase_profile.py --mode decode --skip-accuracy-gate
+
+With --cta every CTA also stamps when its work in each phase is done and when
+it leaves the phase's barrier, which splits each barrier interval into the
+slowest CTA's work, the time other CTAs wait for it, and the barrier's own
+release latency.
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ import re
 import sys
 from pathlib import Path
 
-os.environ["MEGABAKE_PHASE_TIMER"] = "1"
+os.environ["MEGABAKE_PHASE_TIMER"] = "cta" if "--cta" in sys.argv else "1"
 
 import torch  # noqa: E402
 
@@ -29,7 +34,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import megabake.compiler as compiler  # noqa: E402
 from megabake import make_backend  # noqa: E402
-from megabake.runtime import PHASE_TIMER_SLOTS  # noqa: E402
+from megabake.runtime import (  # noqa: E402
+    CTA_TIMER_STRIDE,
+    GRID_TIMER_SLOTS,
+    PHASE_TIMER_SLOTS,
+)
 from benchmarks.full_model import PROMPT, _load, decode_module  # noqa: E402
 from tests.fixtures import SMOLLM_MODEL_NAME, SMOLLM_REVISION  # noqa: E402
 
@@ -50,6 +59,138 @@ def _stamps(callable_, compiled) -> list[int]:
     count = len(compiled.plan.phases)
     raw = state.ready[workers + 2 : workers + 3 + count].cpu().to(torch.int64)
     return [value & 0xFFFFFFFF for value in raw.tolist()]
+
+
+def _cta_stamps(callable_, compiled) -> list[list[int]]:
+    """Per CTA: its start stamp, then (work done, left barrier) per phase."""
+    state = callable_.megabake_runtime_state
+    workers = compiled.plan.launch.grid_size
+    base = workers + 2 + GRID_TIMER_SLOTS
+    width = 1 + 2 * len(compiled.plan.phases)
+    raw = state.ready[base : base + workers * CTA_TIMER_STRIDE].view(workers, CTA_TIMER_STRIDE)
+    return [
+        [value & 0xFFFFFFFF for value in row]
+        for row in raw[:, :width].cpu().to(torch.int64).tolist()
+    ]
+
+
+def cta_profile(callable_, compiled, run, calls: int) -> dict:
+    """Split every barrier interval into work, straggler wait, and release.
+
+    For each interval and CTA: ``busy`` runs from leaving the previous
+    barrier to finishing this interval's work, ``wait`` from there until
+    leaving this barrier. The interval's critical work is the slowest CTA's
+    busy time; straggler wait is how long the average CTA waits for it; the
+    release latency runs from the last CTA's arrival to the first CTA's exit.
+    """
+    phases = compiled.plan.phases
+    barriers = [row[1] != 0 for row in compiled.generated.launch.phase_table]
+    samples = []
+    for _ in range(calls):
+        run()
+        torch.cuda.synchronize()
+        samples.append(_cta_stamps(callable_, compiled))
+    median = lambda values: sorted(values)[len(values) // 2]  # noqa: E731
+    keys = ("span", "critical", "mean_busy", "straggler_wait", "release", "busy_ctas")
+    intervals = []
+    previous, members = None, []
+    for index, phase in enumerate(phases):
+        members.append(phase)
+        if not barriers[index] and index + 1 < len(phases):
+            continue
+        rows = {key: [] for key in keys}
+        for stamps in samples:
+            # 32-bit nanosecond stamps, unwrapped relative to CTA 0's start.
+            reference = stamps[0][0 if previous is None else 2 + 2 * previous]
+            relative = lambda value: ((value - reference + (1 << 31)) & 0xFFFFFFFF) - (1 << 31)  # noqa: E731
+            starts = [relative(row[0 if previous is None else 2 + 2 * previous]) for row in stamps]
+            dones = [relative(row[1 + 2 * index]) for row in stamps]
+            exits = [relative(row[2 + 2 * index]) for row in stamps]
+            busy = [done - start for done, start in zip(dones, starts, strict=True)]
+            critical = max(busy)
+            rows["span"].append(max(exits) - min(starts))
+            rows["critical"].append(critical)
+            rows["mean_busy"].append(sum(busy) / len(busy))
+            rows["straggler_wait"].append(sum(max(dones) - done for done in dones) / len(dones))
+            rows["release"].append(max(0, min(exits) - max(dones)))
+            rows["busy_ctas"].append(sum(value * 2 >= critical for value in busy))
+        intervals.append(({key: median(values) for key, values in rows.items()}, tuple(members)))
+        previous, members = index, []
+    # Per phase: the slowest CTA's time from the previous phase's exit (or the
+    # interval start) to this phase's done stamp.
+    phase_rows = []
+    for index, phase in enumerate(phases):
+        times, fastest, typical = [], [], []
+        for stamps in samples:
+            reference = stamps[0][0]
+            relative = lambda value: ((value - reference + (1 << 31)) & 0xFFFFFFFF) - (1 << 31)  # noqa: E731
+            per_cta = sorted(
+                relative(row[1 + 2 * index]) - relative(row[0 if index == 0 else 2 * index])
+                for row in stamps
+            )
+            times.append(per_cta[-1])
+            fastest.append(per_cta[0])
+            typical.append(per_cta[len(per_cta) // 2])
+        phase_rows.append(
+            {
+                "index": index,
+                "us": median(times) / 1e3,
+                # A CTA without tiles in the phase still walks it: these are
+                # the fastest and the median CTA's time for the phase.
+                "fastest_cta_us": median(fastest) / 1e3,
+                "median_cta_us": median(typical) / 1e3,
+                "phase": f"{_category(phase)} tiles={len(phase.work_items)}",
+                "recompute": phase.recompute,
+                "barrier": barriers[index],
+            }
+        )
+    totals = {
+        key: sum(row[key] for row, _ in intervals) / 1e3
+        for key in ("span", "critical", "mean_busy", "straggler_wait", "release")
+    }
+    by_category: dict[str, dict[str, float]] = collections.defaultdict(
+        lambda: {"critical_us": 0.0, "straggler_wait_us": 0.0, "intervals": 0}
+    )
+    for row, group in intervals:
+        # Attribute an interval to its last (barrier-closing) phase's category.
+        entry = by_category[_category(group[-1])]
+        entry["critical_us"] += row["critical"] / 1e3
+        entry["straggler_wait_us"] += row["straggler_wait"] / 1e3
+        entry["intervals"] += 1
+    return {
+        "intervals": len(intervals),
+        "interval_span_us": totals["span"],
+        "critical_work_us": totals["critical"],
+        "mean_cta_busy_us": totals["mean_busy"],
+        "straggler_wait_us": totals["straggler_wait"],
+        "barrier_release_us": totals["release"],
+        "median_release_us": median([row["release"] for row, _ in intervals]) / 1e3,
+        "by_closing_category": sorted(
+            ({"category": name, **values} for name, values in by_category.items()),
+            key=lambda row: -row["critical_us"],
+        ),
+        "phases": phase_rows,
+        "all_intervals": [
+            {
+                **{key: row[key] / 1e3 for key in ("span", "critical", "mean_busy", "straggler_wait", "release")},
+                "busy_ctas": row["busy_ctas"],
+                "phases": [f"{_category(phase)} tiles={len(phase.work_items)}" for phase in group],
+            }
+            for row, group in intervals
+        ],
+        "largest_straggler_intervals": [
+            {
+                "span_us": row["span"] / 1e3,
+                "critical_us": row["critical"] / 1e3,
+                "straggler_wait_us": row["straggler_wait"] / 1e3,
+                "busy_ctas": row["busy_ctas"],
+                "phases": [
+                    f"{_category(phase)} tiles={len(phase.work_items)}" for phase in group
+                ],
+            }
+            for row, group in sorted(intervals, key=lambda item: -item[0]["straggler_wait"])[:12]
+        ],
+    }
 
 
 def profile(callable_, compiled, run, calls: int) -> dict:
@@ -115,6 +256,9 @@ def main() -> None:
     parser.add_argument("--calls", type=int, default=9)
     parser.add_argument("--out", type=Path)
     parser.add_argument(
+        "--cta", action="store_true", help="also split intervals into work and wait per CTA"
+    )
+    parser.add_argument(
         "--skip-accuracy-gate",
         action="store_true",
         help="profile a plan even if it fails the accuracy check (diagnostic only)",
@@ -154,11 +298,13 @@ def main() -> None:
             raise SystemExit("MegaBake did not compile a kernel for this model")
         if compiled.generated.launch.launch_policy != "megabake_cooperative_table":
             raise SystemExit("phase timing needs a table launch")
-        if len(compiled.plan.phases) >= PHASE_TIMER_SLOTS:
+        if len(compiled.plan.phases) >= min(PHASE_TIMER_SLOTS, GRID_TIMER_SLOTS):
             raise SystemExit("plan has more phases than timer slots")
         for _ in range(3):
             run()
         report = {"model": args.model, "mode": args.mode, **profile(callable_, compiled, run, args.calls)}
+        if args.cta:
+            report["cta"] = cta_profile(callable_, compiled, run, args.calls)
     print(json.dumps(report, indent=2))
     if args.out is not None:
         args.out.write_text(json.dumps(report, indent=2) + "\n")

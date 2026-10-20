@@ -17,6 +17,7 @@ error and the run continues.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import statistics
 import sys
@@ -38,9 +39,10 @@ from megabake.fx_handler.hf_attention import (  # noqa: E402
     register_transformers_attention,
 )
 from tests.fixtures import SMOLLM_MODEL_NAME, SMOLLM_REVISION, StatefulSmolLM  # noqa: E402
+from megabake.lowering import kv_attention  # noqa: E402
 
 PROMPT = [1, 504, 3458, 314]
-VARIANTS = ("eager", "inductor", "inductor_cudagraphs", "megabake")
+VARIANTS = ("eager", "inductor", "inductor_cudagraphs", "inductor_graphed", "megabake")
 
 
 def _load(name: str, revision: str | None, attention: str = "eager") -> torch.nn.Module:
@@ -191,6 +193,87 @@ def decode_module(model, capacity: int) -> tuple[torch.nn.Module, list]:
     return stateful, stateful.state_shapes(capacity)
 
 
+def _static_kv_attention(source, key, value, key_cache, value_cache, valid_length):
+    """``megabake::kv_attention`` without host synchronization.
+
+    The reference reads the valid length on the host to slice the cache, which
+    no CUDA graph can capture. This version writes the new entry at a device
+    index and attends over the whole capacity with positions past the valid
+    length masked out, as static-cache decoders (vLLM, Hugging Face's static
+    cache) do.
+    """
+    index = valid_length.long()
+    key_cache.index_copy_(1, index, key)
+    value_cache.index_copy_(1, index, value)
+    valid_length.add_(1)
+    query = source.permute(0, 2, 1, 3)
+    keys = key_cache.permute(0, 2, 1, 3)
+    values = value_cache.permute(0, 2, 1, 3)
+    if query.shape[1] != keys.shape[1]:
+        group_size = query.shape[1] // keys.shape[1]
+        keys = keys.repeat_interleave(group_size, dim=1)
+        values = values.repeat_interleave(group_size, dim=1)
+    scores = (query @ keys.transpose(-2, -1)).float() * source.shape[-1] ** -0.5
+    valid = torch.arange(key_cache.shape[1], device=source.device) < valid_length
+    scores = scores.masked_fill(~valid, float("-inf"))
+    probabilities = torch.softmax(scores, dim=-1).to(source.dtype)
+    output = probabilities @ values
+    return output.permute(0, 2, 1, 3).reshape(
+        source.shape[0] * source.shape[2], source.shape[1], source.shape[3]
+    )
+
+
+@contextlib.contextmanager
+def _graphable_kv_attention():
+    """Run ``megabake::kv_attention`` calls through ``_static_kv_attention``."""
+    kernels = kv_attention._backend_fns
+    reference = kernels[None]
+    kernels[None] = _static_kv_attention
+    try:
+        yield
+    finally:
+        kernels[None] = reference
+
+
+class GraphedStep:
+    """One decode step of ``function`` captured in a CUDA graph by hand.
+
+    Inductor's own CUDA graphs skip decode because the KV state tensors are
+    mutated inputs. Here they are the graph's static inputs: every call must
+    pass the same state tensors, and the call copies the new token position
+    into the captured buffer before replaying, so the caches advance in
+    place as they do for MegaBake. Attention runs as ``_static_kv_attention``
+    so nothing reads the device on the host. Warm-up and capture run on a
+    side stream; the state is zeroed again afterwards so the first replay is
+    position 0.
+    """
+
+    def __init__(self, function, token, state, warmup: int = 3):
+        self.state = state
+        self.position = torch.zeros((1, 1), dtype=torch.long, device="cuda")
+        with _graphable_kv_attention():
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                for _ in range(warmup):
+                    function(token, self.position, *state)
+            torch.cuda.current_stream().wait_stream(side)
+            torch.cuda.synchronize()
+            self.graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.graph):
+                self.output = function(token, self.position, *state)
+        for tensor in state:
+            tensor.zero_()
+        torch.cuda.synchronize()
+
+    def __call__(self, token, position_ids, *state):
+        if any(given is not captured for given, captured in zip(state, self.state, strict=True)):
+            raise ValueError("a graphed decode step must reuse its captured state tensors")
+        self.position.copy_(position_ids)
+        self.graph.replay()
+        return self.output
+
+
 def bench_decode(model, args) -> dict:
     stateful, state_shapes = decode_module(model, args.capacity)
     token = torch.tensor([[504]], device="cuda")
@@ -200,6 +283,8 @@ def bench_decode(model, args) -> dict:
         "inductor_cudagraphs": lambda: torch.compile(
             stateful, mode="reduce-overhead", fullgraph=True, dynamic=False
         ),
+        # Built per run below: the capture binds that run's state tensors.
+        "inductor_graphed": None,
         "megabake": lambda: torch.compile(
             stateful, backend=_megabake("decode", args.out), fullgraph=True, dynamic=False
         ),
@@ -218,6 +303,10 @@ def bench_decode(model, args) -> dict:
                 for shape, dtype in layer
             ]
             position = [0]
+            if name == "inductor_graphed":
+                build = lambda state=state: GraphedStep(  # noqa: E731
+                    torch.compile(stateful, fullgraph=True, dynamic=False), token, state
+                )
 
             def step(function, state=state, position=position):
                 position_ids = torch.tensor([[position[0]]], device="cuda")

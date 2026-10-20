@@ -39,7 +39,17 @@ from .lowering import (
 )
 from .memory import verify_plan
 from .plan import ConversionBody, CuTeLayout, KernelPlan, SelectedBody
-from .runtime import DYNAMIC_ADDRESS_RING, PHASE_TIMER_SLOTS, call_counter_offset
+from .runtime import (
+    CTA_TIMER,
+    CTA_TIMER_PHASES,
+    CTA_TIMER_STRIDE,
+    CTA_TIMER_WORKERS,
+    DYNAMIC_ADDRESS_RING,
+    GRID_TIMER_SLOTS,
+    L2_PREFETCH_BYTES,
+    PHASE_TIMER_SLOTS,
+    call_counter_offset,
+)
 from .schedule import EventSchedule
 
 
@@ -105,6 +115,9 @@ class LaunchMetadata:
     # device memory instead of passing one kernel parameter per tensor.
     phase_table: tuple[tuple[int, ...], ...] = ()
     dynamic_slots: tuple[int, ...] = ()
+    # Slots whose addresses the host appends to the address table, one per
+    # (phase, tensor column) of table launches (see _slot).
+    resolved_slots: tuple[int, ...] = ()
     barrier_epochs: int = 0
     # Table-launched TMA GEMMs: one row per GEMM phase (variant, A, B, and C
     # address slots), and the phase whose tensors build each variant's
@@ -763,6 +776,9 @@ def _emit_table_module(
     gemm_shapes: list[tuple[int, int, int, bool]] = []
     gemm_template_phases: list[int] = []
     gemm_rows: list[tuple[int, ...]] = []
+    # GEMM phase -> its GEMM row, and each row's weight operand for prefetch.
+    gemm_of_phase: dict[int, int] = {}
+    gemm_weights: list[tuple[int, int, int, int] | None] = []
     gemm_splits: list[int] = []
     # Phase index -> (FP32 elements, Int32 counters) of phase scratch.
     phase_scratch: dict[int, tuple[int, int]] = {}
@@ -775,6 +791,12 @@ def _emit_table_module(
     phase_rows: list[tuple[int, ...]] = []
     # Work tiles per phase, for spreading concurrent phases across CTAs.
     phase_tiles: list[int] = []
+    # Work units each phase's body iterates, from its rotated CTA index in
+    # steps of the grid size; a CTA whose rotated index reaches this count
+    # has nothing to do in the phase and skips its body.
+    phase_units: dict[int, int] = {}
+    # Tensor columns of each non-GEMM phase's row, which get resolved addresses.
+    resolved_columns: dict[int, int] = {}
     # Stateful attention phase -> address slot of its KV valid length.
     length_publishes: dict[int, int] = {}
     # Stateful attention phases whose interval ends in a grid barrier that no
@@ -799,12 +821,18 @@ def _emit_table_module(
     scratch_elements: dict[int, int] = {}
 
     def body_variant(
-        generated: Any, key: tuple[Any, ...], symbol: str | None = None
+        generated: Any, key: tuple[Any, ...], step: int, symbol: str | None = None
     ) -> tuple[str, int]:
         if key not in variants:
             symbol = symbol or f"_body_{len(variants)}"
             variants[key] = (symbol, len(variants), generated)
-            body_definitions.append(_nested_body_source(generated.source, symbol))
+            body_definitions.append(
+                _affine_work_iterator(
+                    _nested_body_source(generated.source, symbol),
+                    step,
+                    generated.tile_count,
+                )
+            )
         symbol, variant_id, _ = variants[key]
         return symbol, variant_id
 
@@ -869,6 +897,7 @@ def _emit_table_module(
                     f"    splits={splits},\n"
                     f"    bias_features={columns if bias else 0},\n"
                     f"    bias_along_m={is_swap_ab(phase.body)!r},\n"
+                    f"    direct_store={is_swap_ab(phase.body) and splits == 1!r},\n"
                     ")"
                 )
             gemm_variant = gemm_variants[gemm_key]
@@ -894,6 +923,8 @@ def _emit_table_module(
                 )
             )
             gemm_index = len(gemm_rows)
+            gemm_of_phase[phase.index] = gemm_index
+            gemm_weights.append(_gemm_weight_rows(plan, tensor_arguments, gemm_slots[:2]))
             gemm_rows.append((gemm_variant, *gemm_slots, bias_slot))
             if splits > 1:
                 output_tiles = -(-gemm_shapes[gemm_variant][0] // tile[0]) * -(
@@ -938,6 +969,14 @@ def _emit_table_module(
                         "                _rotated,",
                         *split_state,
                         *(line for line in bias_state if line),
+                        *(
+                            [
+                                "                c_address=addresses["
+                                "gemm_table[phase_table[phase, 6], 3]],"
+                            ]
+                            if is_swap_ab(phase.body) and splits == 1
+                            else []
+                        ),
                         "            )",
                     ],
                 )
@@ -946,6 +985,10 @@ def _emit_table_module(
                 (runner_id, int(phase.barrier is not None), 0, 0, 0, 0, gemm_index)
             )
             phase_tiles.append(len(phase.work_items) * splits)
+            gemm_shape = gemm_shapes[gemm_variant]
+            phase_units[phase.index] = (
+                -(-gemm_shape[0] // tile[0]) * -(-gemm_shape[1] // tile[1]) * splits
+            )
             phase_records.append(
                 PhaseEmission(
                     phase.index,
@@ -975,8 +1018,14 @@ def _emit_table_module(
             phase_scratch[phase.index] = (scratch_floats, scratch_counters)
         if generated.__dataclass_fields__.get("scratch_elements") is not None:
             scratch_elements[phase.index] = generated.scratch_elements
+        step = (
+            1
+            if selection.program.family in {"reduction", "attention"}
+            or selection.body.provider == "blackwell_mma"
+            else getattr(generated, "tile_elements", generated.threads_per_cta)
+        )
         body_symbol, body_variant_id = body_variant(
-            generated, (phase.body.provider, phase.body.name, generated.source)
+            generated, (phase.body.provider, phase.body.name, generated.source), step
         )
         program_input_ids = tuple(
             dict.fromkeys(load.value_id for load in selection.program.loads)
@@ -1014,15 +1063,7 @@ def _emit_table_module(
             )
             length_publishes[phase.index] = slots[program_input_ids.index(length_value)]
         calls: list[tuple[str, tuple[int, ...], Any, int]] = [
-            (
-                body_symbol,
-                tuple(slots),
-                generated,
-                1
-                if selection.program.family in {"reduction", "attention"}
-                or selection.body.provider == "blackwell_mma"
-                else getattr(generated, "tile_elements", generated.threads_per_cta),
-            )
+            (body_symbol, tuple(slots), generated, step)
         ]
         conversion_symbols: list[str] = []
         for conversion_index, conversion in enumerate(phase.conversion_bodies):
@@ -1037,6 +1078,7 @@ def _emit_table_module(
                     f"{conversion.source_layout}:{conversion.target_layout}",
                     conversion_generated.source,
                 ),
+                conversion_generated.threads_per_cta,
                 f"_conversion_{phase.index}_{conversion_index}",
             )
             conversion_symbols.append(conversion_symbol)
@@ -1123,6 +1165,7 @@ def _emit_table_module(
                 )
             runner_variants[runner_key] = (runner_id, column, lines)
         runner_id, _, _ = runner_variants[runner_key]
+        resolved_columns[phase.index] = sum(len(call_slots) for _, call_slots, _, _ in calls)
         phase_rows.append(
             (
                 runner_id,
@@ -1135,6 +1178,7 @@ def _emit_table_module(
             )
         )
         phase_tiles.append(max(call[2].tile_count for call in calls))
+        phase_units[phase.index] = phase_tiles[-1]
         phase_records.append(
             PhaseEmission(
                 phase.index,
@@ -1206,11 +1250,66 @@ def _emit_table_module(
             phase_rows[index] = (row[0], ordinal, *row[2:])
             ordinal += 1
     barrier_epochs = ordinal
-    phase_table = tuple(row + (0,) * (width - len(row)) for row in phase_rows)
-    dynamic_slots = tuple(
+    # Trailing columns: the GEMM rows whose weights a phase prefetches into
+    # L2 before running its body (the first row and the row count), then the
+    # phase's work units.
+    prefetches, prefetch_sizes = _weight_prefetch_schedule(
+        plan, gemm_of_phase, gemm_weights, L2_PREFETCH_BYTES
+    )
+    phase_table = tuple(
+        row
+        + (0,) * (width - len(row))
+        + prefetches.get(index, (0, 0))
+        + (phase_units[plan.phases[index].index],)
+        for index, row in enumerate(phase_rows)
+    )
+    # Resolved slot addresses: the slot behind each phase's tensor column
+    # (GEMM rows hold their GEMM row there instead and resolve nothing).
+    slot_width = max(width - 6, 1)
+    resolved = [
+        row[6 + column] if column < resolved_columns.get(index, 0) else None
+        for index, row in enumerate(phase_rows)
+        for column in range(slot_width)
+    ]
+    resolved_slots = tuple(0 if slot is None else slot for slot in resolved)
+    gemm_rows = [
+        (*row, *(
+            (weight[0], weight[1], weight[3], size)
+            if weight is not None and size
+            else (0, 0, 0, 0)
+        ))
+        for row, weight, size in zip(gemm_rows, gemm_weights, prefetch_sizes, strict=True)
+    ]
+    # Only CTAs without tiles in the issuing phase prefetch: they would wait
+    # at its barrier anyway. The phase's tiles start at its rotation.
+    weight_prefetch = (
+        f"        if phase_table[phase, {width + 1}] != 0:\n"
+        f"            _units = phase_table[phase, {width + 2}]\n"
+        "            _idle = (_block + workers - phase_table[phase, 2]) % workers - _units\n"
+        "            if phase_table[phase, 2] >= 0 and _idle >= 0:\n"
+        "                prefetch_gemm_weights(\n"
+        "                    addresses,\n"
+        "                    gemm_table,\n"
+        f"                    phase_table[phase, {width}],\n"
+        f"                    phase_table[phase, {width + 1}],\n"
+        f"                    _idle * {plan.launch.threads_per_block} + _thread,\n"
+        f"                    (workers - _units) * {plan.launch.threads_per_block},\n"
+        "                )\n"
+        if prefetches
+        else ""
+    )
+    boundary_slots = tuple(
         index
         for index, argument in enumerate(tensor_arguments)
         if argument.kind in _DYNAMIC_BINDING_KINDS and argument.layout is not None
+    )
+    # Resolved entries of per-call slots change with them, so the kernel
+    # prologue writes them from the dynamic-address ring too.
+    boundary = set(boundary_slots)
+    dynamic_slots = boundary_slots + tuple(
+        len(tensor_arguments) + position
+        for position, slot in enumerate(resolved)
+        if slot is not None and slot in boundary
     )
 
 
@@ -1236,8 +1335,14 @@ def _emit_table_module(
             f"generated kernel requires {shared_memory_bytes} shared-memory bytes"
         )
 
+    if CTA_TIMER and (
+        len(plan.phases) > CTA_TIMER_PHASES or plan.launch.grid_size > CTA_TIMER_WORKERS
+    ):
+        raise UnsupportedCodegen(
+            f"CTA timer holds {CTA_TIMER_PHASES} phases of {CTA_TIMER_WORKERS} CTAs"
+        )
     dispatch = "\n".join(
-        f"        if variant == {runner_id}:\n" + "\n".join(lines)
+        f"            if variant == {runner_id}:\n" + "\n".join("    " + line for line in lines)
         for runner_id, _, lines in runner_variants.values()
     )
     # Per-call boundary addresses arrive through a host-mapped ring of
@@ -1337,6 +1442,7 @@ def _emit_table_module(
         else ""
     )
     launch_smem = "" if has_gemm else f"        smem={shared_memory_bytes},\n"
+    phase_table_width = len(phase_table[0])
     gemm_import = (
         "from megabake.bodies.gemm import (\n"
         "    HopperWgmmaGemmPersistentKernel,\n"
@@ -1352,7 +1458,7 @@ from cuda.bindings import driver as cuda
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.tensor import _Tensor
 
-from megabake.runtime import counting_grid_barrier
+from megabake.runtime import counting_grid_barrier, prefetch_gemm_weights, prefetch_l1
 {gemm_import}
 {chr(10).join(gemm_definitions)}
 
@@ -1367,7 +1473,8 @@ def _slot(
     layout: cutlass.Constexpr,
     alignment: cutlass.Constexpr,
 ):
-    address = addresses[phase_table[phase, 6 + column]]
+    # The host appends each phase's resolved slot addresses to the table.
+    address = addresses[{len(tensor_arguments)} + phase * {slot_width} + column]
     if cutlass.const_expr(dtype is cutlass.Boolean):
         # Boolean tensors are byte-backed, matching DLPack-bound tensors.
         storage = cute.make_tensor(
@@ -1413,8 +1520,12 @@ def megabake_kernel(
     if _block == 0:
         if _thread == 0:
             ready[workers + {call_counter_offset()}] = _call + cutlass.Int32(1)
-{gemm_prologue}{_phase_timer_stamp(len(plan.phases), "    ")}
+{gemm_prologue}{_phase_timer_stamp(len(plan.phases), "    ")}{_cta_timer_stamp("0", "    ")}
     for phase in cutlass.range({len(plan.phases)}, unroll=1):
+{weight_prefetch}        if _thread == 0:
+            if phase + 1 < {len(plan.phases)}:
+                prefetch_l1(phase_table.iterator + (phase + 1) * {phase_table_width})
+                prefetch_l1(addresses.iterator + {len(tensor_arguments)} + (phase + 1) * {slot_width})
         variant = phase_table[phase, 0]
         _rotated = (_block + workers - phase_table[phase, 2]) % workers
         _workers = workers
@@ -1422,11 +1533,12 @@ def megabake_kernel(
             # A recompute phase: this CTA runs every tile itself.
             _rotated = cutlass.Int32(0)
             _workers = cutlass.Int32(1)
+        if _rotated < phase_table[phase, {width + 2}]:
 {dispatch}
         if phase_table[phase, 2] < 0:
             # Later TMA reads in this interval see the generic-proxy writes.
             cute.arch.fence_proxy("async.global")
-        if phase_table[phase, 1] != 0:
+{_cta_timer_stamp("1 + 2 * phase", "        ", synchronize=True)}        if phase_table[phase, 1] != 0:
             counting_grid_barrier(ready, workers, _ordinal + phase_table[phase, 1])
 {_phase_timer_stamp("phase", "            ")}            # Every reader of this interval's KV valid length has finished.
             if phase_table[phase, 3] != 0:
@@ -1446,7 +1558,7 @@ def megabake_kernel(
             # Independent phases share a barrier interval; the CTA still
             # synchronizes before the next body reuses its shared scratch.
             cute.arch.sync_threads()
-
+{_cta_timer_stamp("2 + 2 * phase", "        ")}
 
 @cute.jit
 def launch(
@@ -1512,6 +1624,7 @@ def launch(
         source_bytes=len(source.encode("utf-8")),
         phase_table=phase_table,
         dynamic_slots=dynamic_slots,
+        resolved_slots=resolved_slots,
         barrier_epochs=barrier_epochs,
         gemm_table=tuple(gemm_rows),
         gemm_template_phases=tuple(gemm_template_phases),
@@ -1523,13 +1636,113 @@ def launch(
     return source, launch_metadata, _source_map(source, plan, phase_records)
 
 
+def _gemm_weight_rows(
+    plan: KernelPlan, tensor_arguments: Sequence[TensorArgument], slots: Sequence[int]
+) -> tuple[int, int, int, int] | None:
+    """(slot, rows, row bytes, row stride bytes) of the first GEMM operand
+    whose storage is a kernel input (weights are lifted inputs, often bound
+    through a transposed view), read in rows along its contiguous axis; None
+    without one."""
+    graph = plan.graph
+    for slot in slots:
+        argument = tensor_arguments[slot]
+        layout = argument.layout
+        if layout is None or len(layout.shape) != 2:
+            continue
+        root_id = graph.values[argument.value_id].storage_relation.storage_id
+        root = graph.values.get(root_id or argument.value_id)
+        if root is None or root.producer is not None or root.id not in graph.inputs:
+            continue
+        element = _DTYPE_BYTES[layout.dtype]
+        for axis in (1, 0):
+            if layout.strides[axis] != 1:
+                continue
+            stride = layout.strides[1 - axis] * element
+            row_bytes = layout.shape[axis] * element
+            if stride % 16 or row_bytes < 16:
+                return None
+            return slot, layout.shape[1 - axis], row_bytes, stride
+    return None
+
+
+def _weight_prefetch_schedule(
+    plan: KernelPlan,
+    gemm_of_phase: Mapping[int, int],
+    weights: Sequence[tuple[int, int, int, int] | None],
+    budget: int,
+) -> tuple[dict[int, tuple[int, int]], list[int]]:
+    """Which phase prefetches which GEMMs' weights into L2, and how much.
+
+    Every barrier interval that runs GEMMs has its weights prefetched from
+    the first distributed phase of the first interval after the previous
+    GEMM interval, so the fetch overlaps the norms, RoPE and attention in
+    between; back-to-back GEMM intervals prefetch one interval ahead. CTAs
+    without tiles in the issuing phase issue the prefetches. At most ``budget`` bytes are
+    prefetched per interval, taken as the same leading share of every weight
+    row. Returns {issuing phase: (first GEMM row, GEMM count)} and the bytes
+    per row to prefetch for every GEMM row (0: none).
+    """
+    sizes = [0] * len(weights)
+    issues: dict[int, tuple[int, int]] = {}
+    if budget <= 0:
+        return issues, sizes
+    intervals: list[list[int]] = [[]]
+    for phase in plan.phases:
+        intervals[-1].append(phase.index)
+        if phase.barrier is not None:
+            intervals.append([])
+    previous: int | None = None
+    for position, members in enumerate(intervals):
+        gemms = [gemm_of_phase[index] for index in members if index in gemm_of_phase]
+        if not gemms:
+            continue
+        if previous is None:
+            issuer = 0 if position > 0 else None
+        else:
+            issuer = previous + 1 if previous + 1 < position else previous
+        previous = position
+        if issuer is None or gemms != list(range(gemms[0], gemms[0] + len(gemms))):
+            continue
+        total = sum(
+            weights[gemm][1] * weights[gemm][2] for gemm in gemms if weights[gemm]
+        )
+        if not total:
+            continue
+        share = min(1.0, budget / total)
+        for gemm in gemms:
+            if weights[gemm]:
+                size = int(weights[gemm][2] * share) // 16 * 16
+                sizes[gemm] = size if size >= 64 else 0
+        # Every CTA runs recompute phases, so none is idle in them.
+        distributed = [index for index in intervals[issuer] if not plan.phases[index].recompute]
+        if distributed and any(sizes[gemm] for gemm in gemms):
+            issues[distributed[0]] = (gemms[0], len(gemms))
+    return issues, sizes
+
+
+def _cta_timer_stamp(offset: str, indent: str, *, synchronize: bool = False) -> str:
+    """This CTA records a stamp at ``offset`` within its own timer row.
+
+    ``synchronize`` first waits for every thread of the CTA, so a stamp taken
+    after a body covers all of its warps."""
+    if not CTA_TIMER:
+        return ""
+    return (
+        (f"{indent}cute.arch.sync_threads()\n" if synchronize else "")
+        + f"{indent}if _thread == 0:\n"
+        f"{indent}    ready[workers + {2 + GRID_TIMER_SLOTS} + _block * {CTA_TIMER_STRIDE} + {offset}] = (\n"
+        f"{indent}        cute.arch.globaltimer_lo()\n"
+        f"{indent}    )\n"
+    )
+
+
 def _phase_timer_stamp(slot: int | str, indent: str) -> str:
     """Block 0 records when every CTA has passed this barrier."""
     if not PHASE_TIMER_SLOTS:
         return ""
-    if isinstance(slot, int) and slot >= PHASE_TIMER_SLOTS:
+    if isinstance(slot, int) and slot >= GRID_TIMER_SLOTS:
         raise UnsupportedCodegen(
-            f"phase timer holds {PHASE_TIMER_SLOTS} stamps, plan needs {slot + 1}"
+            f"phase timer holds {GRID_TIMER_SLOTS} stamps, plan needs {slot + 1}"
         )
     return (
         f"{indent}if _block == 0:\n"
@@ -1911,6 +2124,17 @@ def _nested_body_source(source: str, symbol: str) -> str:
     body_source = body_source.replace("    scratch: cute.Tensor,", "    scratch,", 1)
     body_source = body_source.replace("scratch[block,", "scratch[")
     return textwrap.indent(body_source, "    ") + "\n"
+
+
+def _affine_work_iterator(body_source: str, step: int, tile_count: int) -> str:
+    """Compute work-iterator entries instead of loading them.
+
+    Table launches fill every work iterator with ``arange(0, tiles * step,
+    step)``, and a body's first data access depends on its tile's entry: an
+    L2 round trip per tile on the critical path. The tensor stays bound."""
+    return body_source.replace(
+        "work_iterator[tile]", f"(cutlass.Int64(tile) * {step})"
+    ).replace("cute.size(work_iterator)", str(tile_count))
 
 
 def _generic_scratch_bytes(
