@@ -1,4 +1,4 @@
-"""One allowlist for checksums and Git publication; never publish runtime/model files."""
+"""Local diagnostic checksum selection. Git publication uses publication.py instead."""
 ALLOWED_SUFFIXES = {".json", ".jsonl", ".txt", ".log", ".html", ".png", ".svg", ".patch", ".md"}
 
 

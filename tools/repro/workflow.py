@@ -14,7 +14,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from evidence import evidence_files
+from publication import export
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -124,10 +124,10 @@ def publish(config, run_id):
     status = json.loads((directory / "status.json").read_text())
     if status.get("state") not in {"complete", "blocked", "failed"}:
         raise SystemExit("Run is not terminal; collect again after completion")
-    # Explicit file allowlist: no environments, model files, tokens, or arbitrary server files.
-    files = evidence_files(directory)
-    if not files:
-        raise SystemExit("No publishable evidence")
+    try:
+        files = export(directory)
+    except ValueError as error:
+        raise SystemExit(str(error))
     if output(["git", "diff", "--cached", "--name-only"]):
         raise SystemExit("Unrelated staged changes exist; commit them separately before publish")
     remote_url = output(["git", "remote", "get-url", "origin"])
@@ -135,7 +135,7 @@ def publish(config, run_id):
         raise SystemExit(f"Unexpected origin: {remote_url}")
     call(["git", "add", "-f", "--", *[str(p.relative_to(ROOT)) for p in files]], cwd=ROOT)
     if output(["git", "diff", "--cached", "--name-only"]):
-        call(["git", "commit", "-m", f"Record {run_id}: {status['state']}"], cwd=ROOT)
+        call(["git", "commit", "-m", f"Publish performance tables and charts: {run_id}"], cwd=ROOT)
     call(["git", "push", "-u", "origin", f"HEAD:refs/heads/{config['branch']}"], cwd=ROOT)
 
 

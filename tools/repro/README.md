@@ -18,7 +18,7 @@
     │                                              │
     │                                   srun --jobid=281111
     │                                              │
-GitHub 实验分支 ← 本地结果 commit ← rsync ← results/<run-id>
+GitHub 实验分支 ← 性能表格/对比图 ← 本地导出 ← rsync ← results/<run-id>
 ```
 
 服务器无须访问 GitHub，也不接收本地私钥或 GitHub token。
@@ -45,11 +45,8 @@ python3 tools/repro/workflow.py status 20261025-h100-smollm-001
 # 5. 拉回原始日志、环境、结果；生成 HTML 报告与 SHA256 清单。
 python3 tools/repro/workflow.py collect 20261025-h100-smollm-001
 
-# 6. 打开 results/<run-id>/report.html，保存真实浏览器截图为 report.png。
-#    截图后重新执行 report.py 更新文件哈希；结果目录可以包含额外 profiler 截图。
-python3 tools/repro/report.py results/20261025-h100-smollm-001
-
-# 7. 提交结果并推送实验分支，包含 blocked / failed 的真实诊断结果。
+# 6. 从成功测量导出 CSV / Markdown 表格和性能对比柱状图，再提交上传。
+#    无有效测量时拒绝发布；报告截图、错误图像、日志不会上传。
 python3 tools/repro/workflow.py publish 20261025-h100-smollm-001
 
 # 8. 下次 deploy 会将结果提交和后续源码一起快进同步到服务器。
@@ -60,9 +57,11 @@ ChatGPT GitHub connector 绑定的是另一账号，因此本流程使用本地 
 更换电脑时使用自己的 SSH 配置，避免复制别人的私钥。
 
 `collect` 不删除任一端的文件；大型 generated、Nsight 原始数据库不自动拉取。
-`publish` 只提交本次目录内允许的证据文件，单文件上限 10 MiB。
-较大的 trace 和 `.nsys-rep` 留在服务器，可单独压缩归档；截图应同时保留对应的原始日志或 trace。
-读取到 `running` 时不要发布；`complete` 仅表示所选流程执行成功，不自动代表两套计时口径相同。
+`publish` 只提交 `published/` 中由有效数据生成的 CSV / Markdown 表格和性能对比图。
+图表必须有成功测量值；不会上传运行失败图、报错截图、报告/终端截图或占位图。
+原始日志、环境快照、patch、JSON 测量、HTML 报告和截图仅保留在本地及服务器。
+现有柱状图仅比较相同工作负载的 SGLang CUDA Graph 开关；没有 MegaBake 数据时不绘制跨框架比较。
+读取到 `running` 时不要发布；终态中若有独立成功测量，可以只导出这些测量；没有有效数据则拒绝发布。
 
 ## 环境与模型准备
 
@@ -128,7 +127,8 @@ python3 tools/repro/workflow.py --config tools/repro/your-config.json launch uni
 ## 文件与验证
 
 每次运行的 `status.json` 是最终状态，`environment.json` 是环境及版本证据，`*.status.json` 保存阶段退出码，
-`*.log` 保存原始输出，`*.jsonl` / `report.json` 保存原始测量，`report.html` 和 `report.png` 用于阅读展示。
+`*.log` 保存原始输出，`*.jsonl` / `report.json` 保存原始测量，`report.html` 仅用于本地阅读。
+GitHub 发布目录为 `published/`，只存放有效性能表格与对比图。
 阻塞不会填入 0 毫秒或虚构性能；上游脚本返回 0 但内部 variant 失败时，外层仍标记失败。
 输入模型缺失时不下载浮动版本，也不会偷偷切换模型。
 

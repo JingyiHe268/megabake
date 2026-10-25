@@ -1,1 +1,0 @@
-{"run_name": "20261025-h100-qwen3-sglang-v2", "batch_size": 1, "input_len": 4, "output_len": 32, "prefill_latency": 0.004569903016090393, "prefill_throughput": 875.292098304101, "median_decode_latency": 0.001643206924200058, "median_decode_throughput": 608.5660821365012, "total_latency": 0.05571117252111435, "overall_throughput": 646.1899538437486}

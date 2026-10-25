@@ -8,6 +8,7 @@ from unittest.mock import patch
 import report
 import run_node
 import workflow
+import publication
 
 
 class WorkflowTests(unittest.TestCase):
@@ -76,6 +77,59 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(env["PATH"], "/env/bin:/cuda/bin:/usr/bin")
         self.assertEqual(env["LD_LIBRARY_PATH"], "/cuda/lib64:/existing")
         self.assertEqual(base["PATH"], "/usr/bin")
+
+    def test_publication_excludes_screenshots_logs_and_failed_stages(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            (folder / "config.json").write_text('{"model_id":"test/model","model_revision":"abc"}')
+            for name, state in [("on", "complete"), ("off", "complete"), ("bad", "failed")]:
+                stem = f"sglang-cudagraph-{name}-1"
+                (folder / f"{stem}.jsonl").write_text(json.dumps({
+                    "batch_size": 1, "input_len": 4, "output_len": 32,
+                    "prefill_latency": .001, "median_decode_latency": .002}) + "\n")
+                (folder / f"{stem}.status.json").write_text(json.dumps({"state": state}))
+            for name in ("report.png", "blockers.png", "error.log"):
+                (folder / name).write_text("private diagnostic")
+            files = publication.export(folder)
+            self.assertEqual({p.suffix for p in files}, {".csv", ".md", ".svg"})
+            self.assertTrue(all(p.parent.name == "published" for p in files))
+            self.assertNotIn("bad", (folder / "published/performance.csv").read_text())
+            self.assertNotIn("private diagnostic", ''.join(p.read_text() for p in files))
+
+    def test_no_measurements_refuses_publication(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            (folder / "config.json").write_text('{}')
+            (folder / "blockers.png").write_text("failure screenshot")
+            with self.assertRaises(ValueError):
+                publication.export(folder)
+            self.assertFalse((folder / "published").exists())
+
+    def test_nonfinite_measurements_are_never_plotted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            (folder / "config.json").write_text('{}')
+            (folder / "sglang-cudagraph-on-1.status.json").write_text('{"state":"complete"}')
+            (folder / "sglang-cudagraph-on-1.jsonl").write_text(
+                '{"prefill_latency":NaN,"median_decode_latency":0.001}\n')
+            with self.assertRaises(ValueError):
+                publication.export(folder)
+
+    def test_successful_upstream_measurements_export_as_tables(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            (folder / "config.json").write_text(json.dumps({
+                "model_id": "test/model", "model_revision": "abc", "batch_size": 1, "prompt_tokens": 4}))
+            (folder / "megabake-upstream").mkdir()
+            (folder / "megabake-upstream.status.json").write_text('{"state":"complete"}')
+            (folder / "megabake-upstream/report.json").write_text(json.dumps({
+                "prefill": {"megabake": {"complete_call_us": 2000}},
+                "decode": {"megabake": {"complete_call_us": 1000}}}))
+            files = publication.export(folder)
+            self.assertEqual({p.suffix for p in files}, {".csv", ".md"})
+            text = (folder / "published/performance.md").read_text()
+            self.assertIn("2.0000", text)
+            self.assertIn("1.0000", text)
 
 
 if __name__ == "__main__":

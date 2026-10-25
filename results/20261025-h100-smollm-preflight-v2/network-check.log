@@ -1,5 +1,0 @@
-ln311
-download.pytorch.org: resolve call failed: No appropriate name servers or networks for name found
-  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
-                                 Dload  Upload   Total   Spent    Left  Speed
-  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0curl: (6) Could not resolve host: download.pytorch.org

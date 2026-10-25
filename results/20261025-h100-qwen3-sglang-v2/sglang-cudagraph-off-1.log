@@ -1,34 +1,0 @@
-/HOME/sysu_xwzhang/sysu_xwzhang_3/hejy/sglang/python/sglang/bench_one_batch.py:13: FutureWarning: `sglang.bench_one_batch` is deprecated and will be removed in a future release; use `sglang.benchmark.one_batch` instead (e.g. `python -m sglang.benchmark.one_batch`).
-  warnings.warn(
-[1;33m'--disable-cuda-graph' is deprecated and will be removed in a future release. Use '--cuda-graph-backend-{decode,prefill}=disabled' instead.[0m
-Attention backend not specified. Use fa3 backend by default.
-Compiled-kernel caches now live under SGLANG_CACHE_DIR (/HOME/sysu_xwzhang/sysu_xwzhang_3/.cache/sglang). These older directories are no longer used by sglang, but may still be used by other frameworks on this machine, so they were left alone: /HOME/sysu_xwzhang/sysu_xwzhang_3/.triton, /HOME/sysu_xwzhang/sysu_xwzhang_3/.cache/flashinfer. Remove them yourself if nothing else needs them.
-[2026-10-25 22:32:04 TP0] Init torch distributed begin.
-[2026-10-25 22:32:04 TP0] Init torch distributed ends. elapsed=0.13 s, mem usage=0.09 GB
-[2026-10-25 22:32:07 TP0] Load weight begin. avail mem=78.62 GB
-Multi-thread loading shards:   0% Completed | 0/1 [00:00<?, ?it/s][2026-10-25 22:32:07 TP0] Parameter lm_head.weight not found in params_dict
-Multi-thread loading shards: 100% Completed | 1/1 [00:00<00:00,  1.86it/s]Multi-thread loading shards: 100% Completed | 1/1 [00:00<00:00,  1.86it/s]
-[2026-10-25 22:32:08 TP0] Load weight end. elapsed=0.69 s, type=Qwen3ForCausalLM, avail mem=77.44 GB, mem usage=1.18 GB.
-[2026-10-25 22:32:08 TP0] KV Cache is allocated. dtype: torch.bfloat16, #tokens: 356491, K size: 19.04 GB, V size: 19.04 GB
-[2026-10-25 22:32:08 TP0] Memory pool end. avail mem=39.25 GB
-[2026-10-25 22:32:08 TP0] Disable prefill CUDA graph because cuda_graph_config resolved prefill.backend='disabled' (e.g. via --cuda-graph-backend-prefill=disabled or auto-disable rules).
-max_total_num_tokens=356491
-Warmup ...
-Prefill. latency: 1.59132 s, throughput:      2.51 token/s
-Decode 0. Batch size: 1, latency: 0.02279 s, throughput:     43.89 token/s
-Decode 1. Batch size: 1, latency: 0.01424 s, throughput:     70.23 token/s
-Decode 2. Batch size: 1, latency: 0.01336 s, throughput:     74.83 token/s
-Decode 3. Batch size: 1, latency: 0.01350 s, throughput:     74.05 token/s
-Decode 4. Batch size: 1, latency: 0.01338 s, throughput:     74.74 token/s
-Decode.  median latency: 0.01387 s, median throughput:     72.11 token/s
-Total. latency:  2.031 s, throughput:     17.72 token/s
-Benchmark ...
-Prefill. latency: 0.01558 s, throughput:    256.81 token/s
-Decode 0. Batch size: 1, latency: 0.01451 s, throughput:     68.92 token/s
-Decode 1. Batch size: 1, latency: 0.01442 s, throughput:     69.35 token/s
-Decode 2. Batch size: 1, latency: 0.01530 s, throughput:     65.37 token/s
-Decode 3. Batch size: 1, latency: 0.01458 s, throughput:     68.61 token/s
-Decode 4. Batch size: 1, latency: 0.01411 s, throughput:     70.89 token/s
-Decode.  median latency: 0.01388 s, median throughput:     72.05 token/s
-Total. latency:  0.461 s, throughput:     78.03 token/s
-[rank0]:[W1025 22:32:12.264776702 ProcessGroupNCCL.cpp:1624] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
