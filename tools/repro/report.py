@@ -47,9 +47,10 @@ a{{color:#8dc8ff}}li{{margin:7px 0}}
 <div class="muted">JingyiHe268 · reproducible experiment evidence</div>
 <h1>MegaBake × SGLang · H100 reproduction</h1>
 <p class="muted">Run {esc(folder.name)} · {esc(status.get('finished_at', status.get('started_at')))}</p>
-<span class="badge">{esc(status['state'].upper())}</span>
+<span class="badge">{esc(status['state'].upper())}{' · SGLang baseline only' if status.get('baseline_only') else ''}</span>
 <div class="card"><b>Comparison status: {esc(status.get('comparison', 'not_available'))}</b>
 <p>{esc(status.get('comparison_note', 'No completed comparable measurements are available.'))}</p>
+<p>{'Baseline smoke test; MegaBake was not executed. Trials per CUDA Graph setting: ' + esc(config.get('repeats')) + '.' if status.get('baseline_only') else 'Full reproduction preflight / execution.'}</p>
 <b>No cross-framework speedup claimed.</b></div>
 <h2>Version & workload</h2><div class="card">
 <div>Execution commit: <code>{esc(commit)}</code></div>

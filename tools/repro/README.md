@@ -1,5 +1,7 @@
 # ln301 单卡复现与版本同步
 
+本次实际执行情况、测量与阻塞项见 [CURRENT_STATUS.md](CURRENT_STATUS.md)。
+
 本工作流固定 MegaBake 源码 `f70b54cec53cc4e46136c7082e0c9e9f774f5ece`，在其上增加实验工具。
 当前本地下载目录已与该提交逐文件核对。不要把 `origin/main` 的最新版本当作本次版本。
 
