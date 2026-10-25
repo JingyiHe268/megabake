@@ -14,3 +14,10 @@ experiments/*
 !/experiments/.gitkeep
 /artifacts/*
 !/artifacts/.gitkeep
+.repro/
+/results/*
+!/results/.gitkeep
+results/**/generated/
+results/**/*.nsys-rep
+results/**/*.sqlite
+results/**/*.tmp
