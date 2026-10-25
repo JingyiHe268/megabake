@@ -8,6 +8,8 @@ import json
 from pathlib import Path
 import sys
 
+from evidence import evidence_files
+
 
 def render(folder):
     folder = Path(folder)
@@ -73,8 +75,8 @@ a{{color:#8dc8ff}}li{{margin:7px 0}}
         + "See [report](report.html), [status](status.json), [environment](environment.json).\n"
     )
     checksums = {}
-    for path in sorted(folder.rglob("*")):
-        if path.is_file() and not path.is_symlink() and path.name != "checksums.json":
+    for path in evidence_files(folder):
+        if path.name != "checksums.json":
             checksums[str(path.relative_to(folder))] = hashlib.sha256(path.read_bytes()).hexdigest()
     (folder / "checksums.json").write_text(json.dumps(checksums, indent=2) + "\n")
     return folder / "report.html"

@@ -43,6 +43,18 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotIn("<missing model>", text)
             self.assertTrue((folder / "checksums.json").is_file())
 
+    def test_manifest_only_contains_publishable_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            (folder / "status.json").write_text('{"state":"blocked"}')
+            (folder / "launcher.pid").write_text("1234")
+            (folder / "trace.nsys-rep").write_text("large trace")
+            report.render(folder)
+            hashes = json.loads((folder / "checksums.json").read_text())
+            self.assertNotIn("launcher.pid", hashes)
+            self.assertNotIn("trace.nsys-rep", hashes)
+            self.assertIn("status.json", hashes)
+
     def test_report_converts_seconds_to_milliseconds(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)

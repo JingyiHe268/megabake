@@ -14,6 +14,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from evidence import evidence_files
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -123,9 +125,7 @@ def publish(config, run_id):
     if status.get("state") not in {"complete", "blocked", "failed"}:
         raise SystemExit("Run is not terminal; collect again after completion")
     # Explicit file allowlist: no environments, model files, tokens, or arbitrary server files.
-    allowed = {".json", ".jsonl", ".txt", ".log", ".html", ".png", ".svg", ".patch", ".md"}
-    files = [p for p in directory.rglob("*") if p.is_file() and not p.is_symlink()
-             and p.suffix in allowed and p.stat().st_size < 10 * 1024 * 1024]
+    files = evidence_files(directory)
     if not files:
         raise SystemExit("No publishable evidence")
     if output(["git", "diff", "--cached", "--name-only"]):

@@ -196,8 +196,12 @@ def main():
         (folder / "gpu.txt").write_text(metadata["gpu"].get("output", ""))
         for label, python in [("sglang", config["sglang_python"]), ("megabake", config["megabake_python"])]:
             if Path(python).exists():
-                freeze = capture([python, "-m", "pip", "freeze"], timeout=120)
-                (folder / f"{label}-pip-freeze.txt").write_text(freeze.get("output", freeze.get("error", "")))
+                # uv-created environments need not contain pip; query installed metadata directly.
+                freeze = capture([python, "-c", "import importlib.metadata as m; "
+                                  "print('\\n'.join(sorted(f\"{d.metadata['Name']}=={d.version}\" "
+                                  "for d in m.distributions())))"], timeout=120)
+                (folder / f"{label}-installed-distributions.txt").write_text(
+                    freeze.get("output", freeze.get("error", "")))
         blockers = status["blockers"]
         if not metadata["model"]["ready"]:
             blockers.append(metadata["model"]["reason"])
