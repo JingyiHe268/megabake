@@ -1,0 +1,118 @@
+{
+  "captured_at": "2026-10-25T14:19:57.818824+00:00",
+  "hostname": "hn43",
+  "platform": "Linux-5.15.0-78-th-an-x86_64-with-glibc2.35",
+  "job_id": "281111",
+  "step_id": "4",
+  "cuda_visible_devices": "0",
+  "megabake_commit": {
+    "argv": [
+      "git",
+      "rev-parse",
+      "HEAD"
+    ],
+    "returncode": 0,
+    "output": "8b158eec8ec6311034c0f9d917378bf88d9ca161\n"
+  },
+  "source_revision": "f70b54cec53cc4e46136c7082e0c9e9f774f5ece",
+  "gpu": {
+    "argv": [
+      "nvidia-smi"
+    ],
+    "returncode": 0,
+    "output": "Sun Oct 25 22:19:57 2026       \n+-----------------------------------------------------------------------------------------+\n| NVIDIA-SMI 550.54.15              Driver Version: 550.54.15      CUDA Version: 12.4     |\n|-----------------------------------------+------------------------+----------------------+\n| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |\n| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |\n|                                         |                        |               MIG M. |\n|=========================================+========================+======================|\n|   0  NVIDIA H100 80GB HBM3          On  |   00000000:C6:00.0 Off |                    0 |\n| N/A   30C    P0             72W /  700W |       0MiB /  81559MiB |      0%      Default |\n|                                         |                        |             Disabled |\n+-----------------------------------------+------------------------+----------------------+\n                                                                                         \n+-----------------------------------------------------------------------------------------+\n| Processes:                                                                              |\n|  GPU   GI   CI        PID   Type   Process name                              GPU Memory |\n|        ID   ID                                                               Usage      |\n|=========================================================================================|\n|  No running processes found                                                             |\n+-----------------------------------------------------------------------------------------+\n"
+  },
+  "gpu_details": {
+    "argv": [
+      "nvidia-smi",
+      "--query-gpu=name,uuid,driver_version,memory.total,mig.mode.current,power.limit",
+      "--format=csv"
+    ],
+    "returncode": 0,
+    "output": "name, uuid, driver_version, memory.total [MiB], mig.mode.current, power.limit [W]\nNVIDIA H100 80GB HBM3, GPU-7dafa829-27b8-47a1-55c6-b6c2e37a7951, 550.54.15, 81559 MiB, Disabled, 700.00 W\n"
+  },
+  "slurm_job": {
+    "argv": [
+      "scontrol",
+      "show",
+      "job",
+      "281111"
+    ],
+    "returncode": 0,
+    "output": "JobId=281111 JobName=interactive\n   UserId=sysu_xwzhang_3(16053) GroupId=sysu_xwzhang(12252) MCS_label=N/A\n   Priority=1 Nice=0 Account=sysu_xwzhang QOS=normal\n   JobState=RUNNING Reason=None Dependency=(null)\n   Requeue=0 Restarts=0 BatchFlag=0 Reboot=0 ExitCode=0:0\n   RunTime=10:43:49 TimeLimit=365-00:00:00 TimeMin=N/A\n   SubmitTime=2026-10-22T12:16:28 EligibleTime=2026-10-22T12:16:28\n   AccrueTime=2026-10-22T12:16:28\n   StartTime=2026-10-25T11:36:09 EndTime=2027-10-25T11:36:09 Deadline=N/A\n   SuspendTime=None SecsPreSuspend=0 LastSchedEval=2026-10-25T11:36:09 Scheduler=Backfill\n   Partition=h100x AllocNode:Sid=ln302:1522123\n   ReqNodeList=(null) ExcNodeList=(null)\n   NodeList=hn43\n   BatchHost=hn43\n   NumNodes=1 NumCPUs=14 NumTasks=1 CPUs/Task=1 ReqB:S:C:T=0:0:*:*\n   ReqTRES=cpu=1,mem=2060000M,node=1,gres/gpu:a100=1\n   AllocTRES=cpu=14,mem=240G,node=1,billing=200,gres/gpu:h100=1\n   Socks/Node=* NtasksPerN:B:S:C=0:0:*:* CoreSpec=*\n   MinCPUsNode=1 MinMemoryNode=0 MinTmpDiskNode=0\n   Features=(null) DelayBoot=00:00:00\n   OverSubscribe=OK Contiguous=0 Licenses=(null) Network=(null)\n   Command=/bin/bash\n   WorkDir=/HOME/sysu_xwzhang/sysu_xwzhang_3\n   CpusPerTres=gpu:14\n   MemPerTres=gpu:245760\n   TresPerJob=gres/gpu:1\n   \n\n"
+  },
+  "sglang_commit": {
+    "argv": [
+      "git",
+      "rev-parse",
+      "HEAD"
+    ],
+    "returncode": 0,
+    "output": "0948e6ebed82c7dd7df8a0c347076e46af84bef6\n"
+  },
+  "sglang_status": {
+    "argv": [
+      "git",
+      "status",
+      "--short"
+    ],
+    "returncode": 0,
+    "output": " M benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton_sep.py\n M python/sglang/kernels/ops/moe/fused_moe_triton_kernels.py\n M python/sglang/srt/environ.py\n M python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py\n M python/sglang/srt/models/qwen2_moe.py\n?? benchmark/qwen3_30b_a3b_fixed_decode/\n?? benchmark/qwen3_6_decode_research/\n?? scripts/capture_qwen36_routing.sh\n?? scripts/compare_qwen36_moe_sep.sh\n?? scripts/launch_qwen36_nsys.sh\n?? scripts/launch_qwen36_sglang.sh\n?? scripts/profile_qwen36_decode.py\n?? scripts/run_moe_tuner_no_ray.py\n?? scripts/test_qwen36_fused_moe_gemm1_swiglu_fp8.py\n?? scripts/tune_qwen36_moe_sep.sh\n?? scripts/tuning_fused_moe_triton_sep.py\n?? test/registered/kernels/ops/moe/test_fused_moe_gemm1_swiglu_fp8.py\n"
+  },
+  "sglang_benchmark_sha256": {
+    "python/sglang/benchmark/one_batch.py": "76cdb1c3eddf1871d126859312228702ffe41f9f54a7496347fe94d8101899c2",
+    "python/sglang/bench_one_batch.py": "2b062012b43493632ca6dbbb46aa783e235905c9da9cde94c23b6f6b3828ab55"
+  },
+  "sglang_probe": {
+    "argv": [
+      "/HOME/sysu_xwzhang/sysu_xwzhang_3/hejy/sglang/.venv/bin/python",
+      "-u",
+      "-c",
+      "import importlib.metadata as m, json, sys\npackages = {}\nfor name in [\"torch\", \"transformers\", \"sglang\", \"sglang-kernel\", \"nvidia-cutlass-dsl\", \"numpy\"]:\n    try: packages[name] = m.version(name)\n    except m.PackageNotFoundError: packages[name] = None\ndata = {\"python\": sys.version, \"executable\": sys.executable, \"packages\": packages}\ntry:\n    import torch\n    data.update(cuda_runtime=torch.version.cuda, cuda_available=torch.cuda.is_available())\n    if data[\"cuda_available\"]:\n        x = torch.ones(1, device=\"cuda\")\n        torch.cuda.synchronize()\n        data.update(gpu=torch.cuda.get_device_name(), capability=list(torch.cuda.get_device_capability()),\n                    cuda_tensor_ok=float(x.cpu()[0]) == 1.0)\nexcept Exception as error: data[\"cuda_error\"] = repr(error)\nprint(\"REPRO_PROBE=\" + json.dumps(data))\n"
+    ],
+    "returncode": 0,
+    "output": "REPRO_PROBE={\"python\": \"3.10.12 (main, Jun 11 2023, 05:26:28) [GCC 11.4.0]\", \"executable\": \"/HOME/sysu_xwzhang/sysu_xwzhang_3/hejy/sglang/.venv/bin/python\", \"packages\": {\"torch\": \"2.13.0+cu129\", \"transformers\": \"5.12.1\", \"sglang\": \"0.0.0.dev17813+g0948e6ebe\", \"sglang-kernel\": \"0.4.6.post1+cu129\", \"nvidia-cutlass-dsl\": \"4.6.2\", \"numpy\": \"2.2.6\"}, \"cuda_runtime\": \"12.9\", \"cuda_available\": true, \"gpu\": \"NVIDIA H100 80GB HBM3\", \"capability\": [9, 0], \"cuda_tensor_ok\": true}\n",
+    "data": {
+      "python": "3.10.12 (main, Jun 11 2023, 05:26:28) [GCC 11.4.0]",
+      "executable": "/HOME/sysu_xwzhang/sysu_xwzhang_3/hejy/sglang/.venv/bin/python",
+      "packages": {
+        "torch": "2.13.0+cu129",
+        "transformers": "5.12.1",
+        "sglang": "0.0.0.dev17813+g0948e6ebe",
+        "sglang-kernel": "0.4.6.post1+cu129",
+        "nvidia-cutlass-dsl": "4.6.2",
+        "numpy": "2.2.6"
+      },
+      "cuda_runtime": "12.9",
+      "cuda_available": true,
+      "gpu": "NVIDIA H100 80GB HBM3",
+      "capability": [
+        9,
+        0
+      ],
+      "cuda_tensor_ok": true
+    }
+  },
+  "megabake_probe": {
+    "argv": [
+      "/HOME/sysu_xwzhang/sysu_xwzhang_3/hejy/envs/megabake/bin/python",
+      "-u",
+      "-c",
+      "import importlib.metadata as m, json, sys\npackages = {}\nfor name in [\"torch\", \"transformers\", \"sglang\", \"sglang-kernel\", \"nvidia-cutlass-dsl\", \"numpy\"]:\n    try: packages[name] = m.version(name)\n    except m.PackageNotFoundError: packages[name] = None\ndata = {\"python\": sys.version, \"executable\": sys.executable, \"packages\": packages}\ntry:\n    import torch\n    data.update(cuda_runtime=torch.version.cuda, cuda_available=torch.cuda.is_available())\n    if data[\"cuda_available\"]:\n        x = torch.ones(1, device=\"cuda\")\n        torch.cuda.synchronize()\n        data.update(gpu=torch.cuda.get_device_name(), capability=list(torch.cuda.get_device_capability()),\n                    cuda_tensor_ok=float(x.cpu()[0]) == 1.0)\nexcept Exception as error: data[\"cuda_error\"] = repr(error)\nprint(\"REPRO_PROBE=\" + json.dumps(data))\n"
+    ],
+    "returncode": null,
+    "error": "[Errno 2] No such file or directory: '/HOME/sysu_xwzhang/sysu_xwzhang_3/hejy/envs/megabake/bin/python'"
+  },
+  "nvcc": {
+    "argv": [
+      "/HOME/sysu_xwzhang/sysu_xwzhang_3/hejy/toolchains/cuda-13.0/bin/nvcc",
+      "--version"
+    ],
+    "returncode": null,
+    "error": "[Errno 2] No such file or directory: '/HOME/sysu_xwzhang/sysu_xwzhang_3/hejy/toolchains/cuda-13.0/bin/nvcc'"
+  },
+  "model": {
+    "ready": false,
+    "reason": "model config missing: /HOME/sysu_xwzhang/sysu_xwzhang_3/hejy/models/SmolLM-135M/config.json"
+  }
+}
