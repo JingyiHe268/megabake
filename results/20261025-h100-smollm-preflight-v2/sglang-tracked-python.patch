@@ -1,0 +1,816 @@
+diff --git a/benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton_sep.py b/benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton_sep.py
+index 1c5880147..32eb5cbe7 100644
+--- a/benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton_sep.py
++++ b/benchmark/kernels/fused_moe_triton/tuning_fused_moe_triton_sep.py
+@@ -5,9 +5,12 @@ import argparse
+ import dataclasses
+ import json
+ import os
++import re
+ import time
+ from contextlib import nullcontext
+ from datetime import datetime
++from functools import lru_cache
++from pathlib import Path
+ from typing import Any, Dict, List, Tuple
+ 
+ import ray
+@@ -118,13 +121,48 @@ class KernelWrapper:
+         return time_cost
+ 
+ 
++@lru_cache(maxsize=None)
++def _ordered_topk_id_files(topk_ids_dir: str):
++    pattern = re.compile(r"topk_ids_layer(\d+)_idx(\d+)\.pt$")
++    files = []
++    for path in Path(topk_ids_dir).glob("topk_ids_layer*_idx*.pt"):
++        match = pattern.fullmatch(path.name)
++        if match:
++            files.append((int(match.group(2)), int(match.group(1)), path))
++    files.sort()
++    if len(files) < 100:
++        raise ValueError(
++            f"Need at least 100 captured topk_ids files in {topk_ids_dir}, "
++            f"found {len(files)}"
++        )
++    return tuple(path for _, _, path in files)
++
++
+ def load_topk_ids(topk_ids_dir, i: int):
+-    num_layers = 61
+-    dense_layers = 3
+-    moe_layers = num_layers - dense_layers
+-    return torch.load(
+-        f"{topk_ids_dir}/topk_ids_layer{i % moe_layers + dense_layers}_idx{i // moe_layers}.pt"
+-    )
++    """Load captures in sample-major/layer-major order for any model depth."""
++    return torch.load(_ordered_topk_id_files(topk_ids_dir)[i])
++
++
++def get_search_space(args, block_shape):
++    if args.search_space_file:
++        with open(args.search_space_file) as f:
++            search_space = json.load(f)
++        if not isinstance(search_space, list) or not all(
++            isinstance(config, dict) for config in search_space
++        ):
++            raise ValueError(
++                "--search-space-file must contain a JSON list of configs"
++            )
++    else:
++        search_space = get_configs_compute_bound()
++    if block_shape is not None:
++        block_k = block_shape[1]
++        search_space = [
++            config
++            for config in search_space
++            if block_k % config["BLOCK_SIZE_K"] == 0
++        ]
++    return search_space
+ 
+ 
+ def benchmark_config(
+@@ -794,6 +832,7 @@ class BenchmarkWorker:
+         cmp_config_files: List[str],
+         topk_ids_dir: str,
+         ep_size: int = 1,
++        enable_up_tma: bool = False,
+     ):
+         # compare performance of different configs
+         cmp_configs = []
+@@ -829,6 +868,7 @@ class BenchmarkWorker:
+                         topk_ids_list,
+                         block_shape,
+                         ep_size=ep_size,
++                        enable_up_tma=enable_up_tma,
+                     )
+                     kernel_times.append(kernel_time)
+                 print(f"batch_size={bs=}:")
+@@ -925,14 +965,15 @@ def main(args: argparse.Namespace):
+             args.cmp_configs,
+             topk_ids_dir,
+             args.ep_size,
++            args.enable_tune_up_tma,
+         )
+         return
+ 
+     if len(batch_sizes) == 1:
+         worker = BenchmarkWorker(args.seed, server_args)
+         if args.tune:
+-            search_space = get_configs_compute_bound()
+-            worker.tune(
++            search_space = get_search_space(args, block_shape)
++            up_config, down_config, up_cost, down_cost = worker.tune(
+                 batch_sizes[0],
+                 E,
+                 shard_intermediate_size,
+@@ -949,6 +990,39 @@ def main(args: argparse.Namespace):
+                 args.ep_size,
+                 enable_up_tma=args.enable_tune_up_tma,
+             )
++            batch_size = batch_sizes[0]
++            print(
++                f"Best separate configs for M={batch_size}: "
++                f"up={up_config} ({up_cost:.6f} ms), "
++                f"down={down_config} ({down_cost:.6f} ms)"
++            )
++            save_configs_sep(
++                {batch_size: sort_config(up_config)},
++                E,
++                shard_intermediate_size,
++                hidden_size,
++                topk,
++                dtype,
++                use_fp8_w8a8,
++                use_int8_w8a8,
++                use_int8_w8a16,
++                use_int4_w4a16,
++                block_shape,
++            )
++            save_configs_sep(
++                {batch_size: sort_config(down_config)},
++                E,
++                shard_intermediate_size,
++                hidden_size,
++                topk,
++                dtype,
++                use_fp8_w8a8,
++                use_int8_w8a8,
++                use_int8_w8a16,
++                use_int4_w4a16,
++                block_shape,
++                down_moe=True,
++            )
+         else:
+             cfg = {
+                 "BLOCK_SIZE_M": args.configs[0],
+@@ -999,12 +1073,7 @@ def main(args: argparse.Namespace):
+             worker_idx = (worker_idx + 1) % num_gpus
+         return ray.get(outputs)
+ 
+-    search_space = get_configs_compute_bound()
+-    if block_shape is not None:
+-        block_n, block_k = block_shape[0], block_shape[1]
+-        search_space = [
+-            config for config in search_space if block_k % config["BLOCK_SIZE_K"] == 0
+-        ]
++    search_space = get_search_space(args, block_shape)
+     filename = get_config_filename(
+         E,
+         shard_intermediate_size,
+@@ -1108,6 +1177,11 @@ if __name__ == "__main__":
+     parser.add_argument("--disable-shared-experts-fusion", action="store_true")
+     parser.add_argument("--configs", type=int, nargs="+", required=False)
+     parser.add_argument("--topk-ids-dir", type=str, required=True)
++    parser.add_argument(
++        "--search-space-file",
++        type=str,
++        help="JSON file containing an explicit list of Triton configs to tune.",
++    )
+     parser.add_argument("--cmp-configs", type=str, nargs="+", required=False)
+     parser.add_argument(
+         "--enable-tune-up-tma",
+diff --git a/python/sglang/kernels/ops/moe/fused_moe_triton_kernels.py b/python/sglang/kernels/ops/moe/fused_moe_triton_kernels.py
+index e90e0fb08..d6abe92d7 100644
+--- a/python/sglang/kernels/ops/moe/fused_moe_triton_kernels.py
++++ b/python/sglang/kernels/ops/moe/fused_moe_triton_kernels.py
+@@ -10,10 +10,12 @@ import triton.language as tl
+ 
+ from sglang.kernels.jit.utils import is_arch_support_pdl
+ from sglang.kernels.ops.quantization.fp8_kernel import (
++    fp8_dtype,
+     per_token_group_quant_fp8,
+     scaled_fp8_quant,
+     sglang_per_token_group_quant_fp8,
+ )
++from sglang.kernels.ops.quantization.fp8_utils import fp8_dtype_to_triton
+ from sglang.kernels.ops.quantization.int8_kernel import (
+     per_token_group_quant_int8,
+     per_token_quant_int8,
+@@ -53,6 +55,199 @@ elif _is_hip:
+ padding_size = get_moe_padding_size(_use_aiter)
+ 
+ 
++@triton.jit
++def fused_moe_gemm1_swiglu_quant_kernel(
++    a_ptr,
++    b_ptr,
++    b_desc,
++    c_ptr,
++    c_scale_ptr,
++    a_scale_ptr,
++    b_scale_ptr,
++    sorted_token_ids_ptr,
++    expert_ids_ptr,
++    num_tokens_post_padded_ptr,
++    N,
++    K,
++    EM,
++    num_valid_tokens,
++    stride_am,
++    stride_ak,
++    stride_be,
++    stride_bk,
++    stride_bn,
++    stride_cm,
++    stride_cn,
++    stride_csm,
++    stride_csn,
++    stride_asm,
++    stride_ask,
++    stride_bse,
++    stride_bsk,
++    stride_bsn,
++    group_n: tl.constexpr,
++    group_k: tl.constexpr,
++    BLOCK_SIZE_M: tl.constexpr,
++    BLOCK_SIZE_N: tl.constexpr,
++    BLOCK_SIZE_K: tl.constexpr,
++    GROUP_SIZE_M: tl.constexpr,
++    top_k: tl.constexpr,
++    compute_type: tl.constexpr,
++    FP8_DTYPE: tl.constexpr,
++    even_Ks: tl.constexpr,
++    c_sorted: tl.constexpr,
++    filter_expert: tl.constexpr,
++    USE_GDC: tl.constexpr = False,
++    GDC_EARLY: tl.constexpr = False,
++):
++    """FP8 blockwise GEMM1 with an in-register SwiGLU+quant epilogue.
++
++    ``B`` keeps the checkpoint's [gate; up] row layout. Each program computes
++    matching gate and up tiles, rounds both to ``compute_type`` exactly where
++    the unfused GEMM stores them, applies the same fast SiLU used by
++    ``silu_and_mul``, and writes GEMM2-ready FP8 values plus one dynamic scale
++    per row/group. BLOCK_SIZE_N is one output quantization group.
++    """
++    if USE_GDC:
++        tl.extra.cuda.gdc_wait()
++        if GDC_EARLY:
++            tl.extra.cuda.gdc_launch_dependents()
++
++    pid = tl.program_id(axis=0)
++    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
++    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
++    num_pid_in_group = GROUP_SIZE_M * num_pid_n
++    group_id = pid // num_pid_in_group
++    first_pid_m = group_id * GROUP_SIZE_M
++    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
++    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
++    pid_n = (pid % num_pid_in_group) // group_size_m
++
++    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
++    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
++        return
++
++    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
++    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
++    token_mask = offs_token < num_valid_tokens
++    off_experts_i32 = tl.load(expert_ids_ptr + pid_m)
++    off_experts = off_experts_i32.to(tl.int64)
++    if filter_expert and off_experts == -1:
++        return
++
++    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
++    offs_k = tl.arange(0, BLOCK_SIZE_K)
++    a_ptrs = a_ptr + (
++        offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
++    )
++    if b_desc is None:
++        b_gate_ptrs = (
++            b_ptr
++            + off_experts * stride_be
++            + offs_k[:, None] * stride_bk
++            + offs_n[None, :] * stride_bn
++        )
++        b_up_ptrs = b_gate_ptrs + N * stride_bn
++
++    a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
++    gate_scale_ptrs = (
++        b_scale_ptr
++        + off_experts * stride_bse
++        + (pid_n * BLOCK_SIZE_N // group_n) * stride_bsn
++    )
++    up_scale_ptrs = (
++        b_scale_ptr
++        + off_experts * stride_bse
++        + ((N + pid_n * BLOCK_SIZE_N) // group_n) * stride_bsn
++    )
++
++    gate_acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
++    up_acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
++    for k_start in range(0, K, BLOCK_SIZE_K):
++        if even_Ks:
++            a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
++        else:
++            a = tl.load(
++                a_ptrs,
++                mask=token_mask[:, None] & (offs_k[None, :] < K - k_start),
++                other=0.0,
++            )
++
++        if b_desc is not None:
++            b_gate = (
++                b_desc.load([off_experts_i32, pid_n * BLOCK_SIZE_N, k_start])
++                .reshape(BLOCK_SIZE_N, BLOCK_SIZE_K)
++                .T
++            )
++            b_up = (
++                b_desc.load([off_experts_i32, N + pid_n * BLOCK_SIZE_N, k_start])
++                .reshape(BLOCK_SIZE_N, BLOCK_SIZE_K)
++                .T
++            )
++        elif even_Ks:
++            b_gate = tl.load(b_gate_ptrs)
++            b_up = tl.load(b_up_ptrs)
++        else:
++            k_mask = offs_k[:, None] < K - k_start
++            b_gate = tl.load(b_gate_ptrs, mask=k_mask, other=0.0)
++            b_up = tl.load(b_up_ptrs, mask=k_mask, other=0.0)
++
++        offs_ks = k_start // group_k
++        a_scale = tl.load(
++            a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
++        )
++        gate_scale = tl.load(gate_scale_ptrs + offs_ks * stride_bsk)
++        up_scale = tl.load(up_scale_ptrs + offs_ks * stride_bsk)
++        gate_acc += tl.dot(a, b_gate) * (a_scale[:, None] * gate_scale)
++        up_acc += tl.dot(a, b_up) * (a_scale[:, None] * up_scale)
++
++        a_ptrs += BLOCK_SIZE_K * stride_ak
++        if b_desc is None:
++            b_gate_ptrs += BLOCK_SIZE_K * stride_bk
++            b_up_ptrs += BLOCK_SIZE_K * stride_bk
++
++    # Match the unfused boundary: GEMM1 rounds to BF16/FP16 before SwiGLU.
++    gate_b = gate_acc.to(compute_type)
++    up_b = up_acc.to(compute_type)
++    gate_f = gate_b.to(tl.float32)
++    exp_neg = tl.inline_asm_elementwise(
++        "{ mul.ftz.f32 $0, $1, 0fBFB8AA3B; ex2.approx.ftz.f32 $0, $0; }",
++        "=f,f",
++        [gate_f],
++        dtype=tl.float32,
++        is_pure=True,
++        pack=1,
++    )
++    silu_f = tl.inline_asm_elementwise(
++        "div.approx.ftz.f32 $0, $1, $2;",
++        "=f,f,f",
++        [gate_f, 1.0 + exp_neg],
++        dtype=tl.float32,
++        is_pure=True,
++        pack=1,
++    )
++    activated = (silu_f * up_b.to(tl.float32)).to(compute_type).to(tl.float32)
++
++    amax = tl.maximum(tl.max(tl.abs(activated), axis=1), 1.0e-10)
++    out_scale = amax / 448.0
++    out_fp8 = tl.clamp(activated / out_scale[:, None], -448.0, 448.0).to(
++        FP8_DTYPE
++    )
++
++    out_rows = offs_token_id if c_sorted else offs_token
++    c_ptrs = c_ptr + out_rows[:, None] * stride_cm + offs_n[None, :] * stride_cn
++    c_mask = token_mask[:, None] & (offs_n[None, :] < N)
++    tl.store(c_ptrs, out_fp8, mask=c_mask)
++    tl.store(
++        c_scale_ptr + out_rows * stride_csm + pid_n * stride_csn,
++        out_scale,
++        mask=token_mask,
++    )
++
++    if USE_GDC and not GDC_EARLY:
++        tl.extra.cuda.gdc_launch_dependents()
++
++
+ def support_tensor_descriptor():
+     return _support_tensor_descriptor
+ 
+@@ -779,6 +974,95 @@ def _get_b_tma_desc_cached(B: torch.Tensor, block_n: int, block_k: int):
+     return desc
+ 
+ 
++def invoke_fused_moe_gemm1_swiglu_quant_kernel(
++    A: torch.Tensor,
++    B: torch.Tensor,
++    C: torch.Tensor,
++    C_scale: torch.Tensor,
++    A_scale: torch.Tensor,
++    B_scale: torch.Tensor,
++    sorted_token_ids: torch.Tensor,
++    expert_ids: torch.Tensor,
++    num_tokens_post_padded: torch.Tensor,
++    topk_ids: torch.Tensor,
++    config: Dict[str, Any],
++    compute_type: tl.dtype,
++    block_shape: List[int],
++    *,
++    c_sorted: bool,
++    b_use_tma: bool,
++    filter_expert: bool,
++) -> None:
++    """Launch the model-specific FP8 GEMM1+SwiGLU+quant fast path."""
++    group_n, group_k = block_shape
++    assert A.dtype == fp8_dtype and A_scale is not None
++    assert B.dtype == fp8_dtype and B_scale is not None
++    assert B.shape[1] % 2 == 0
++    assert B.shape[1] // 2 == C.shape[1]
++    assert C.dtype == fp8_dtype and C.is_contiguous()
++    assert C_scale.dtype == torch.float32 and C_scale.is_contiguous()
++    assert config["BLOCK_SIZE_N"] == group_n == group_k
++    assert C.shape[1] % group_k == 0
++
++    if b_use_tma:
++        _set_triton_tma_allocator()
++        b_desc = _get_b_tma_desc_cached(
++            B, config["BLOCK_SIZE_N"], config["BLOCK_SIZE_K"]
++        )
++    else:
++        b_desc = None
++
++    grid = lambda META: (
++        triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
++        * triton.cdiv(C.shape[1], META["BLOCK_SIZE_N"]),
++    )
++    pdl_kwargs = (
++        {"USE_GDC": True, "launch_pdl": True, "GDC_EARLY": A.shape[0] <= 512}
++        if is_arch_support_pdl()
++        else {}
++    )
++    fused_moe_gemm1_swiglu_quant_kernel[grid](
++        A,
++        B,
++        b_desc,
++        C,
++        C_scale,
++        A_scale,
++        B_scale,
++        sorted_token_ids,
++        expert_ids,
++        num_tokens_post_padded,
++        C.shape[1],
++        B.shape[2],
++        sorted_token_ids.shape[0],
++        topk_ids.numel(),
++        A.stride(0),
++        A.stride(1),
++        B.stride(0),
++        B.stride(2),
++        B.stride(1),
++        C.stride(0),
++        C.stride(1),
++        C_scale.stride(0),
++        C_scale.stride(1),
++        A_scale.stride(0),
++        A_scale.stride(1),
++        B_scale.stride(0),
++        B_scale.stride(2),
++        B_scale.stride(1),
++        group_n=group_n,
++        group_k=group_k,
++        top_k=topk_ids.shape[1],
++        compute_type=compute_type,
++        FP8_DTYPE=fp8_dtype_to_triton(fp8_dtype),
++        even_Ks=B.shape[2] % config["BLOCK_SIZE_K"] == 0,
++        c_sorted=c_sorted,
++        filter_expert=filter_expert,
++        **pdl_kwargs,
++        **config,
++    )
++
++
+ def invoke_fused_moe_kernel(
+     A: torch.Tensor,
+     B: torch.Tensor,
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index a5e613f08..8602db36f 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -838,6 +838,13 @@ class Envs:
+     # not compatible with runtime weight updates or EPLB expert rearrangement,
+     # both of which assume the checkpoint's halves layout.
+     SGLANG_OPT_FUSE_SWIGLU_INTERLEAVED = EnvBool(False)
++    # Fuse block-FP8 MoE GEMM1, SwiGLU, and the dynamic per-token-group
++    # quantization consumed by GEMM2. Unlike the BF16 interleaved path above,
++    # this keeps checkpoint W13 in its native [gate; up] layout so the
++    # [128, 128] block scales remain valid. The fused epilogue writes FP8 data
++    # and scales directly in the expert-sorted layout used by the down TMA
++    # path. Currently restricted to CUDA Triton W8A8 block quantization.
++    SGLANG_OPT_FUSE_MOE_GEMM1_SWIGLU_FP8 = EnvBool(False)
+     # Fuse the `residual_add + RMSNorm + zero-pad` triplet that appears
+     # before the MoE block for models whose MoE input hidden_size must be
+     # padded up to a stride (e.g. GPT-OSS MXFP4 needs pad to multiple of
+diff --git a/python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py b/python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py
+index ce665e936..40d24d9fb 100644
+--- a/python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py
++++ b/python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py
+@@ -17,15 +17,21 @@ import triton.language as tl
+ from sglang.kernels.jit.utils import is_arch_support_pdl
+ from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
+     act_and_mul_triton,
++    invoke_fused_moe_gemm1_swiglu_quant_kernel,
+     invoke_fused_moe_kernel,
+     moe_sum_reduce_triton,
+     support_tensor_descriptor,
+ )
++from sglang.kernels.ops.quantization.fp8_kernel import (
++    fp8_dtype,
++    sglang_per_token_group_quant_fp8,
++)
+ from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+ from sglang.srt.distributed import get_tp_group
+ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+     use_symmetric_memory,
+ )
++from sglang.srt.environ import envs
+ from sglang.srt.layers.dp_attention import is_allocation_symmetric
+ from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+ from sglang.srt.layers.moe.utils import get_moe_padding_size, get_moe_runner_backend
+@@ -121,6 +127,64 @@ def _validate_fused_swiglu_interleaved(
+         )
+ 
+ 
++def _use_fused_gemm1_swiglu_fp8(
++    *,
++    hidden_states: torch.Tensor,
++    w1: torch.Tensor,
++    b1: Optional[torch.Tensor],
++    use_fp8_w8a8: bool,
++    use_int8_w8a8: bool,
++    use_int8_w8a16: bool,
++    use_int4_w4a16: bool,
++    block_shape: Optional[List[int]],
++    a2_scale: Optional[torch.Tensor],
++    activation: str,
++    is_gated: bool,
++    apply_router_weight_on_input: bool,
++    gemm1_alpha: Optional[float],
++    gemm1_limit: Optional[float],
++    swiglu_limit: Optional[float],
++    hooks: Optional[Any],
++    fuse_swiglu_interleaved: bool,
++) -> bool:
++    if not envs.SGLANG_OPT_FUSE_MOE_GEMM1_SWIGLU_FP8.get():
++        return False
++
++    supported = (
++        _is_cuda
++        and use_fp8_w8a8
++        and not any((use_int8_w8a8, use_int8_w8a16, use_int4_w4a16))
++        and block_shape is not None
++        and list(block_shape) == [128, 128]
++        and a2_scale is None
++        and activation == "silu"
++        and is_gated
++        and b1 is None
++        and not apply_router_weight_on_input
++        and gemm1_alpha is None
++        and gemm1_limit is None
++        and swiglu_limit is None
++        and hooks is None
++        and not fuse_swiglu_interleaved
++        and hidden_states.dtype == torch.bfloat16
++        and w1.dtype == fp8_dtype
++        and w1.shape[1] % 2 == 0
++        and (w1.shape[1] // 2) % block_shape[1] == 0
++    )
++    if not supported:
++        logger.warning_once(
++            "SGLANG_OPT_FUSE_MOE_GEMM1_SWIGLU_FP8 was requested, but this "
++            "MoE call is outside the CUDA BF16 + dynamic block-FP8 [128,128] "
++            "fast-path contract; falling back to the unfused sequence."
++        )
++    else:
++        logger.info_once(
++            "Enabled fused Triton MoE GEMM1 + SwiGLU + dynamic block-FP8 "
++            "quant epilogue (group=128)."
++        )
++    return supported
++
++
+ def _use_moe_sum_reduce_torch_compile(num_tokens: int) -> bool:
+     return num_tokens <= 32 and not is_batch_invariant_mode_enabled()
+ 
+@@ -539,6 +603,26 @@ def _fused_moe_kernel_sequence(
+     topk = topk_ids.shape[1]
+     compute_type = tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
+ 
++    fuse_gemm1_swiglu_fp8 = _use_fused_gemm1_swiglu_fp8(
++        hidden_states=hidden_states,
++        w1=w1,
++        b1=b1,
++        use_fp8_w8a8=use_fp8_w8a8,
++        use_int8_w8a8=use_int8_w8a8,
++        use_int8_w8a16=use_int8_w8a16,
++        use_int4_w4a16=use_int4_w4a16,
++        block_shape=block_shape,
++        a2_scale=a2_scale,
++        activation=activation,
++        is_gated=is_gated,
++        apply_router_weight_on_input=apply_router_weight_on_input,
++        gemm1_alpha=gemm1_alpha,
++        gemm1_limit=gemm1_limit,
++        swiglu_limit=swiglu_limit,
++        hooks=hooks,
++        fuse_swiglu_interleaved=fuse_swiglu_interleaved,
++    )
++
+     # LoRA hooks consume and update route-major intermediate buffers. The TMA
+     # down path keeps those buffers in expert-sorted, block-padded order, which
+     # is incompatible with the hook contract.
+@@ -590,7 +674,52 @@ def _fused_moe_kernel_sequence(
+         and (not use_int4_w4a16)
+     )
+ 
+-    if fuse_swiglu_interleaved:
++    fused_a2_scale = None
++    if fuse_gemm1_swiglu_fp8:
++        assert block_shape is not None and w1_scale is not None
++        # One CTA owns exactly one output quantization group. Keeping W13 in
++        # [gate; up] layout preserves its block-scale mapping; the specialized
++        # kernel loads both halves and emits GEMM2-ready FP8 directly.
++        fused_up_config = dict(config)
++        fused_up_config["BLOCK_SIZE_N"] = block_shape[1]
++        fused_up_config["BLOCK_SIZE_K"] = block_shape[1]
++        if a1_q is None:
++            gemm1_input, gemm1_input_scale = sglang_per_token_group_quant_fp8(
++                hidden_states, block_shape[1]
++            )
++        else:
++            gemm1_input, gemm1_input_scale = a1_q, a1_scale
++        assert gemm1_input_scale is not None
++        intermediate_cache1 = None
++        intermediate_cache2 = torch.empty(
++            (total_tokens, N // 2),
++            device=hidden_states.device,
++            dtype=fp8_dtype,
++        )
++        fused_a2_scale = torch.empty(
++            (total_tokens, (N // 2) // block_shape[1]),
++            device=hidden_states.device,
++            dtype=torch.float32,
++        )
++        invoke_fused_moe_gemm1_swiglu_quant_kernel(
++            gemm1_input,
++            w1,
++            intermediate_cache2,
++            fused_a2_scale,
++            gemm1_input_scale,
++            w1_scale,
++            sorted_token_ids,
++            expert_ids,
++            num_tokens_post_padded,
++            topk_ids,
++            fused_up_config,
++            compute_type,
++            block_shape,
++            c_sorted=down_moe_use_tma,
++            b_use_tma=up_moe_use_tma,
++            filter_expert=filter_expert,
++        )
++    elif fuse_swiglu_interleaved:
+         _validate_fused_swiglu_interleaved(
+             activation=activation,
+             is_gated=is_gated,
+@@ -618,34 +747,35 @@ def _fused_moe_kernel_sequence(
+             dtype=hidden_states.dtype,
+         )
+ 
+-    invoke_fused_moe_kernel(
+-        a1_q if a1_q is not None else hidden_states,
+-        w1,
+-        b1,
+-        gemm1_out,
+-        a1_scale,
+-        w1_scale,
+-        w1_zp,
+-        topk_weights,
+-        topk_ids,
+-        sorted_token_ids,
+-        expert_ids,
+-        num_tokens_post_padded,
+-        apply_router_weight_on_input,
+-        topk,
+-        config,
+-        compute_type=compute_type,
+-        use_fp8_w8a8=use_fp8_w8a8,
+-        use_int8_w8a8=use_int8_w8a8,
+-        use_int8_w8a16=use_int8_w8a16,
+-        use_int4_w4a16=use_int4_w4a16,
+-        per_channel_quant=per_channel_quant,
+-        block_shape=block_shape,
+-        c_sorted=down_moe_use_tma,
+-        b_use_tma=up_moe_use_tma,
+-        filter_expert=filter_expert,
+-        fuse_swiglu=fuse_swiglu_interleaved,
+-    )
++    if not fuse_gemm1_swiglu_fp8:
++        invoke_fused_moe_kernel(
++            a1_q if a1_q is not None else hidden_states,
++            w1,
++            b1,
++            gemm1_out,
++            a1_scale,
++            w1_scale,
++            w1_zp,
++            topk_weights,
++            topk_ids,
++            sorted_token_ids,
++            expert_ids,
++            num_tokens_post_padded,
++            apply_router_weight_on_input,
++            topk,
++            config,
++            compute_type=compute_type,
++            use_fp8_w8a8=use_fp8_w8a8,
++            use_int8_w8a8=use_int8_w8a8,
++            use_int8_w8a16=use_int8_w8a16,
++            use_int4_w4a16=use_int4_w4a16,
++            per_channel_quant=per_channel_quant,
++            block_shape=block_shape,
++            c_sorted=down_moe_use_tma,
++            b_use_tma=up_moe_use_tma,
++            filter_expert=filter_expert,
++            fuse_swiglu=fuse_swiglu_interleaved,
++        )
+ 
+     if hooks and hooks.after_gate_up:
+         # Hooks expect intermediate_cache1 shaped (num_tokens, topk, N); the
+@@ -659,7 +789,7 @@ def _fused_moe_kernel_sequence(
+             topk_ids,
+         )
+ 
+-    if not fuse_swiglu_interleaved:
++    if not (fuse_swiglu_interleaved or fuse_gemm1_swiglu_fp8):
+         intermediate_cache2 = torch.empty(
+             (total_tokens, N // 2),
+             device=hidden_states.device,
+@@ -667,7 +797,7 @@ def _fused_moe_kernel_sequence(
+         )
+ 
+     # Activation function with multiplication
+-    if fuse_swiglu_interleaved:
++    if fuse_swiglu_interleaved or fuse_gemm1_swiglu_fp8:
+         # silu(gate) * up was already applied by the up-GEMM epilogue.
+         pass
+     elif activation == "silu" and is_gated:
+@@ -834,7 +964,7 @@ def _fused_moe_kernel_sequence(
+                 else out_hidden_states.unsqueeze(0)
+             )
+         ),
+-        a2_scale,
++        fused_a2_scale if fuse_gemm1_swiglu_fp8 else a2_scale,
+         w2_scale,
+         w2_zp,
+         topk_weights,
+diff --git a/python/sglang/srt/models/qwen2_moe.py b/python/sglang/srt/models/qwen2_moe.py
+index ea6cf62f4..17a7d315f 100644
+--- a/python/sglang/srt/models/qwen2_moe.py
++++ b/python/sglang/srt/models/qwen2_moe.py
+@@ -19,6 +19,7 @@
+ """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
+ 
+ import logging
++import os
+ from contextlib import nullcontext
+ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+ 
+@@ -646,6 +647,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
+         # router_logits: (num_tokens, n_experts)
+         router_logits, _ = self.gate(hidden_states)
+         topk_output = self.topk(hidden_states, router_logits)
++        self._maybe_dump_topk_ids(topk_output.topk_ids)
+         if defer_finalize:
+             if not self.supports_deferred_finalize:
+                 raise RuntimeError(
+@@ -663,6 +665,29 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
+             topk_output = self._append_shared_to_topk_output(topk_output, hidden_states)
+         return self.experts(hidden_states, topk_output)
+ 
++    def _maybe_dump_topk_ids(self, topk_ids: torch.Tensor) -> None:
++        """Optionally persist real routing decisions for offline MoE tuning.
++
++        This path is disabled unless SGLANG_MOE_TOPK_DUMP_DIR is set.  It is
++        intended for short eager-mode profiling runs, not production serving.
++        """
++        dump_dir = os.getenv("SGLANG_MOE_TOPK_DUMP_DIR")
++        if not dump_dir:
++            return
++        min_tokens = int(os.getenv("SGLANG_MOE_TOPK_DUMP_MIN_TOKENS", "1024"))
++        max_samples = int(os.getenv("SGLANG_MOE_TOPK_DUMP_MAX_SAMPLES", "3"))
++        if topk_ids.shape[0] < min_tokens:
++            return
++        save_idx = getattr(self, "_topk_dump_idx", 0)
++        if save_idx >= max_samples:
++            return
++        os.makedirs(dump_dir, exist_ok=True)
++        path = os.path.join(
++            dump_dir, f"topk_ids_layer{self.layer_id}_idx{save_idx}.pt"
++        )
++        torch.save(topk_ids.detach().cpu(), path)
++        self._topk_dump_idx = save_idx + 1
++
+     def _gate_shared_output_out_of_place(
+         self,
+         hidden_states: torch.Tensor,
