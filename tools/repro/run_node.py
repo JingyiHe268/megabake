@@ -64,6 +64,16 @@ def probe(python, env):
     return result
 
 
+def tool_environment(base, python, cuda_home, python_path):
+    env = base.copy()
+    env["PYTHONPATH"] = str(python_path)
+    env["CUDA_HOME"] = str(cuda_home)
+    # Invoking venv/bin/python does not activate venv/bin for subprocesses (e.g. ninja).
+    env["PATH"] = str(Path(python).parent) + ":" + str(cuda_home) + "/bin:" + base.get("PATH", "")
+    env["LD_LIBRARY_PATH"] = str(cuda_home) + "/lib64:" + base.get("LD_LIBRARY_PATH", "")
+    return env
+
+
 def fingerprint_model(path):
     path = Path(path)
     if not (path / "config.json").is_file():
@@ -170,11 +180,16 @@ def main():
             if p.is_file():
                 hashes[relative] = hashlib.sha256(p.read_bytes()).hexdigest()
         metadata["sglang_benchmark_sha256"] = hashes
-        metadata["sglang_probe"] = probe(config["sglang_python"], env)
-        megabake_env = env.copy()
-        megabake_env["CUDA_HOME"] = config["cuda_home"]
-        megabake_env["PATH"] = config["cuda_home"] + "/bin:" + env.get("PATH", "")
+        baseline_env = tool_environment(
+            env, config["sglang_python"], Path(config["remote_base"]) / "toolchains/cuda-12.9", sglang / "python")
+        metadata["sglang_probe"] = probe(config["sglang_python"], baseline_env)
+        megabake_env = tool_environment(env, config["megabake_python"], config["cuda_home"], ROOT / "src")
         metadata["megabake_probe"] = probe(config["megabake_python"], megabake_env)
+        metadata["tool_paths"] = {
+            "sglang_ninja": shutil.which("ninja", path=baseline_env["PATH"]),
+            "sglang_cuda_home": baseline_env["CUDA_HOME"],
+            "megabake_cuda_home": megabake_env["CUDA_HOME"],
+        }
         metadata["nvcc"] = capture([config["cuda_home"] + "/bin/nvcc", "--version"])
         metadata["model"] = fingerprint_model(config["model_path"])
         write(folder / "environment.json", metadata)
@@ -221,11 +236,6 @@ def main():
                                "--random-seed", "42", "--result-filename", str(raw), "--run-name", args.run_id]
                     if graph == "off":
                         command.append("--disable-cuda-graph")
-                    baseline_env = env.copy()
-                    baseline_env["PYTHONPATH"] = str(sglang / "python")
-                    # SGLang's existing CUDA 12.9 environment remains untouched.
-                    baseline_env["CUDA_HOME"] = str(Path(config["remote_base"]) / "toolchains/cuda-12.9")
-                    baseline_env["PATH"] = baseline_env["CUDA_HOME"] + "/bin:" + env.get("PATH", "")
                     stage = run_stage(name, command, folder, baseline_env, config["timeout_seconds"], sglang)
                     if stage["state"] == "complete" and (not raw.exists() or not raw.read_text().strip()):
                         stage.update(state="failed", error="benchmark returned no measurements")

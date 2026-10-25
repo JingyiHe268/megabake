@@ -54,7 +54,7 @@ def deploy(config):
     call(["scp", "-o", "BatchMode=yes", bundle, f"{config['ssh_host']}:{destination}"])
     # Shell code is sent as a positional argument to bash, with every value quoted.
     script = """set -euo pipefail
-bundle=$1; repo=$2; branch=$3; revision=$4; digest=$5
+bundle=$1; repo=$2; branch=$3; revision=$4; digest=$5; origin=$6
 test "$(sha256sum "$bundle" | cut -d' ' -f1)" = "$digest"
 if [ ! -e "$repo" ]; then
   git clone --branch "$branch" "$bundle" "$repo"
@@ -67,11 +67,12 @@ else
 fi
 git -C "$repo" config user.name JingyiHe268
 git -C "$repo" config user.email hejy268@mail2.sysu.edu.cn
+git -C "$repo" remote set-url origin "$origin"
 test "$(git -C "$repo" rev-parse HEAD)" = "$revision"
 echo "DEPLOYED_COMMIT=$revision"
 """
     remote(config, shlex.join(["bash", "-c", script, "repro-deploy", destination,
-                               config["remote_repo"], branch, revision, digest]))
+                               config["remote_repo"], branch, revision, digest, config["repository"]]))
     (staging / "deployment.json").write_text(json.dumps(
         {"commit": revision, "bundle_sha256": digest, "remote_repo": config["remote_repo"]}, indent=2) + "\n")
 

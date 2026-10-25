@@ -69,17 +69,23 @@ MegaBake 必须使用独立环境 `~/hejy/envs/megabake`。
 
 本次实测 SGLang：Python 3.10、PyTorch 2.13.0+cu129、transformers 5.12.1、CuTe 4.6.2。
 原版 MegaBake 要求 Python >=3.12、PyTorch 2.14.x、CuTe 4.8.0、CUDA 13.0 开发工具链。
-当前没有符合要求的独立 MegaBake 环境，服务器和计算节点也无法解析外部域名。
+已找到用户目录的 Python 3.12.13，以及集群 CUDA 13.0：`/APP/u22/ai_x86/CUDA/13.0`。
+配置已使用这个工具链；不直接加载会把 stubs 加入运行时库路径的集群 module。
+独立 MegaBake 环境可以用已有 Python 创建，所需 Python 包仍待下载。
+本次连接中，登录节点的 `resolvectl query pypi.org` 返回
+`No appropriate name servers or networks for name found`，不是根据计算节点限制推测登录节点不能下载。
 
 在已有可用 Python 3.13 和 CUDA 13 工具链、可访问依赖源后，在服务器执行：
 
 ```bash
-python3.13 -m venv /HOME/sysu_xwzhang/sysu_xwzhang_3/hejy/envs/megabake
+/HOME/sysu_xwzhang/sysu_xwzhang_3/.local/bin/uv venv \
+  --python /HOME/sysu_xwzhang/sysu_xwzhang_3/.local/share/uv/python/cpython-3.12-linux-x86_64-gnu/bin/python3.12 \
+  /HOME/sysu_xwzhang/sysu_xwzhang_3/hejy/envs/megabake
 source /HOME/sysu_xwzhang/sysu_xwzhang_3/hejy/envs/megabake/bin/activate
-export CUDA_HOME=/HOME/sysu_xwzhang/sysu_xwzhang_3/hejy/toolchains/cuda-13.0
+export CUDA_HOME=/APP/u22/ai_x86/CUDA/13.0
 export PATH="$CUDA_HOME/bin:$PATH"
 cd /HOME/sysu_xwzhang/sysu_xwzhang_3/hejy/megabake
-python -m pip install -r requirements.txt
+/HOME/sysu_xwzhang/sysu_xwzhang_3/.local/bin/uv pip install -r requirements.txt
 ```
 
 无外网时，在同架构 Linux/Python 的联网机器准备完整 wheelhouse，再用 SCP 传输，安装时使用
@@ -90,6 +96,7 @@ macOS 下载的本机 wheels 不能直接代替 Linux wheels；CUDA toolkit 与 
 [Forward Compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/forward-compatibility.html)
 路径，但必须满足兼容表且实际通过 CUDA 张量和 CuTe 编译检查。单纯修改 `CUDA_HOME` 不会升级驱动。
 本流程不修改系统驱动，也不把 12.9 环境伪装成原版 CUDA 13 复现。
+当前官方兼容表没有列出 R550；不能仅凭 H100 的型号认定 CUDA 13 兼容包必然可用。
 
 共同模型默认选择上游已验证的 SmolLM-135M，revision 固定为
 `1d461723eec654e65efdc40cf49301c89c0c92f4`。
@@ -101,6 +108,7 @@ macOS 下载的本机 wheels 不能直接代替 Linux wheels；CUDA toolkit 与 
 ## 测试口径
 
 - 基线：已有 SGLang `bench_one_batch`，BF16、TP=1、batch=1、input=4、output=32；CUDA Graph 开和关各重复三次。
+- 启动时将所选 `.venv/bin` 放到 PATH 首位，让已有 ninja 等 JIT 工具可用；不修改虚拟环境内容。
 - 原版复现：`benchmarks/full_model.py` 中 eager、Inductor、Inductor CUDA Graph、MegaBake；20 samples、5 warmup、KV capacity=128。
 - 两者使用同一个本地模型路径，并记录模型文件哈希、完整命令、源码 commit、SGLang 未提交 Python patch、软件包清单、GPU、Slurm 分配和退出码。
 - SGLang 包含引擎/采样工作，原版脚本主要计模型 forward，缓存初始化与上下文推进也不同。因此报告并列保留原始数据，**不自动计算 SGLang / MegaBake 加速比**。
