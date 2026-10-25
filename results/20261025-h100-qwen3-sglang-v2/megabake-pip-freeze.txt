@@ -1,0 +1,1 @@
+/HOME/sysu_xwzhang/sysu_xwzhang_3/hejy/envs/megabake/bin/python: No module named pip
