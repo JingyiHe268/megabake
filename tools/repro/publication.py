@@ -78,9 +78,10 @@ def chart(rows, metric, title, unit, description=None, footnote=None):
 def export_mock(directory):
     data = json.loads((directory / "mock-forward.json").read_text())
     status = json.loads((directory / "status.json").read_text())
+    decode = data.get("mode") == "decode"
     limit = .01 if data.get("workload") == "mlp" else .02
     errors = [data.get("relative_l2"), data.get("inductor_relative_l2")]
-    if data.get("mode") == "decode":
+    if decode:
         cache_errors = data.get("cache_relative_l2", {})
         if (data.get("cache_state_validation") is not True or data.get("batch_size") != 1
                 or data.get("output_tokens") != 1 or data.get("context_length") != data.get("rows")
@@ -117,7 +118,7 @@ def export_mock(directory):
     csv_path.write_text(stream.getvalue())
     md_path = destination / "performance.md"
     md_path.write_text(
-        f'# MOCK {data["workload"]} forward performance\n\n'
+        f'# MOCK {data["workload"]} {"single-token decode" if decode else "forward"} performance\n\n'
         f'Random weights, seed {data["seed"]}, rows {data["rows"]}, layers {data.get("layers")}, '
         f'{data["dtype"]}, {data["samples"]} samples per variant.\n\n'
         f'Profile: {data["profile"]}. Torch {data["torch"]}; CuTe {data["cute"]}; GPU {data["gpu"]}.\n\n'
@@ -125,11 +126,11 @@ def export_mock(directory):
         'No SGLang engine comparison or pretrained-model accuracy claim.\n\n'
         f'Correctness relative L2: MegaBake {data["relative_l2"]:.6g}, Inductor {data["inductor_relative_l2"]:.6g}. '
         f'MegaBake workload kernels: 1. Execution commit: `{data["execution_commit"]}`.\n\n'
-        '| Variant | Median forward latency (ms) |\n| --- | ---: |\n'
+        f'| Variant | Median {"decode" if decode else "forward"} latency (ms) |\n| --- | ---: |\n'
         + ''.join(f'| {row["variant"]} | {row["median_call_ms"]:.6f} |\n' for row in rows))
     svg_path = destination / "mock_forward_ms.svg"
     svg_path.write_text(chart(
-        rows, "median_call_ms", f'MOCK {data["workload"]}: synchronized forward latency', "ms",
+        rows, "median_call_ms", f'MOCK {data["workload"]}: synchronized {"decode" if decode else "forward"} latency', "ms",
         description=f'Random weights · BF16 · rows={data["rows"]} · layers={data.get("layers")} · seed={data["seed"]}',
         footnote="One trial; CUDA 12 experimental profile. Same-model forward comparison, not SGLang engine latency."))
     return [csv_path, md_path, svg_path]
