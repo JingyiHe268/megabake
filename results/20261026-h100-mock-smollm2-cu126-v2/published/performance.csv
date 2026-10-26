@@ -1,0 +1,5 @@
+variant,workload,mock_weights,rows,layers,dtype,seed,samples,median_call_ms,torch,cute,profile,gpu,execution_commit
+eager,smollm,True,4,2,bfloat16,20261026,20,2.2300444543361664,2.14.0+cu126,4.8.0,experimental CUDA 12; not the upstream cu130 environment,NVIDIA H100 80GB HBM3,7e5cb1ba06101bd3432b9ab7d5d4cc0d819bcb39
+eager_cuda_graph,smollm,True,4,2,bfloat16,20261026,20,0.3157593309879303,2.14.0+cu126,4.8.0,experimental CUDA 12; not the upstream cu130 environment,NVIDIA H100 80GB HBM3,7e5cb1ba06101bd3432b9ab7d5d4cc0d819bcb39
+inductor,smollm,True,4,2,bfloat16,20261026,20,0.532444566488266,2.14.0+cu126,4.8.0,experimental CUDA 12; not the upstream cu130 environment,NVIDIA H100 80GB HBM3,7e5cb1ba06101bd3432b9ab7d5d4cc0d819bcb39
+megabake,smollm,True,4,2,bfloat16,20261026,20,2.027297392487526,2.14.0+cu126,4.8.0,experimental CUDA 12; not the upstream cu130 environment,NVIDIA H100 80GB HBM3,7e5cb1ba06101bd3432b9ab7d5d4cc0d819bcb39
