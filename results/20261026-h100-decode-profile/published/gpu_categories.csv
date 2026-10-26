@@ -1,0 +1,118 @@
+engine,lead_decode_steps,first_cached_tokens,steps,category,us_per_step
+sglang,0,128,16,linear algebra,520.4185000000001
+sglang,0,128,16,attention / softmax,236.32306249999937
+sglang,0,128,16,norm / position / activation,158.4518749999996
+sglang,0,128,16,other / fused,113.5223124999997
+sglang,0,128,16,sampling,14.603937499999999
+sglang,0,128,16,copy / indexing,17.818375000000003
+sglang,2032,2160,16,linear algebra,509.21537500000005
+sglang,2032,2160,16,attention / softmax,348.4776874999993
+sglang,2032,2160,16,norm / position / activation,160.22868749999964
+sglang,2032,2160,16,other / fused,110.64293749999982
+sglang,2032,2160,16,sampling,14.0979375
+sglang,2032,2160,16,copy / indexing,17.630000000000003
+sglang,4079,4207,16,linear algebra,507.33112499999976
+sglang,4079,4207,16,attention / softmax,367.0646874999999
+sglang,4079,4207,16,norm / position / activation,160.4079374999996
+sglang,4079,4207,16,other / fused,110.45981249999967
+sglang,4079,4207,16,sampling,14.0419375
+sglang,4079,4207,16,copy / indexing,17.8120625
+megabake,0,128,16,megakernel,1597.442
+megabake,0,128,16,sampling,13.462000000000002
+megabake,0,128,16,copy / indexing,1.7341250000000004
+megabake,2032,2160,16,megakernel,1862.7526874999999
+megabake,2032,2160,16,sampling,13.255687500000002
+megabake,2032,2160,16,copy / indexing,1.6060625000000002
+megabake,4079,4207,16,megakernel,2078.5983125000002
+megabake,4079,4207,16,sampling,13.153875000000001
+megabake,4079,4207,16,copy / indexing,1.5560000000000003
+tensor_eager_graph,0,128,16,copy / indexing,1406.5624375000011
+tensor_eager_graph,0,128,16,linear algebra,1181.1704999999977
+tensor_eager_graph,0,128,16,other / fused,1835.7040000000025
+tensor_eager_graph,0,128,16,attention / softmax,126.90737500000033
+tensor_eager_graph,0,128,16,norm / position / activation,56.86381249999988
+tensor_eager_graph,0,128,16,sampling,13.3758125
+tensor_eager_graph,2032,2160,16,copy / indexing,1404.3600000000033
+tensor_eager_graph,2032,2160,16,linear algebra,1179.2970624999964
+tensor_eager_graph,2032,2160,16,other / fused,1832.815125000004
+tensor_eager_graph,2032,2160,16,attention / softmax,114.45462500000012
+tensor_eager_graph,2032,2160,16,norm / position / activation,56.75131249999981
+tensor_eager_graph,2032,2160,16,sampling,13.317437499999999
+tensor_eager_graph,4079,4207,16,copy / indexing,1405.0308750000017
+tensor_eager_graph,4079,4207,16,linear algebra,1179.1859999999963
+tensor_eager_graph,4079,4207,16,other / fused,1831.5748750000062
+tensor_eager_graph,4079,4207,16,attention / softmax,103.47162500000007
+tensor_eager_graph,4079,4207,16,norm / position / activation,56.67574999999968
+tensor_eager_graph,4079,4207,16,sampling,13.2871875
+tensor_inductor,0,128,16,linear algebra,1221.0725000000004
+tensor_inductor,0,128,16,other / fused,211.6851874999995
+tensor_inductor,0,128,16,attention / softmax,117.91362500000004
+tensor_inductor,0,128,16,copy / indexing,386.5792499999997
+tensor_inductor,0,128,16,norm / position / activation,45.98218749999983
+tensor_inductor,0,128,16,sampling,14.178749999999999
+tensor_inductor,2032,2160,16,linear algebra,1207.9132500000007
+tensor_inductor,2032,2160,16,other / fused,212.17749999999904
+tensor_inductor,2032,2160,16,attention / softmax,117.11231250000007
+tensor_inductor,2032,2160,16,copy / indexing,385.7866875000004
+tensor_inductor,2032,2160,16,norm / position / activation,44.45137499999993
+tensor_inductor,2032,2160,16,sampling,13.7565
+tensor_inductor,4079,4207,16,linear algebra,1210.812187500001
+tensor_inductor,4079,4207,16,other / fused,212.72893749999912
+tensor_inductor,4079,4207,16,attention / softmax,116.61162499999989
+tensor_inductor,4079,4207,16,copy / indexing,383.04074999999966
+tensor_inductor,4079,4207,16,norm / position / activation,45.60837499999978
+tensor_inductor,4079,4207,16,sampling,13.626125000000002
+tensor_inductor_graph,0,128,16,linear algebra,1159.0625624999977
+tensor_inductor_graph,0,128,16,other / fused,195.8049374999991
+tensor_inductor_graph,0,128,16,attention / softmax,112.24687499999985
+tensor_inductor_graph,0,128,16,copy / indexing,355.16656249999994
+tensor_inductor_graph,0,128,16,norm / position / activation,41.04537500000006
+tensor_inductor_graph,0,128,16,sampling,13.241937499999999
+tensor_inductor_graph,2032,2160,16,linear algebra,1159.2042499999984
+tensor_inductor_graph,2032,2160,16,other / fused,196.97156249999892
+tensor_inductor_graph,2032,2160,16,attention / softmax,112.15368749999982
+tensor_inductor_graph,2032,2160,16,copy / indexing,355.04768749999977
+tensor_inductor_graph,2032,2160,16,norm / position / activation,41.005687499999986
+tensor_inductor_graph,2032,2160,16,sampling,13.172125000000003
+tensor_inductor_graph,4079,4207,16,linear algebra,1159.0894374999982
+tensor_inductor_graph,4079,4207,16,other / fused,197.34649999999914
+tensor_inductor_graph,4079,4207,16,attention / softmax,112.12912499999987
+tensor_inductor_graph,4079,4207,16,copy / indexing,354.9315625
+tensor_inductor_graph,4079,4207,16,norm / position / activation,41.001187499999986
+tensor_inductor_graph,4079,4207,16,sampling,13.09175
+sdpa_inductor_graph,0,128,16,attention / softmax,6977.9600625000085
+sdpa_inductor_graph,0,128,16,linear algebra,769.5783750000038
+sdpa_inductor_graph,0,128,16,copy / indexing,313.7456875000002
+sdpa_inductor_graph,0,128,16,other / fused,71.25737499999974
+sdpa_inductor_graph,0,128,16,norm / position / activation,39.608687499999974
+sdpa_inductor_graph,0,128,16,sampling,12.769999999999998
+sdpa_inductor_graph,2032,2160,16,attention / softmax,6984.258124999997
+sdpa_inductor_graph,2032,2160,16,linear algebra,769.8541875000021
+sdpa_inductor_graph,2032,2160,16,copy / indexing,313.27993750000036
+sdpa_inductor_graph,2032,2160,16,other / fused,71.29331249999981
+sdpa_inductor_graph,2032,2160,16,norm / position / activation,39.621749999999956
+sdpa_inductor_graph,2032,2160,16,sampling,12.775875
+sdpa_inductor_graph,4079,4207,16,attention / softmax,6967.071437499999
+sdpa_inductor_graph,4079,4207,16,linear algebra,768.6765625000031
+sdpa_inductor_graph,4079,4207,16,copy / indexing,313.2487500000003
+sdpa_inductor_graph,4079,4207,16,other / fused,71.3424999999997
+sdpa_inductor_graph,4079,4207,16,norm / position / activation,39.631937499999964
+sdpa_inductor_graph,4079,4207,16,sampling,12.7960625
+flash_inductor_graph,0,128,16,linear algebra,772.403500000003
+flash_inductor_graph,0,128,16,attention / softmax,397.62156249999964
+flash_inductor_graph,0,128,16,copy / indexing,307.6355624999999
+flash_inductor_graph,0,128,16,norm / position / activation,40.26562500000005
+flash_inductor_graph,0,128,16,other / fused,66.85562500000005
+flash_inductor_graph,0,128,16,sampling,12.996
+flash_inductor_graph,2032,2160,16,linear algebra,772.3027500000014
+flash_inductor_graph,2032,2160,16,attention / softmax,415.24643750000007
+flash_inductor_graph,2032,2160,16,copy / indexing,308.01712499999985
+flash_inductor_graph,2032,2160,16,norm / position / activation,40.46612499999995
+flash_inductor_graph,2032,2160,16,other / fused,66.84150000000008
+flash_inductor_graph,2032,2160,16,sampling,12.883937499999998
+flash_inductor_graph,4079,4207,16,linear algebra,776.198125000002
+flash_inductor_graph,4079,4207,16,attention / softmax,422.1906249999994
+flash_inductor_graph,4079,4207,16,copy / indexing,308.90043749999984
+flash_inductor_graph,4079,4207,16,norm / position / activation,40.51618749999999
+flash_inductor_graph,4079,4207,16,other / fused,66.78656250000009
+flash_inductor_graph,4079,4207,16,sampling,12.921875

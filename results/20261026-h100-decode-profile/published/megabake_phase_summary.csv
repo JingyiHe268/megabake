@@ -1,0 +1,4 @@
+lead_decode_steps,first_cached_tokens,workers,phases,barrier_intervals,timed_total_us,trailing_phases_untimed
+0,128,132,603,183,1643.808,3
+2032,2160,132,603,183,1934.688,3
+4079,4207,132,603,183,2325.12,3
