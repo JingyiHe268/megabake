@@ -131,6 +131,28 @@ class WorkflowTests(unittest.TestCase):
             self.assertIn("2.0000", text)
             self.assertIn("1.0000", text)
 
+    def test_mock_export_requires_correctness_and_complete_timings(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            (folder / "status.json").write_text('{"state":"complete"}')
+            data = {"state": "complete", "mock_weights": True, "workload": "mlp", "rows": 4,
+                    "layers": None, "samples": 2, "dtype": "bfloat16", "seed": 1,
+                    "relative_l2": .001, "inductor_relative_l2": .001, "workload_kernel_count": 1,
+                    "torch": "test", "cute": "test", "gpu": "test", "profile": "test",
+                    "execution_commit": "test", "measurements": {
+                        name: {"median_call_us": 2, "samples_us": [1, 3]}
+                        for name in ("eager", "eager_cuda_graph", "inductor", "megabake")}}
+            path = folder / "mock-forward.json"
+            path.write_text(json.dumps(data))
+            files = publication.export(folder)
+            self.assertEqual({p.suffix for p in files}, {".csv", ".md", ".svg"})
+            self.assertIn("Random weights", (folder / "published/performance.md").read_text())
+            self.assertNotIn("No MegaBake comparison", (folder / "published/mock_forward_ms.svg").read_text())
+            data["relative_l2"] = .2
+            path.write_text(json.dumps(data))
+            with self.assertRaises(ValueError):
+                publication.export(folder)
+
 
 if __name__ == "__main__":
     unittest.main()

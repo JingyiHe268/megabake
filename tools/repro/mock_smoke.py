@@ -9,6 +9,7 @@ import importlib.metadata
 import json
 from pathlib import Path
 import statistics
+import subprocess
 import time
 
 
@@ -105,6 +106,8 @@ def main():
     if len(kernels) != 1:
         raise RuntimeError(f"Expected one workload kernel, observed {len(kernels)} GPU events")
     result = {"state": "complete", "mock_weights": True, "seed": 20261026,
+              "execution_commit": subprocess.check_output(
+                  ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[2], text=True).strip(),
               "workload": args.workload, "layers": args.layers if args.workload == "smollm" else None,
               "rows": args.rows, "samples": args.samples, "dtype": "bfloat16",
               "profile": "experimental CUDA 12; not the upstream cu130 environment",

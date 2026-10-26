@@ -49,7 +49,7 @@ def measurements(directory):
     return rows
 
 
-def chart(rows, metric, title, unit):
+def chart(rows, metric, title, unit, description=None, footnote=None):
     """A linear, zero-based bar chart; only rows with identical workload are compared."""
     maximum = max(row[metric] for row in rows)
     bars = []
@@ -62,18 +62,72 @@ def chart(rows, metric, title, unit):
                     f'<rect x="270" y="{y}" width="{width:.2f}" height="32" fill="#4278b7"/>'
                     f'<text x="{280+width:.2f}" y="{y+22}" font-size="14">{value:.4f}</text>')
     height = 190 + 72 * len(rows)
+    description = description or (f'{rows[0]["model"]} · BF16 · batch={rows[0]["batch_size"]} · '
+                                  f'input={rows[0]["input_tokens"]} · output={rows[0]["output_tokens"]}')
+    footnote = footnote or "Each bar is one recorded trial; decode median covers advancing tokens. No MegaBake comparison."
     return (f'<svg xmlns="http://www.w3.org/2000/svg" width="900" height="{height}" viewBox="0 0 900 {height}">'
             '<rect width="100%" height="100%" fill="white"/><g font-family="sans-serif" fill="#152030">'
             f'<text x="24" y="36" font-size="22">{html.escape(title)}</text>'
-            f'<text x="24" y="64" font-size="14">{html.escape(rows[0]["model"])} · BF16 · '
-            f'batch={rows[0]["batch_size"]} · input={rows[0]["input_tokens"]} · output={rows[0]["output_tokens"]}</text>'
+            f'<text x="24" y="64" font-size="14">{html.escape(description)}</text>'
             + ''.join(bars) + f'<path d="M270 94V{100+72*len(rows)}" stroke="#555"/>'
             f'<text x="270" y="{height-55}" font-size="13">0 — {maximum:.4f} {unit}; lower is better</text>'
-            f'<text x="24" y="{height-24}" font-size="12">Each bar is one recorded trial; decode median covers advancing tokens. No MegaBake comparison.</text>'
+            f'<text x="24" y="{height-24}" font-size="12">{html.escape(footnote)}</text>'
             '</g></svg>')
 
 
+def export_mock(directory):
+    data = json.loads((directory / "mock-forward.json").read_text())
+    status = json.loads((directory / "status.json").read_text())
+    limit = .01 if data.get("workload") == "mlp" else .02
+    errors = [data.get("relative_l2"), data.get("inductor_relative_l2")]
+    if (status.get("state") != "complete" or data.get("state") != "complete"
+            or data.get("mock_weights") is not True or data.get("workload_kernel_count") != 1
+            or not all(isinstance(v, (float, int)) and math.isfinite(v) and 0 <= v < limit for v in errors)):
+        raise ValueError("Mock correctness or single-kernel validation has not passed")
+    rows = []
+    for name in ("eager", "eager_cuda_graph", "inductor", "megabake"):
+        record = data.get("measurements", {}).get(name, {})
+        samples = record.get("samples_us", [])
+        value = record.get("median_call_us")
+        if (not isinstance(value, (float, int)) or not math.isfinite(value) or value <= 0
+                or len(samples) != data.get("samples") or not samples
+                or not all(isinstance(v, (float, int)) and math.isfinite(v) and v > 0 for v in samples)):
+            raise ValueError(f"Incomplete mock measurements for {name}")
+        rows.append({"variant": name, "workload": data["workload"], "mock_weights": True,
+                     "rows": data["rows"], "layers": data.get("layers"), "dtype": data["dtype"],
+                     "seed": data["seed"], "samples": len(samples), "median_call_ms": value / 1000,
+                     "torch": data["torch"], "cute": data["cute"], "profile": data["profile"],
+                     "gpu": data["gpu"], "execution_commit": data["execution_commit"]})
+    destination = directory / "published"
+    destination.mkdir(exist_ok=True)
+    csv_path = destination / "performance.csv"
+    stream = io.StringIO(newline="")
+    writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+    writer.writeheader()
+    writer.writerows(rows)
+    csv_path.write_text(stream.getvalue())
+    md_path = destination / "performance.md"
+    md_path.write_text(
+        f'# MOCK {data["workload"]} forward performance\n\n'
+        f'Random weights, seed {data["seed"]}, rows {data["rows"]}, layers {data.get("layers")}, '
+        f'{data["dtype"]}, {data["samples"]} samples per variant.\n\n'
+        f'Profile: {data["profile"]}. Torch {data["torch"]}; CuTe {data["cute"]}; GPU {data["gpu"]}.\n\n'
+        'Same-model synchronized forward calls; no SGLang engine comparison or pretrained-model accuracy claim.\n\n'
+        f'Correctness relative L2: MegaBake {data["relative_l2"]:.6g}, Inductor {data["inductor_relative_l2"]:.6g}. '
+        f'MegaBake workload kernels: 1. Execution commit: `{data["execution_commit"]}`.\n\n'
+        '| Variant | Median forward latency (ms) |\n| --- | ---: |\n'
+        + ''.join(f'| {row["variant"]} | {row["median_call_ms"]:.6f} |\n' for row in rows))
+    svg_path = destination / "mock_forward_ms.svg"
+    svg_path.write_text(chart(
+        rows, "median_call_ms", f'MOCK {data["workload"]}: synchronized forward latency', "ms",
+        description=f'Random weights · BF16 · rows={data["rows"]} · layers={data.get("layers")} · seed={data["seed"]}',
+        footnote="One trial; CUDA 12 experimental profile. Same-model forward comparison, not SGLang engine latency."))
+    return [csv_path, md_path, svg_path]
+
+
 def export(directory):
+    if (directory / "mock-forward.json").exists():
+        return export_mock(directory)
     rows = measurements(directory)
     if not rows:
         raise ValueError("No successful, finite performance measurements to publish")
