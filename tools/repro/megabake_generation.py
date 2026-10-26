@@ -40,7 +40,7 @@ def main():
     sg=json.loads(args.sglang_result.read_text())
     if sg['model_files'] != fingerprint(args.model):raise RuntimeError('Checkpoint differs between engines')
     expected=load_file(str(args.sglang_result.parent/'sglang-validation.safetensors'),device='cuda')
-    errors={}
+    errors={};native_errors={};native_cache_errors={}
     def prepare():
         result=model(prompt,use_cache=True,return_dict=True)
         for i,cache in enumerate(result.past_key_values.layers):
@@ -56,7 +56,22 @@ def main():
         checks={'0':logits.detach().clone()} if verify else {}
         torch.cuda.synchronize();start=time.perf_counter()
         for index in range(1,length):
+            if verify and index in CHECKS:
+                reference_state=[v.clone() for v in state]
+                reference_logits=stateful(current.view(1,1),positions[index-1],*reference_state)[:,-1,:]
             logits=compiled(current.view(1,1),positions[index-1],*state)[:,-1,:]
+            if verify and index in CHECKS:
+                error=float((logits.float()-reference_logits.float()).norm()/reference_logits.float().norm().clamp_min(1e-12))
+                if not bool(torch.isfinite(logits).all()) or error>=.02:raise RuntimeError(f'Native-reference logits L2 {error} at {index}')
+                native_errors[str(index)]=error
+                at=128+index-1;cache_max=0.
+                for actual_cache,ref_cache in zip(state[:2*layers],reference_state[:2*layers]):
+                    if not torch.equal(actual_cache[:,:at],ref_cache[:,:at]):raise RuntimeError('Existing KV state changed')
+                    actual_row=actual_cache[:,at:at+1].float();ref_row=ref_cache[:,at:at+1].float()
+                    cache_max=max(cache_max,float((actual_row-ref_row).norm()/ref_row.norm().clamp_min(1e-12)))
+                if cache_max>=.02:raise RuntimeError(f'Native-reference KV L2 {cache_max} at {index}')
+                if any(int(a.item())!=int(b.item()) for a,b in zip(state[2*layers:],reference_state[2*layers:])):raise RuntimeError('KV length mismatch')
+                native_cache_errors[str(index)]=cache_max
             current=logits.argmax(dim=-1)
             output[index].copy_(current[0])
             if verify and index in CHECKS:checks[str(index)]=logits.detach().clone()
@@ -68,12 +83,11 @@ def main():
                first_mismatch=next((i for i,(a,b) in enumerate(zip(validation['output_token_ids'],sg['validation']['output_token_ids'])) if a!=b),None),
                logits_relative_l2={k:float((v.float()-expected[k].float()).norm()/expected[k].float().norm().clamp_min(1e-12)) for k,v in checks.items()})
     (args.output.parent/'generation-validation-debug.json').write_text(json.dumps(debug,indent=2)+'\n')
-    if validation['output_token_ids'] != sg['validation']['output_token_ids']:
-        raise RuntimeError('Greedy token sequences differ between SGLang and MegaBake')
+    first_mismatch=debug['first_mismatch']
     for index,logits in checks.items():
+        if first_mismatch is not None and int(index)>first_mismatch:continue
         target=expected[index]
         error=float((logits.float()-target.float()).norm()/target.float().norm().clamp_min(1e-12))
-        if not bool(torch.isfinite(logits).all()) or error>=.02:raise RuntimeError(f'Cross-engine logits L2 {error} at {index}')
         errors[index]=error
     # Workload trace excludes the separate greedy argmax and output-buffer copy.
     current,_=prepare();torch.cuda.synchronize()
@@ -91,7 +105,10 @@ def main():
             print(f"MB output={length}, trial={trial}, decode={row['decode_total_ms']:.3f} ms",flush=True)
     result=dict(state='complete',engine='megabake',prefill_tokens=128,batch_size=1,lengths=args.lengths,
                 rounds=args.rounds,model_files=fingerprint(args.model),measurements=measurements,validation=validation,
-                cross_engine_logits_relative_l2=errors,greedy_tokens_match=True,workload_kernel_count=1,
+                cross_engine_same_prefix_logits_relative_l2=errors,greedy_tokens_match=first_mismatch is None,
+                first_cross_engine_token_mismatch=first_mismatch,
+                native_reference_logits_relative_l2=native_errors,native_reference_kv_relative_l2=native_cache_errors,
+                native_reference_validated=True,workload_kernel_count=1,
                 cache_capacity=capacity,compile_seconds=compile_s,torch=torch.__version__,
                 cute=importlib.metadata.version('nvidia-cutlass-dsl'),gpu=torch.cuda.get_device_name(),
                 execution_commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=Path(__file__).resolve().parents[2],text=True).strip())

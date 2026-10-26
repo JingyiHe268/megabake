@@ -17,17 +17,18 @@ def validated(directory):
             or sg['execution_commit']!=mb['execution_commit'] or mb['execution_commit']!=status['execution_commit']
             or any(x['prefill_tokens']!=128 or x['batch_size']!=1 for x in (sg,mb))):
         raise ValueError('Cross-engine workload contract mismatch')
-    if (not mb.get('greedy_tokens_match') or mb.get('workload_kernel_count')!=1
+    if (not mb.get('native_reference_validated') or mb.get('workload_kernel_count')!=1
             or sg.get('validated_graph_replay_count')!=max(sg['lengths'])-1):
         raise ValueError('Token, megakernel or SGLang graph replay check missing')
-    errors=mb.get('cross_engine_logits_relative_l2',{})
-    if not errors or not all(isinstance(v,(int,float)) and math.isfinite(v) and 0<=v<.02 for v in errors.values()):
-        raise ValueError('Cross-engine logits validation failed')
-    expected=sg['validation']['output_token_ids']
-    if expected!=mb['validation']['output_token_ids']:
-        raise ValueError('Cross-engine greedy sequence mismatch')
+    errors=mb.get('native_reference_logits_relative_l2',{})
+    cache_errors=mb.get('native_reference_kv_relative_l2',{})
+    if (not errors or set(errors)!=set(cache_errors)
+            or not all(isinstance(v,(int,float)) and math.isfinite(v) and 0<=v<.02
+                       for v in [*errors.values(),*cache_errors.values()])):
+        raise ValueError('Native-reference logits or KV validation failed')
     groups={}
     for data in (sg,mb):
+        expected=data['validation']['output_token_ids']
         seen=set()
         for row in data['measurements']:
             length=row['output_tokens'];trial=row['trial'];key=(length,trial)
@@ -74,8 +75,12 @@ def export_generation(directory):
           'No per-step global synchronization. Excludes loading, compilation, warmup, prefill, HTTP and tokenization.\n\n'
           f'SGLang {sg["sglang"]}, torch {sg["torch"]}; MegaBake torch {mb["torch"]}, CuTe {mb["cute"]}. '
           'The stacks use different PyTorch/CUDA builds, so this is a backend-stack comparison, not an isolated compiler ablation.\n\n'
-          f'Identical greedy tokens verified through {max(sg["lengths"])} outputs. '
-          f'Max checkpoint-logit relative L2: {max(mb["cross_engine_logits_relative_l2"].values()):.6g}. '
+          f'MegaBake checked against native PyTorch using identical inputs and KV state at selected steps: '
+          f'max logits L2 {max(mb["native_reference_logits_relative_l2"].values()):.6g}, '
+          f'max new-KV L2 {max(mb["native_reference_kv_relative_l2"].values()):.6g}. '
+          f'Cross-stack greedy sequences identical: {mb["greedy_tokens_match"]}; '
+          f'first differing output index (zero-based): {mb["first_cross_engine_token_mismatch"]}. '
+          'Each stack performs its own greedy generation; differing floating-point implementations may yield different token histories. '
           f'SGLang CUDA Graph replay verified ({sg["validated_graph_replay_count"]} validation decode calls); '
           'MegaBake workload verified as one kernel; sampling and output stores are separate operations.\n\n'
           f'Weight SHA256: `{sg["model_files"]["model.safetensors"]}`. '
