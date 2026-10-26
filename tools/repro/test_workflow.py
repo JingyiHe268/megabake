@@ -71,6 +71,10 @@ class WorkflowTests(unittest.TestCase):
         with patch.object(workflow, "output", return_value=" M file.py"), self.assertRaises(SystemExit):
             workflow.deploy({})
 
+    def test_mock_launch_requires_an_explicit_compatibility_profile(self):
+        with self.assertRaises(SystemExit):
+            workflow.launch({}, Path("unused"), "mock-test", mock="mlp")
+
     def test_subprocess_tools_use_the_selected_venv(self):
         base = {"PATH": "/usr/bin", "LD_LIBRARY_PATH": "/existing"}
         env = run_node.tool_environment(base, "/env/bin/python", "/cuda", "/source")

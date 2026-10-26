@@ -66,3 +66,18 @@ srun --jobid=281111 --overlap --exact -N1 -n1 -c4 --mem=24G \
 比较范围是同一个随机模型的同步 forward：eager、eager CUDA Graph、Inductor、MegaBake。
 不将结果称为预训练模型精度，也不与之前 Qwen3 的 SGLang 引擎延迟直接计算加速比。
 失败日志不发布；成功结果仍只导出数据表和性能对比图。
+
+也可从本地通过已集成的工作流运行，显式选择兼容性配置：
+
+```bash
+python3 tools/repro/workflow.py --config tools/repro/ln301-mock-cu126.json \
+  launch unique-mock-run --mock smollm --layers 30
+python3 tools/repro/workflow.py --config tools/repro/ln301-mock-cu126.json status unique-mock-run
+python3 tools/repro/workflow.py --config tools/repro/ln301-mock-cu126.json collect unique-mock-run
+python3 tools/repro/workflow.py --config tools/repro/ln301-mock-cu126.json publish unique-mock-run
+```
+
+此配置不使用模型权重目录；随机权重在 GPU 测试进程内按固定种子生成。
+`--mock mlp` 用于小型 MLP 检查，`--mock smollm --layers N` 用于 N 层模型结构测试。
+SmolLM 的四种实现均接收相同的预构造因果 mask；脚本先检查它与原始二维 padding mask 的 eager 输出一致。
+这样可排除 HF eager mask 构造期间的 CPU 标量复制，允许 CUDA Graph 捕获；计时不包含 mask 预处理。

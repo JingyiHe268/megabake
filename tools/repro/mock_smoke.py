@@ -44,8 +44,15 @@ def main():
         module = SmolLMArchitecture(layers=args.layers)
         def model(ids, mask):
             return module(ids, attention_mask=mask).logits
-        inputs = (torch.arange(1, args.rows + 1, device="cuda").view(1, -1),
-                  torch.ones((1, args.rows), device="cuda", dtype=torch.int64))
+        ids = torch.arange(1, args.rows + 1, device="cuda").view(1, -1)
+        padding_mask = torch.ones((1, args.rows), device="cuda", dtype=torch.int64)
+        # HF's eager mask builder creates a pageable CPU scalar, which torch
+        # 2.14 cannot copy during graph capture. All variants receive the same
+        # prebuilt causal mask; verify it preserves the original eager output.
+        causal_mask = torch.full((1, 1, args.rows, args.rows), torch.finfo(torch.bfloat16).min,
+                                 device="cuda", dtype=torch.bfloat16).triu(1)
+        torch.testing.assert_close(model(ids, causal_mask), model(ids, padding_mask))
+        inputs = (ids, causal_mask)
 
     expected = model(*inputs).clone()
     backend = make_backend(mode="prefill", compile_kernel=True, cache=False,
@@ -111,7 +118,7 @@ def main():
               "workload": args.workload, "layers": args.layers if args.workload == "smollm" else None,
               "rows": args.rows, "samples": args.samples, "dtype": "bfloat16",
               "profile": "experimental CUDA 12; not the upstream cu130 environment",
-              "timing_scope": "synchronized model-forward calls; no SGLang engine comparison",
+              "timing_scope": "synchronized model-forward calls; SmolLM uses a prebuilt causal mask; no SGLang engine comparison",
               "gpu": torch.cuda.get_device_name(), "torch": torch.__version__,
               "cuda_runtime": torch.version.cuda,
               "cute": importlib.metadata.version("nvidia-cutlass-dsl"),
