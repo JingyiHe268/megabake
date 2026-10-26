@@ -118,3 +118,24 @@ python3 tools/repro/workflow.py --config tools/repro/ln301-mock-sweep.json colle
 - 已通过的工作负载不能证明未测试的算子、形状和编译选项兼容。发生失败时需查看实际错误，不能一律归因于驱动。
 - 低版本号本身不说明结果一定错误，也不说明性能固定降低。当前数值检查是特定测试的证据，不能外推到所有输入。
 - 同机、同环境内的性能比较可以记录，但不能把该实验配置的数据称为官方 CUDA 13 环境的复现。
+
+## Batch=1 decode 上下文扫描
+
+```bash
+python3 tools/repro/workflow.py --config tools/repro/ln301-mock-sweep.json \
+  launch unique-decode-sweep --mock smollm-decode --layers 30 \
+  --tokens 128 256 512 1024 2048 4096 --rounds 3
+```
+
+此时 `--tokens` 表示调用之前已缓存的上下文长度，不是一次输入的 token 数。
+每次调用输入 1 个 token、输出该位置 logits，并更新各层 KV；batch 固定 1。
+每个长度的 cache capacity 固定为 context+1，单独编译；不混入不同容量的结果。
+权重为固定种子随机初始化，历史 KV 为固定种子的非零随机数据，没有执行真实 prompt prefill。
+
+原始声明 KV op 的 eager 实现使用 CPU `.item()` 读取长度，不能 CUDA Graph 捕获。
+基线共用原模型 wrapper，只有 KV attention 换成 GPU-only tensor 实现；先与原 eager 验证 logits 和完整 KV 状态。
+MegaBake 仍编译原始声明 KV op；额外检查旧缓存未变、新 KV 的相对 L2 小于 0.02、各层长度恰好加 1。
+每次计时前仅恢复逻辑长度到 context，位置固定为 context；新 KV 会覆盖 context 位置。
+恢复操作与同步在计时开始前完成，不含在 decode 延迟中。
+计时包含单 token 模型 forward、KV 写入、主机调用和结束同步，不包含采样/分词或 SGLang 调度。
+复用上述 collect / publish 命令；decode 表格使用 `cached_tokens`，图表横轴明确标为历史上下文长度。
