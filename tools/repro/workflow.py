@@ -129,7 +129,7 @@ def collect(config, run_id):
     destination.mkdir(parents=True, exist_ok=True)
     remote_path = f"{config['remote_repo']}/results/{run_id}/"
     # No --delete: never delete results or local screenshots on either side.
-    call(["rsync", "-az", "--exclude=*.nsys-rep", "--exclude=*.sqlite", "--exclude=generated/",
+    call(["rsync", "-az", "--exclude=*.nsys-rep", "--exclude=*.sqlite", "--exclude=*-trace.json", "--exclude=generated/",
           "-e", "ssh -o BatchMode=yes", f"{config['ssh_host']}:{remote_path}", str(destination) + "/"])
     call([sys.executable, ROOT / "tools/repro/report.py", destination])
 

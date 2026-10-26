@@ -21,10 +21,26 @@ def sdpa_kv(source,key,value,key_cache,value_cache,valid_length):
     return out.permute(0,2,1,3).reshape(source.shape[0]*source.shape[2],1,source.shape[3])
 
 
+def flash_kv(source,key,value,key_cache,value_cache,valid_length):
+    """Packed FlashAttention with GPU-resident seqused_k; reads logical KV length."""
+    import torch
+    index=valid_length.to(torch.int64)
+    key_cache.index_copy_(1,index,key);value_cache.index_copy_(1,index,value);valid_length.add_(1)
+    capacity=key_cache.shape[1]
+    cuq=torch.tensor([0,1],device=source.device,dtype=torch.int32)
+    cuk=torch.tensor([0,capacity],device=source.device,dtype=torch.int32)
+    output=torch.ops.aten._flash_attention_forward.default(
+        source.reshape(1,source.shape[2],source.shape[3]),
+        key_cache.reshape(capacity,key_cache.shape[2],key_cache.shape[3]),
+        value_cache.reshape(capacity,value_cache.shape[2],value_cache.shape[3]),
+        cuq,cuk,1,capacity,0.,False,False,seqused_k=valid_length)[0]
+    return output.reshape(source.shape[0]*source.shape[2],1,source.shape[3])
+
+
 def main():
     p=argparse.ArgumentParser();p.add_argument('--model',required=True);p.add_argument('--output',type=Path,required=True)
     p.add_argument('--lengths',type=int,nargs='+',default=LENGTHS);p.add_argument('--rounds',type=int,default=3)
-    a=p.parse_args()
+    p.add_argument('--variants',nargs='+');a=p.parse_args()
     import torch
     from transformers import AutoModelForCausalLM
     from tests.fixtures import StatefulSmolLM
@@ -37,6 +53,10 @@ def main():
     results=[]
     variants=[('tensor_eager_graph',tensor_kv,False,True),('tensor_inductor',tensor_kv,True,False),
               ('tensor_inductor_graph',tensor_kv,True,True),('sdpa_inductor_graph',sdpa_kv,True,True)]
+    if a.variants:
+        variants.append(('flash_inductor_graph',flash_kv,True,True))
+        variants=[v for v in variants if v[0] in a.variants]
+        if len(variants)!=len(a.variants):raise ValueError('Unknown/duplicate variant')
     compiled_cache={}
     for name,attention,use_inductor,use_graph in variants:
         print('BUILD '+name,flush=True)
@@ -50,6 +70,9 @@ def main():
             if use_inductor:compiled_cache[attention.__name__]=function
         state=[torch.zeros(shape,device='cuda',dtype=torch.bfloat16) for _ in range(2*layers)]
         state += [torch.zeros((1,),device='cuda',dtype=torch.int32) for _ in range(layers)]
+        if attention is flash_kv:
+            reference(token,position,*[v.clone() for v in state]);torch.cuda.synchronize()
+            print('Native packed FlashAttention preflight passed',flush=True)
         start=time.perf_counter();function(token,position,*state);torch.cuda.synchronize();compile_s=time.perf_counter()-start
         def prepare():
             result=model(prompt,use_cache=True,return_dict=True)

@@ -11,12 +11,14 @@ def category(name):
     text = name.lower()
     if 'megabake' in text or 'cooperative' in text:
         return 'megakernel'
-    if any(s in text for s in ('gemm', 'gemv', 'matmul', 'cublas', 'cutlass')):
-        return 'linear algebra'
-    if any(s in text for s in ('attention', 'flash', 'decode', 'softmax')):
-        return 'attention / softmax'
     if any(s in text for s in ('argmax', 'sample', 'sampling', 'topk')):
         return 'sampling'
+    if any(s in text for s in ('norm', 'rotary', 'rope', 'silu', 'gelu')):
+        return 'norm / position / activation'
+    if any(s in text for s in ('attention', 'flashattn', 'flash_attn', 'batch_decode', 'batchdecode', 'softmax')):
+        return 'attention / softmax'
+    if any(s in text for s in ('gemm', 'gemv', 'matmul', 'cublas', 'cutlass', 'nvjet_tst')):
+        return 'linear algebra'
     if any(s in text for s in ('memcpy', 'memset', 'copy', 'index')):
         return 'copy / indexing'
     return 'other / fused'

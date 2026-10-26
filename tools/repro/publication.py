@@ -137,6 +137,9 @@ def export_mock(directory):
 
 
 def export(directory):
+    if (directory / "config.json").exists() and json.loads((directory / "config.json").read_text()).get('profiling'):
+        from profile_publication import export_profile
+        return export_profile(directory)
     if (directory / "sglang-generation.json").exists():
         from generation_publication import export_generation
         return export_generation(directory)
