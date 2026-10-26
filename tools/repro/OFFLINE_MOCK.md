@@ -129,7 +129,7 @@ python3 tools/repro/workflow.py --config tools/repro/ln301-mock-sweep.json \
 
 此时 `--tokens` 表示调用之前已缓存的上下文长度，不是一次输入的 token 数。
 每次调用输入 1 个 token、输出该位置 logits，并更新各层 KV；batch 固定 1。
-每个长度的 cache capacity 固定为 context+1，单独编译；不混入不同容量的结果。
+每个长度的 cache capacity 固定为 context+128，单独编译；不混入不同容量的结果。
 权重为固定种子随机初始化，历史 KV 为固定种子的非零随机数据，没有执行真实 prompt prefill。
 
 原始声明 KV op 的 eager 实现使用 CPU `.item()` 读取长度，不能 CUDA Graph 捕获。
@@ -137,5 +137,7 @@ python3 tools/repro/workflow.py --config tools/repro/ln301-mock-sweep.json \
 MegaBake 仍编译原始声明 KV op；额外检查旧缓存未变、新 KV 的相对 L2 小于 0.02、各层长度恰好加 1。
 每次计时前仅恢复逻辑长度到 context，位置固定为 context；新 KV 会覆盖 context 位置。
 恢复操作与同步在计时开始前完成，不含在 decode 延迟中。
+Inductor 显式启用 `emulate_precision_casts=True`，保留 eager 的 BF16 中间舍入；图表标记为 BF16-aligned，
+不把它与默认 Inductor 融合精度配置混为一谈。数值检查阈值保持 0.02。
 计时包含单 token 模型 forward、KV 写入、主机调用和结束同步，不包含采样/分词或 SGLang 调度。
 复用上述 collect / publish 命令；decode 表格使用 `cached_tokens`，图表横轴明确标为历史上下文长度。

@@ -55,7 +55,9 @@ def main():
     class TensorReference(StatefulSmolLM):
         forward = reference_forward
     reference = TensorReference(model).eval()
-    capacity = args.rows + 1
+    # Dynamo and backend calibration execute the mutable graph while compiling.
+    # Reserve headroom, then restore the entire initial state before validation.
+    capacity = args.rows + 128
     shape = (1, capacity, model.config.num_key_value_heads,
              model.config.hidden_size // model.config.num_attention_heads)
     initial = [torch.randn(shape, device='cuda', dtype=torch.bfloat16) * .02 for _ in range(2 * args.layers)]
@@ -98,6 +100,10 @@ def main():
         actual = function(token, position, *state)
         torch.cuda.synchronize()
         compile_seconds[name] = time.perf_counter() - start
+        for current, original in zip(state, initial):
+            current.copy_(original)
+        actual = function(token, position, *state)
+        torch.cuda.synchronize()
         errors[name] = l2(actual, expected)
         if errors[name] >= .02:
             raise RuntimeError(f'{name} logits relative L2 {errors[name]} exceeds .02')
@@ -105,7 +111,9 @@ def main():
         for i, (current, expected_cache) in enumerate(zip(state[:2*args.layers], expected_state[:2*args.layers])):
             if not torch.equal(current[:, :args.rows], initial[i][:, :args.rows]):
                 raise RuntimeError(f'{name} modified existing KV entries')
-            maxima.append(l2(current[:, args.rows:], expected_cache[:, args.rows:]))
+            if not torch.equal(current[:, args.rows+1:], initial[i][:, args.rows+1:]):
+                raise RuntimeError(f'{name} modified unused KV entries')
+            maxima.append(l2(current[:, args.rows:args.rows+1], expected_cache[:, args.rows:args.rows+1]))
         cache_errors[name] = max(maxima)
         if cache_errors[name] >= .02:
             raise RuntimeError(f'{name} new KV entry relative L2 {cache_errors[name]} exceeds .02')

@@ -84,7 +84,7 @@ def export_mock(directory):
         cache_errors = data.get("cache_relative_l2", {})
         if (data.get("cache_state_validation") is not True or data.get("batch_size") != 1
                 or data.get("output_tokens") != 1 or data.get("context_length") != data.get("rows")
-                or data.get("cache_capacity") != data.get("rows", 0) + 1
+                or data.get("cache_capacity") != data.get("rows", 0) + 128
                 or set(cache_errors) != {"eager", "eager_cuda_graph", "inductor", "megabake"}
                 or not all(isinstance(v, (float, int)) and math.isfinite(v) and 0 <= v < limit
                            for v in cache_errors.values())):

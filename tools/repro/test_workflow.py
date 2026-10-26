@@ -213,7 +213,7 @@ class SweepPublicationTests(unittest.TestCase):
             point = self.make_point(root, 128)
             data = json.loads((point / "mock-forward.json").read_text())
             data.update(mode="decode", workload="smollm-decode", batch_size=1, output_tokens=1,
-                        context_length=128, cache_capacity=129, cache_state_validation=True,
+                        context_length=128, cache_capacity=256, cache_state_validation=True,
                         cache_relative_l2={name: 0.01 for name in data["measurements"]})
             (point / "mock-forward.json").write_text(json.dumps(data))
             self.assertEqual(len(publication.export_mock(point)), 3)

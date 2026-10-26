@@ -70,6 +70,7 @@ def export_sweep(directory):
                                 inductor_relative_l2=data["inductor_relative_l2"],
                                 execution_commit=data["execution_commit"],
                                 mode=data.get("mode", "prefill"), batch_size=1,
+                                inductor_emulate_precision_casts=data.get("inductor_options", {}).get("emulate_precision_casts", False),
                                 cache_capacity=data.get("cache_capacity", ""),
                                 max_new_kv_relative_l2=max(data.get("cache_relative_l2", {"unused": 0}).values())))
             for trial, value in enumerate(round_ms, 1):
@@ -102,10 +103,12 @@ def export_sweep(directory):
              'Speedup >1 means MegaBake is faster; no SGLang engine comparison.\n')
     if decode:
         text += ('\nEach call consumes one token at the stated cached context and updates KV state. '
-                 'Capacity is context+1, specialized per length. Logical lengths are restored before each call outside timing. '
+                 'Capacity is context+128, specialized per length. Logical lengths are restored before each call outside timing. '
                  'Cached K/V are seeded nonzero random tensors, not computed from a prompt. '
                  'Eager, CUDA Graph and Inductor use a GPU-only tensor KV reference checked against upstream eager logits and full KV state. '
                  'MegaBake uses the original declared KV op; existing cache contents and one-token updates are validated.\n')
+        text += ('\nInductor enables `emulate_precision_casts=True` to preserve eager BF16 intermediate rounding. '
+                 'This is an explicitly configured baseline, not the default Inductor precision-fusion configuration.\n')
     path = target / "performance.md"
     path.write_text(text)
     files.append(path)
@@ -130,7 +133,8 @@ def plots(target, points):
             values = [p["measurements"][variant]["median_call_us"] / 1000 for p in points]
             if kind == "speedup":
                 values = [v / (p["measurements"]["megabake"]["median_call_us"] / 1000) for v, p in zip(values, points)]
-            ax.plot(lengths, values, "o-", label=variant, color=color, linewidth=2)
+            label = "inductor (BF16-aligned)" if decode and variant == "inductor" else variant
+            ax.plot(lengths, values, "o-", label=label, color=color, linewidth=2)
             if kind == "latency":
                 low = [min(p["measurements"][variant]["round_medians_us"]) / 1000 for p in points]
                 high = [max(p["measurements"][variant]["round_medians_us"]) / 1000 for p in points]
@@ -149,7 +153,7 @@ def plots(target, points):
                      + (("Decode latency vs cached context (lower is better)" if decode else "Latency vs input length (lower is better)")
                         if kind == "latency" else "MegaBake speedup (above 1 is faster)"))
         fig.supxlabel(f'Random weights · {points[0]["rounds"]} rounds × {points[0]["samples_per_round"]} samples · CUDA 12 experimental profile\n' +
-                      ('Random KV; capacity=context+1; reset excluded; host+GPU decode; no SGLang comparison.' if decode else
+                      ('Random KV; capacity=context+128; reset excluded; host+GPU decode; no SGLang comparison.' if decode else
                        'Prebuilt causal mask; host-call + synchronization included; no SGLang comparison.'), fontsize=8)
         path = target / f"token_{kind}.svg"
         fig.savefig(path, metadata={"Date": None})
