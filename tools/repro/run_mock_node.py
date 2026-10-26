@@ -17,7 +17,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--run-id", type=validate_id, required=True)
-    parser.add_argument("--workload", choices=("mlp", "smollm"), required=True)
+    parser.add_argument("--workload", choices=("mlp", "smollm", "smollm-decode"), required=True)
     parser.add_argument("--layers", type=int, default=2)
     parser.add_argument("--tokens", type=int, nargs="+")
     parser.add_argument("--rounds", type=int, default=1)
@@ -53,7 +53,8 @@ def main():
         point = folder / f"tokens-{length}" if sweep else folder
         point.mkdir(exist_ok=True)
         print(f"START tokens={length}, rounds={args.rounds}", flush=True)
-        command = [config["megabake_python"], "-u", str(ROOT / "tools/repro/mock_smoke.py"),
+        script = "mock_decode.py" if args.workload == "smollm-decode" else "mock_smoke.py"
+        command = [config["megabake_python"], "-u", str(ROOT / "tools/repro" / script),
                    "--workload", args.workload, "--layers", str(args.layers),
                    "--rows", str(length), "--samples", str(config["samples"]),
                    "--rounds", str(args.rounds), "--output", str(point / "mock-forward.json")]

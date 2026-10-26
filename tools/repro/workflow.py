@@ -159,7 +159,7 @@ def main():
         p.add_argument("run_id", type=validate_id)
         if name == "launch":
             p.add_argument("--baseline-only", action="store_true")
-            p.add_argument("--mock", choices=("mlp", "smollm"))
+            p.add_argument("--mock", choices=("mlp", "smollm", "smollm-decode"))
             p.add_argument("--layers", type=int, default=2)
             p.add_argument("--tokens", type=int, nargs="+")
             p.add_argument("--rounds", type=int, default=1)
