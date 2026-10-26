@@ -15,7 +15,7 @@ def category(name):
         return 'sampling'
     if any(s in text for s in ('norm', 'rotary', 'rope', 'silu', 'gelu')):
         return 'norm / position / activation'
-    if any(s in text for s in ('attention', 'flashattn', 'flash_attn', 'batch_decode', 'batchdecode', 'softmax')):
+    if any(s in text for s in ('attention', 'flashattn', 'flash_attn', 'flash_fwd', 'fmha', 'batch_decode', 'batchdecode', 'softmax')):
         return 'attention / softmax'
     if any(s in text for s in ('gemm', 'gemv', 'matmul', 'cublas', 'cutlass', 'nvjet_tst')):
         return 'linear algebra'

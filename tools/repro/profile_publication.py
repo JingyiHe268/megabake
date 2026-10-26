@@ -65,42 +65,73 @@ def export_profile(folder):
             timings.append(dict(engine=name,output_tokens=length,decode_steps=length-1,
                                 median_mean_tpot_ms=statistics.median(values),min_mean_tpot_ms=min(values),max_mean_tpot_ms=max(values)))
             trials.extend(dict(engine=name,**{k:r[k] for k in ('output_tokens','decode_steps','trial','decode_total_ms','decode_mean_ms_per_token','output_sha256')}) for r in rows)
-    phases=[];phase_summary=[]
+    phases=[];phase_summary=[];phase_groups=[]
     for p in phase['phase_profiles']:
         phase_summary.append({k:p[k] for k in ('lead_decode_steps','first_cached_tokens','workers','phases','barrier_intervals','timed_total_us','trailing_phases_untimed')})
         phases.extend(dict(lead_decode_steps=p['lead_decode_steps'],category=c['category'],phases=c['phases'],approximate_us=c['us']) for c in p['categories'])
+        groups={}
+        for c in p['categories']:
+            name=c['category']
+            group=('GEMM' if 'tensor-core GEMM' in name else 'Attention' if 'kv_attention' in name else
+                   'RoPE' if '[rope]' in name else 'Other fused elementwise' if name=='generic_elementwise_fused' else 'Other')
+            groups[group]=groups.get(group,0.)+c['us']
+        phase_groups.extend(dict(first_cached_tokens=p['first_cached_tokens'],group=k,approximate_us=v) for k,v in groups.items())
     if [p['lead_decode_steps'] for p in phase['phase_profiles']]!=LEADS:raise ValueError('Missing internal phase windows')
     for name,rows in [('comparison.csv',timings),('comparison_trials.csv',trials),('gpu_windows.csv',windows),
                       ('gpu_kernels.csv',kernels),('cuda_apis.csv',apis),('gpu_categories.csv',categories),
-                      ('megabake_phase_summary.csv',phase_summary),('megabake_phase_categories.csv',phases)]:
+                      ('megabake_phase_summary.csv',phase_summary),('megabake_phase_categories.csv',phases),('megabake_phase_groups.csv',phase_groups)]:
         path=target/name;write_csv(path,rows);files.append(path)
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     plt.rcParams.update({'svg.fonttype':'none','svg.hashsalt':'decode-profile-v1','font.size':10})
+    previews=folder/'previews';previews.mkdir(exist_ok=True)
+    def save(fig,path):
+        fig.savefig(path,metadata={'Date':None})
+        fig.savefig(previews/(path.stem+'.png'),dpi=150)
     labels={'sglang':'SGLang (CUDA Graph)','megabake':'MegaBake',
             'tensor_eager_graph':'Eager + CUDA Graph','tensor_inductor':'Inductor',
             'tensor_inductor_graph':'Inductor + CUDA Graph','sdpa_inductor_graph':'Inductor + masked SDPA + CUDA Graph',
             'flash_inductor_graph':'Inductor + FlashAttention + CUDA Graph'}
     fig,ax=plt.subplots(figsize=(9,5))
+    primary={'sglang','megabake','tensor_inductor_graph','flash_inductor_graph'}
     for e in engines:
+        if e['engine'] not in primary:continue
         rows=[r for r in timings if r['engine']==e['engine']]
         ax.plot([r['output_tokens'] for r in rows],[r['median_mean_tpot_ms'] for r in rows],marker='o',label=labels[e['engine']])
-    ax.set(xlabel='Output length (includes first token from prefill)',ylabel='Mean decode ms/token',title='H100, shared mock SmolLM-135M, BF16, batch 1, prefill 128')
+    ax.set(xlabel='Output length (includes first token from prefill)',ylabel='Mean decode ms/token (median of 3 runs)',ylim=(0,2.4),title='H100, shared mock SmolLM-135M, BF16, batch 1, prefill 128')
     ax.grid(alpha=.2);ax.legend(fontsize=8);fig.tight_layout()
-    path=target/'compiler_graph_comparison.svg';fig.savefig(path,metadata={'Date':None});plt.close(fig);files.append(path)
+    path=target/'compiler_graph_comparison.svg';save(fig,path);plt.close(fig);files.append(path)
+    fig,ax=plt.subplots(figsize=(10,5))
+    rows=[r for r in timings if r['output_tokens']==4096]
+    bars=ax.bar(range(len(rows)),[r['median_mean_tpot_ms'] for r in rows],color=plt.get_cmap('tab10').colors[:len(rows)])
+    ax.bar_label(bars,fmt='%.3f',padding=3,fontsize=9)
+    ax.set_xticks(range(len(rows)),[labels[r['engine']] for r in rows],rotation=24,ha='right',fontsize=8)
+    ax.set(ylabel='Mean decode ms/token (median of 3 runs)',title='4096 output tokens: compiler, CUDA Graph and attention ablations',ylim=(0,9.3))
+    ax.grid(axis='y',alpha=.2);fig.tight_layout()
+    path=target/'cuda_graph_ablation.svg';save(fig,path);plt.close(fig);files.append(path)
     fig,axes=plt.subplots(1,3,figsize=(14,5),sharey=True)
-    names=[e['engine'] for e in engines]
+    names=[e['engine'] for e in engines if e['engine'] in primary]
+    short={'sglang':'SGLang (CG)','megabake':'MegaBake','tensor_inductor_graph':'Inductor + CG',
+           'flash_inductor_graph':'Inductor + FlashAttention + CG'}
     for ax,lead in zip(axes,LEADS):
         rows=[next(r for r in windows if r['engine']==name and r['lead_decode_steps']==lead) for name in names]
         busy=[r['gpu_busy_us_per_step']/1000 for r in rows]
-        ax.bar(range(len(names)),busy,label='GPU busy (union)')
+        ax.bar(range(len(names)),busy,label='GPU busy (union)',color=['tab:blue','tab:orange','tab:green','tab:red'][:len(names)])
         ax.set_title(f'Cached tokens: {128+lead}–{128+lead+15}')
-        ax.set_xticks(range(len(names)),[labels[n] for n in names],rotation=65,ha='right',fontsize=8)
+        ax.set_xticks(range(len(names)),[short[n] for n in names],rotation=25,ha='right',fontsize=8)
         ax.grid(axis='y',alpha=.2)
     axes[0].set_ylabel('Profiled GPU busy ms/step');axes[0].legend(fontsize=8)
     fig.suptitle('GPU activity time in separate 16-step CUPTI windows (host gaps excluded)')
-    fig.tight_layout();path=target/'gpu_timeline.svg';fig.savefig(path,metadata={'Date':None});plt.close(fig);files.append(path)
+    fig.tight_layout();path=target/'gpu_timeline.svg';save(fig,path);plt.close(fig);files.append(path)
+    fig,ax=plt.subplots(figsize=(8,4.7))
+    for group in ('Attention','GEMM','RoPE','Other fused elementwise','Other'):
+        rows=[r for r in phase_groups if r['group']==group]
+        ax.plot([r['first_cached_tokens'] for r in rows],[r['approximate_us']/1000 for r in rows],marker='o',label=group)
+    ax.set(xlabel='Cached tokens before profiling window',ylabel='Approximate phase-group ms/step',ylim=(0,1.3),
+           title='MegaBake separate instrumented build: computation + synchronization')
+    ax.grid(alpha=.2);ax.legend(fontsize=8);fig.tight_layout()
+    path=target/'megabake_phase_breakdown.svg';save(fig,path);plt.close(fig);files.append(path)
     text=('# Matched decode profiling and compiler/graph ablation\n\n'
           'H100 80GB, shared nonzero random checkpoint, BF16, batch=1, prefill=128. '
           'Output length D includes the first token from prefill; timed decode steps = D−1. '
@@ -146,3 +177,27 @@ def export_profile(folder):
         for r in counters['measurements']:text+=f'| {r["first_cached_tokens"]} | {r["metric"]} | {r["value"]:.6g} | {r["unit"]} |\n'
         (target/'profiling.md').write_text(text)
     return files
+
+
+def attach_followup(directory,followup):
+    """Keep raw evidence private and attach only completed, matched aggregates."""
+    from counter_publication import extract
+    status=json.loads((followup/'status.json').read_text())
+    flash=json.loads((followup/'torch-flash-generation.json').read_text())
+    sg=json.loads((directory/'sglang-generation.json').read_text())
+    counters=extract(followup/'counters')
+    if (status['state']!='complete' or flash['state']!='complete' or flash['model_files']!=sg['model_files']
+            or counters['model_files']!=sg['model_files'] or flash['execution_commit']!=status['execution_commit']
+            or counters['execution_commit']!=status['execution_commit']):
+        raise ValueError('Follow-up is incomplete or has mismatched provenance')
+    (directory/'torch-flash-generation.json').write_text(json.dumps(flash,indent=2)+'\n')
+    (directory/'counter-aggregate.json').write_text(json.dumps(counters,indent=2)+'\n')
+
+
+if __name__=='__main__':
+    import argparse
+    from pathlib import Path
+    parser=argparse.ArgumentParser();parser.add_argument('directory',type=Path);parser.add_argument('--followup',type=Path)
+    args=parser.parse_args()
+    if args.followup:attach_followup(args.directory,args.followup)
+    print('\n'.join(str(p) for p in export_profile(args.directory)))

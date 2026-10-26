@@ -60,9 +60,49 @@ ChatGPT GitHub connector 绑定的是另一账号，因此本流程使用本地 
 更换电脑时使用自己的 SSH 配置，避免复制别人的私钥。
 
 `collect` 不删除任一端的文件；大型 generated、Nsight 原始数据库不自动拉取。
+原始 CUPTI `*-trace.json` 也保留服务器，不自动拉取。
 `publish` 只提交 `published/` 中由有效数据生成的 CSV / Markdown 表格和性能对比图。
 图表必须有成功测量值；不会上传运行失败图、报错截图、报告/终端截图或占位图。
 原始日志、环境快照、patch、JSON 测量、HTML 报告和截图仅保留在本地及服务器。
+
+## 同条件 profiling 与强编译器基线
+
+结果解读见 [PROFILING_ANALYSIS.md](PROFILING_ANALYSIS.md)。以下使用未占用的新 run ID，先确认已有分配仍有效且 GPU 没有其他测试：
+
+```bash
+# 本地：先提交、部署同一版本，再启动顺序执行的性能与 profiler 实验。
+python3 tools/repro/workflow.py --config tools/repro/ln301-profiling.json deploy
+python3 tools/repro/workflow.py --config tools/repro/ln301-profiling.json launch profile-new --generation --tokens 128 1024 4096 --rounds 3
+python3 tools/repro/workflow.py --config tools/repro/ln301-profiling.json status profile-new
+python3 tools/repro/workflow.py --config tools/repro/ln301-profiling.json collect profile-new
+```
+
+配置 `profiling=true` 依次运行共同 checkpoint、SGLang、MegaBake、Eager Graph/Inductor/Inductor Graph/masked SDPA 消融、独立 instrumented MegaBake。主计时不使用 profiler；短窗口和阶段计时分别输出，不混入 TPOT。当前 profiling 窗口及后续强基线固定以 4096 最大输出为口径。
+
+主实验结束后，在服务器仓库目录启动逻辑 KV 长度 FlashAttention 与独立 NCU（两者串行）：
+
+```bash
+cd /HOME/sysu_xwzhang/sysu_xwzhang_3/hejy/megabake
+srun --jobid=281111 --overlap --exact -N1 -n1 -c4 --mem=24G \
+  /HOME/sysu_xwzhang/sysu_xwzhang_3/hejy/envs/megabake-cu126/bin/python \
+  tools/repro/run_profile_followup.py --config tools/repro/ln301-profiling.json \
+  --output results/profile-followup-new
+```
+
+随后在本地取回小型聚合数据并合并、发布；使用已配置 Matplotlib 的 `.repro/plot-env`：
+
+```bash
+rsync -az --exclude='*-trace.json' -e 'ssh -o BatchMode=yes' \
+  ln301:/HOME/sysu_xwzhang/sysu_xwzhang_3/hejy/megabake/results/profile-followup-new/ \
+  results/profile-followup-new/
+MPLCONFIGDIR=.repro/matplotlib .repro/plot-env/bin/python tools/repro/profile_publication.py \
+  results/profile-new --followup results/profile-followup-new
+MPLCONFIGDIR=.repro/matplotlib .repro/plot-env/bin/python tools/repro/workflow.py \
+  --config tools/repro/ln301-profiling.json publish profile-new
+python3 tools/repro/workflow.py --config tools/repro/ln301-profiling.json deploy
+```
+
+合并时检查完成状态、执行提交与共同模型哈希；发布仍只提交成功性能 CSV/Markdown/SVG。NCU 回放计时、CUPTI 活动时间、无 profiler 的连续 TPOT 分别保留，不能混算。后续修改环境、模型或编译选项时须更新配置及证据，不能沿用旧数据标签。
 SGLang 图比较相同工作负载的 CUDA Graph 开关；mock 图比较同一随机模型的四种 forward 实现。
 不同模型、不同计时范围之间不绘制加速比。
 读取到 `running` 时不要发布；终态中若有独立成功测量，可以只导出这些测量；没有有效数据则拒绝发布。

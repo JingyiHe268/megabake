@@ -1,5 +1,14 @@
 # 当前复现进度（2026-10-26）
 
+## 最新：同条件 profiling 与 Inductor/CUDA Graph 消融
+
+已完成 [根因分析](PROFILING_ANALYSIS.md) 与 [成功性能表格、图表](../../results/20261026-h100-decode-profile/published/profiling.md)。
+主机计时与 profiler 运行分离；新增逻辑 KV 长度的 FlashAttention+Inductor+CUDA Graph 强基线，以及 MegaBake 阶段计时、NCU 硬件计数器。
+中段 GPU 窗口中 MegaBake 模型 kernel 1.863 ms，SGLang 全部 GPU busy 1.111 ms；差距主要已存在于 GPU 内部。
+注意力阶段随生成推进约 0.485→0.783→1.170 ms，GEMM 阶段约 0.70 ms 基本稳定；阶段时间包含同步，不是纯算子计时。
+4096 输出：SGLang 1.1086、MegaBake 2.0199、Inductor 5.3683、Inductor+Graph 1.8614、Inductor+逻辑长度 FlashAttention+Graph 1.5968 ms/token。
+当前 MegaBake 并未战胜强编译器/注意力/图捕获组合。原版核心编译器未改动，下一步候选与对比局限见分析文档。
+
 ## 当前主实验：固定 prefill=128，连续输出 128–4096，与 SGLang 比较
 
 **用户所指长度为输出/decode length，不是 KV cache 长度。** 前面的 KV 长度扫描属于另一种微基准，不作为本次需求的性能结论。

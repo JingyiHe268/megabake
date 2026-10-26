@@ -21,3 +21,5 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(category('cutlass::device_kernel<flash::FlashAttnFwdSm90>'),'attention / softmax')
         self.assertEqual(category('cutlass_kernel_flashinfernormkernelsFusedAddRMSNorm'),'norm / position / activation')
         self.assertEqual(category('nvjet_tst_64x8_64x16'),'linear algebra')
+        self.assertEqual(category('pytorch_flash::flash_fwd_splitkv_kernel'),'attention / softmax')
+        self.assertEqual(category('fmha_cutlassF_bf16_aligned_64x64_rf_sm80'),'attention / softmax')

@@ -12,12 +12,16 @@ def extract(folder):
     text=(folder/'ncu.csv').read_text();lines=text.splitlines()
     start=next(i for i,s in enumerate(lines) if s.startswith('"ID","Process ID"'))
     rows=[]
+    aliases={'Block Size':'launch__block_size','Grid Size':'launch__grid_size',
+             'Registers Per Thread':'launch__registers_per_thread',
+             'Dynamic Shared Memory Per Block':'launch__shared_mem_per_block_dynamic',
+             'Static Shared Memory Per Block':'launch__shared_mem_per_block_static'}
     for row in csv.DictReader(io.StringIO('\n'.join(lines[start:]))):
         if row.get('Metric Value') is None:continue
         try:index=int(row['ID']);value=float(row['Metric Value'].replace(',',''))
         except (ValueError,TypeError):continue
         if index not in (0,1) or not math.isfinite(value):continue
-        metric=row['Metric Name']
+        metric=aliases.get(row['Metric Name'],row['Metric Name'])
         if metric not in ('gpu__time_duration.sum','dram__bytes.sum','dram__throughput.avg.pct_of_peak_sustained_elapsed',
                           'sm__throughput.avg.pct_of_peak_sustained_elapsed','sm__warps_active.avg.pct_of_peak_sustained_active',
                           'launch__registers_per_thread','launch__shared_mem_per_block_static','launch__shared_mem_per_block_dynamic',
