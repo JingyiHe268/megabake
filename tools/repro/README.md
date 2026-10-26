@@ -60,10 +60,28 @@ ChatGPT GitHub connector 绑定的是另一账号，因此本流程使用本地 
 `publish` 只提交 `published/` 中由有效数据生成的 CSV / Markdown 表格和性能对比图。
 图表必须有成功测量值；不会上传运行失败图、报错截图、报告/终端截图或占位图。
 原始日志、环境快照、patch、JSON 测量、HTML 报告和截图仅保留在本地及服务器。
-现有柱状图仅比较相同工作负载的 SGLang CUDA Graph 开关；没有 MegaBake 数据时不绘制跨框架比较。
+SGLang 图比较相同工作负载的 CUDA Graph 开关；mock 图比较同一随机模型的四种 forward 实现。
+不同模型、不同计时范围之间不绘制加速比。
 读取到 `running` 时不要发布；终态中若有独立成功测量，可以只导出这些测量；没有有效数据则拒绝发布。
 
 ## 环境与模型准备
+
+**当前可运行方案：** 按 [OFFLINE_MOCK.md](OFFLINE_MOCK.md) 使用独立
+`~/hejy/envs/megabake-cu126`、Python 3.12.13、PyTorch 2.14.0+cu126、CuTe 4.8.0 和 CUDA 12.9 工具链。
+69 个 Linux wheels 已在本地下载、校验并传入服务器，离线安装完成；真实 CUDA 张量、BF16 GEMM、
+CuTe GPU 单测和 mock MLP 已通过。模型使用固定种子的随机权重，无须下载 checkpoint。
+这是当前驱动下实测可用的实验配置，不代表 CuTe 对 R550 的官方支持，也不等同于原版 cu130 环境。
+
+本地执行：
+
+```bash
+python3 tools/repro/workflow.py --config tools/repro/ln301-mock-cu126.json deploy
+python3 tools/repro/workflow.py --config tools/repro/ln301-mock-cu126.json \
+  launch unique-mock-run --mock smollm --layers 30
+# status / collect / publish 均使用同一配置与 run ID。
+```
+
+以下为原版 CUDA 13 + 预训练权重流程，当前固定驱动不满足，不能直接执行来替代上面的 mock 方案。
 
 配置文件为 `tools/repro/ln301.json`。已有 SGLang 使用其原 `.venv` 和源码；不安装或升级其中任何包。
 MegaBake 必须使用独立环境 `~/hejy/envs/megabake`。
@@ -72,11 +90,11 @@ MegaBake 必须使用独立环境 `~/hejy/envs/megabake`。
 原版 MegaBake 要求 Python >=3.12、PyTorch 2.14.x、CuTe 4.8.0、CUDA 13.0 开发工具链。
 已找到用户目录的 Python 3.12.13，以及集群 CUDA 13.0：`/APP/u22/ai_x86/CUDA/13.0`。
 配置已使用这个工具链；不直接加载会把 stubs 加入运行时库路径的集群 module。
-独立 MegaBake 环境可以用已有 Python 创建，所需 Python 包仍待下载。
+原版独立 MegaBake 环境已创建；CUDA 13.0 runtime 实测返回错误 35（驱动不足）。
 本次连接中，登录节点的 `resolvectl query pypi.org` 返回
 `No appropriate name servers or networks for name found`，不是根据计算节点限制推测登录节点不能下载。
 
-在已有可用 Python 3.13 和 CUDA 13 工具链、可访问依赖源后，在服务器执行：
+仅在驱动满足 CUDA 13、可访问依赖源后，在服务器执行：
 
 ```bash
 /HOME/sysu_xwzhang/sysu_xwzhang_3/.local/bin/uv venv \
