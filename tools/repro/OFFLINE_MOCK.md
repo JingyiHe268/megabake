@@ -97,6 +97,8 @@ python3 tools/repro/workflow.py --config tools/repro/ln301-mock-sweep.json \
   launch unique-token-sweep --mock smollm --layers 30 --tokens 4 8 16 32 64 128 --rounds 3
 python3 tools/repro/workflow.py --config tools/repro/ln301-mock-sweep.json collect unique-token-sweep
 # 本地发布器的多长度绘图需要 matplotlib；服务器计算环境无需安装它。
+# 首次准备：uv venv .repro/plot-env
+# uv pip install --python .repro/plot-env/bin/python matplotlib==3.11.2
 .repro/plot-env/bin/python tools/repro/workflow.py --config tools/repro/ln301-mock-sweep.json publish unique-token-sweep
 ```
 

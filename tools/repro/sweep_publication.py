@@ -106,7 +106,7 @@ def plots(target, points):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    matplotlib.rcParams.update({"svg.fonttype": "none", "font.size": 10})
+    matplotlib.rcParams.update({"svg.fonttype": "none", "svg.hashsalt": "megabake-token-sweep", "font.size": 10})
     lengths = [p["rows"] for p in points]
     colors = ("#687587", "#d99026", "#387bc1", "#14866a")
     files = []
