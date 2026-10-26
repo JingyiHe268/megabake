@@ -39,9 +39,9 @@ SmolLM 使用预构造因果 mask，已检查其与原始二维 mask 的 eager �
 MegaBake 相对 eager 的 L2 误差均为 0，三种工作负载均确认只执行 1 个工作内核。
 完整 30 层下，MegaBake 比 eager CUDA Graph 约快 1.54 倍，比 Inductor 约快 2.34 倍；
 MLP 和两层结果未显示相同优势。上述加速比只适用于这次随机权重、4 tokens 的同步 forward 测量。
-完整模型结构已验证可运行；原版 CUDA 13、预训练权重、decode 及共同模型 SGLang 对比仍未完成。
+完整模型结构已验证可运行；原版 CUDA 13、预训练权重及共同模型 SGLang 对比仍未完成。mock decode 见下节。
 
-## 六组 token 长度对比
+## 六组 prefill token 长度对比
 
 已完成 [4 / 8 / 16 / 32 / 64 / 128 tokens 的完整表格与曲线](../../results/20261026-h100-mock-token-sweep/published/performance.md)。
 统一使用 30 层随机权重 SmolLM、BF16、batch=1、seed=20261026；每组独立进程编译，
@@ -66,6 +66,33 @@ Inductor / eager 为 0.013792–0.016289，均低于预设 0.02 阈值。
 
 当前 R550 低于 CuTe CUDA 12.9 的官方驱动要求。六组通过只证明这些路径实测可用；
 新驱动 API、新版 PTX JIT 或其他形状仍可能失败。详见 [实际影响](OFFLINE_MOCK.md#低于官方驱动要求的实际影响)。
+
+## Batch=1 decode：128–4096 已缓存 tokens
+
+[完整表格、逐轮数据、3600 个采样及延迟/加速比曲线](../../results/20261026-h100-mock-decode-sweep-v3/published/performance.md)。
+30 层随机权重 SmolLM、BF16、seed=20261026、batch=1，每次输入 1 token 并更新 KV。
+每个上下文长度独立进程编译，随后同一进程内 3 轮 × 每种实现 50 个样本；不含编译、warmup 或上下文恢复。
+
+| Cached tokens | Eager ms | CUDA Graph ms | Inductor BF16-aligned ms | MegaBake ms |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 28.414203 | 3.861142 | 5.510993 | 2.256760 |
+| 256 | 22.594549 | 3.905907 | 4.361218 | 2.173426 |
+| 512 | 22.636298 | 3.985727 | 4.488640 | 2.196452 |
+| 1024 | 22.539603 | 4.792398 | 4.380947 | 2.282755 |
+| 2048 | 24.005350 | 4.195433 | 4.640771 | 2.471149 |
+| 4096 | 22.717340 | 5.189376 | 4.338654 | 2.862399 |
+
+MegaBake 全部六组快于两个优化基线；相对 CUDA Graph 为 1.70–2.10×，相对 BF16 对齐 Inductor 为 1.52–2.44×。
+这是固定上下文的同步 host+GPU 单步延迟，不包含采样、分词、引擎调度或持续生成循环。
+MegaBake logits 相对 eager 的 L2 最大为 0.001340（2048 上下文）；其他五组为 0。
+Inductor logits L2 均为 0；全部实现的新 KV L2 均为 0，旧缓存及未用尾部保持不变，各层长度只增加 1。
+所有 MegaBake 组均检查为 1 个工作内核。
+
+KV 内容是非零随机数据，没有用真实 prompt 执行 prefill。各点 cache capacity=context+128，预留编译校准空间；
+编译后恢复完整初始状态再验证，每次计时前恢复逻辑长度，恢复不计时。
+基线使用 GPU-only tensor KV 实现，已与原声明 op 的 eager logits 和完整 KV 状态检查一致。
+Inductor 显式开启 `emulate_precision_casts=True`；图例标记 BF16-aligned，不当作默认 Inductor 配置。
+实验源码提交 `1b3fa9361047f3fd9a8e782bb4f167cf39682998`；原编译器源码未修改。
 
 ## SGLang 基线冒烟结果
 

@@ -69,7 +69,7 @@ SGLang 图比较相同工作负载的 CUDA Graph 开关；mock 图比较同一�
 **当前可运行方案：** 按 [OFFLINE_MOCK.md](OFFLINE_MOCK.md) 使用独立
 `~/hejy/envs/megabake-cu126`、Python 3.12.13、PyTorch 2.14.0+cu126、CuTe 4.8.0 和 CUDA 12.9 工具链。
 69 个 Linux wheels 已在本地下载、校验并传入服务器，离线安装完成；真实 CUDA 张量、BF16 GEMM、
-CuTe GPU 单测、mock MLP、两层与完整 30 层 SmolLM 已通过。模型使用固定种子的随机权重，无须下载 checkpoint。
+CuTe GPU 单测、mock MLP、两层与完整 30 层 SmolLM、batch=1 的 128–4096 上下文 decode 已通过。模型使用固定种子的随机权重，无须下载 checkpoint。
 这是当前驱动下实测可用的实验配置，不代表 CuTe 对 R550 的官方支持，也不等同于原版 cu130 环境。
 
 本地执行：
