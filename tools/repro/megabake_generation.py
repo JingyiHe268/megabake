@@ -64,6 +64,10 @@ def main():
         if any(int(v.item())!=128+length-1 for v in state[2*layers:]):raise RuntimeError('KV lengths did not advance correctly')
         return record(length,trial,elapsed,prefill,output.cpu().tolist()),checks
     validation,checks=run(max(args.lengths),0,True)
+    debug=dict(megabake_tokens=validation['output_token_ids'],sglang_tokens=sg['validation']['output_token_ids'],
+               first_mismatch=next((i for i,(a,b) in enumerate(zip(validation['output_token_ids'],sg['validation']['output_token_ids'])) if a!=b),None),
+               logits_relative_l2={k:float((v.float()-expected[k].float()).norm()/expected[k].float().norm().clamp_min(1e-12)) for k,v in checks.items()})
+    (args.output.parent/'generation-validation-debug.json').write_text(json.dumps(debug,indent=2)+'\n')
     if validation['output_token_ids'] != sg['validation']['output_token_ids']:
         raise RuntimeError('Greedy token sequences differ between SGLang and MegaBake')
     for index,logits in checks.items():

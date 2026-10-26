@@ -137,6 +137,9 @@ def export_mock(directory):
 
 
 def export(directory):
+    if (directory / "sglang-generation.json").exists():
+        from generation_publication import export_generation
+        return export_generation(directory)
     if (directory / "sweep.json").exists():
         from sweep_publication import export_sweep
         return export_sweep(directory)

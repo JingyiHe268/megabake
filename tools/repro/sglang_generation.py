@@ -13,8 +13,10 @@ def main():
     p=argparse.ArgumentParser();p.add_argument('--model',required=True);p.add_argument('--output',type=Path,required=True)
     p.add_argument('--lengths',type=int,nargs='+',default=LENGTHS);p.add_argument('--rounds',type=int,default=3)
     args=p.parse_args()
+    print('Importing SGLang benchmark and CUDA runtime',flush=True)
     import torch
     import sglang.benchmark.one_batch as b
+    print('SGLang benchmark imported',flush=True)
     from safetensors.torch import save_file
     parser=argparse.ArgumentParser();b.ServerArgs.add_cli_args(parser)
     raw=parser.parse_args(['--model-path',args.model,'--tokenizer-path',args.model,'--dtype','bfloat16',
@@ -41,7 +43,18 @@ def main():
             tokens=output.cpu().tolist();runner.cleanup(batch)
             return record(length,trial,elapsed,prefill,tokens),checks
         run(32,0)
+        graph_runner=getattr(runner.torch_runner,'decode_cuda_graph_runner',None)
+        if graph_runner is None: raise RuntimeError('SGLang CUDA Graph runner was not initialized')
+        original_replay=graph_runner.execute
+        replay_count=[0]
+        def counted_replay(*a,**kw):
+            replay_count[0]+=1
+            return original_replay(*a,**kw)
+        graph_runner.execute=counted_replay
         validation,checks=run(max(args.lengths),0,True)
+        graph_runner.execute=original_replay
+        if replay_count[0] != max(args.lengths)-1:
+            raise RuntimeError(f'SGLang graph replay count {replay_count[0]} does not match decode steps')
         args.output.parent.mkdir(parents=True,exist_ok=True)
         save_file(checks,str(args.output.parent/'sglang-validation.safetensors'))
         measurements=[]
@@ -58,7 +71,10 @@ def main():
                     rounds=args.rounds,model_files=fingerprint(args.model),measurements=measurements,
                     validation=validation,torch=torch.__version__,gpu=torch.cuda.get_device_name(),
                     sglang=importlib.metadata.version('sglang'),
-                    cuda_graph_disabled=bool(cfg.disable_cuda_graph),
+                    cuda_graph_disabled=bool(getattr(cfg,'disable_cuda_graph',False)),
+                    validated_graph_replay_count=replay_count[0],
+                    sglang_commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=Path(b.__file__).resolve().parents[3],text=True).strip(),
+                    sglang_dirty=bool(subprocess.check_output(['git','status','--porcelain'],cwd=Path(b.__file__).resolve().parents[3],text=True).strip()),
                     execution_commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=Path(__file__).resolve().parents[2],text=True).strip())
         args.output.write_text(json.dumps(result,indent=2)+'\n')
     b.latency_test=execute
