@@ -113,7 +113,7 @@ def plots(target, points):
     for kind in ("latency", "speedup"):
         fig, ax = plt.subplots(figsize=(9, 5.4), layout="constrained")
         for variant, color in zip(VARIANTS, colors):
-            if kind == "speedup" and variant == "megabake":
+            if kind == "speedup" and variant in ("megabake", "eager"):
                 continue
             values = [p["measurements"][variant]["median_call_us"] / 1000 for p in points]
             if kind == "speedup":
