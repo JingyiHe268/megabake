@@ -79,11 +79,13 @@ echo "DEPLOYED_COMMIT=$revision"
         {"commit": revision, "bundle_sha256": digest, "remote_repo": config["remote_repo"]}, indent=2) + "\n")
 
 
-def launch(config, config_path, run_id, baseline_only=False, mock=None, layers=2, tokens=None, rounds=1):
+def launch(config, config_path, run_id, baseline_only=False, mock=None, layers=2, tokens=None, rounds=1, generation=False):
     run_id = validate_id(run_id)
     if mock and (baseline_only or config.get("profile") != "cuda12-mock" or layers < 1):
         raise SystemExit("Mock runs require cuda12-mock config, positive layers, and no --baseline-only")
-    if rounds < 1 or (tokens and (not mock or min(tokens) < 1 or len(set(tokens)) != len(tokens))):
+    if generation and (mock or baseline_only or config.get("profile") != "cuda12-generation"):
+        raise SystemExit("Generation requires the shared-checkpoint cuda12-generation profile")
+    if rounds < 1 or (tokens and ((not mock and not generation) or min(tokens) < 1 or len(set(tokens)) != len(tokens))):
         raise SystemExit("Use unique positive --tokens with --mock and positive --rounds")
     try:
         relative_config = config_path.resolve().relative_to(ROOT)
@@ -94,8 +96,8 @@ def launch(config, config_path, run_id, baseline_only=False, mock=None, layers=2
         raise SystemExit("Commit changes before launching a reproducible run")
     repo = config["remote_repo"]
     result = f"{repo}/results/{run_id}"
-    runner = "run_mock_node.py" if mock else "run_node.py"
-    python = config["megabake_python"] if mock else "python3"
+    runner = "run_generation_node.py" if generation else ("run_mock_node.py" if mock else "run_node.py")
+    python = config["megabake_python"] if mock or generation else "python3"
     argv = ["srun", f"--jobid={config['job_id']}", "--overlap", "--exact", "-N1", "-n1", "-c4",
             "--mem=24G", python, f"{repo}/tools/repro/{runner}", "--config",
             f"{repo}/{relative_config}", "--run-id", run_id]
@@ -105,6 +107,10 @@ def launch(config, config_path, run_id, baseline_only=False, mock=None, layers=2
         argv.extend(["--workload", mock, "--layers", str(layers), "--rounds", str(rounds)])
         if tokens:
             argv.extend(["--tokens", *map(str, tokens)])
+    if generation:
+        argv.extend(["--rounds", str(rounds)])
+        if tokens:
+            argv.extend(["--lengths", *map(str, tokens)])
     # Reserve the run directory atomically, detach on the login node; work executes under srun.
     script = f"""set -euo pipefail
 test "$(git -C {shlex.quote(repo)} rev-parse HEAD)" = {shlex.quote(expected)}
@@ -163,12 +169,13 @@ def main():
             p.add_argument("--layers", type=int, default=2)
             p.add_argument("--tokens", type=int, nargs="+")
             p.add_argument("--rounds", type=int, default=1)
+            p.add_argument("--generation", action="store_true")
     args = parser.parse_args()
     config = json.loads(args.config.read_text())
     if args.command == "deploy":
         deploy(config)
     elif args.command == "launch":
-        launch(config, args.config, args.run_id, args.baseline_only, args.mock, args.layers, args.tokens, args.rounds)
+        launch(config, args.config, args.run_id, args.baseline_only, args.mock, args.layers, args.tokens, args.rounds, args.generation)
     elif args.command == "collect":
         collect(config, args.run_id)
     elif args.command == "publish":

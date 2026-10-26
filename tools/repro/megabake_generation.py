@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""Continuous greedy MegaBake decode from real 128-token prefill KV state."""
+import argparse
+import importlib.metadata
+import json
+from pathlib import Path
+import subprocess
+import time
+from generation_common import LENGTHS,PROMPT,CHECKS,fingerprint,record
+
+
+def main():
+    p=argparse.ArgumentParser();p.add_argument('--model',required=True);p.add_argument('--output',type=Path,required=True)
+    p.add_argument('--sglang-result',type=Path,required=True);p.add_argument('--lengths',type=int,nargs='+',default=LENGTHS)
+    p.add_argument('--rounds',type=int,default=3);args=p.parse_args()
+    import torch
+    from transformers import AutoModelForCausalLM
+    from megabake import make_backend
+    from tests.fixtures import StatefulSmolLM
+    from safetensors.torch import load_file
+    torch.set_grad_enabled(False)
+    torch.manual_seed(20261026)
+    model=AutoModelForCausalLM.from_pretrained(args.model,dtype=torch.bfloat16,attn_implementation='eager',local_files_only=True).cuda().eval()
+    stateful=StatefulSmolLM(model).eval()
+    layers=model.config.num_hidden_layers;capacity=128+max(args.lengths)+128
+    shape=(1,capacity,model.config.num_key_value_heads,model.config.hidden_size//model.config.num_attention_heads)
+    state=[torch.zeros(shape,device='cuda',dtype=torch.bfloat16) for _ in range(2*layers)]
+    state += [torch.zeros((1,),device='cuda',dtype=torch.int32) for _ in range(layers)]
+    backend=make_backend(mode='decode',compile_kernel=True,cache=False,scheduler='phase',dump_dir=args.output.parent/'generated')
+    compiled=torch.compile(stateful,backend=backend,fullgraph=True,dynamic=False)
+    dummy=torch.tensor([[504]],device='cuda');zero=torch.tensor([[0]],device='cuda')
+    start=time.perf_counter();compiled(dummy,zero,*state);torch.cuda.synchronize();compile_s=time.perf_counter()-start
+    if backend.megabake_contexts[-1].requirements.get('execution') != 'megakernel':raise RuntimeError('No megakernel execution')
+    for _ in range(5):
+        for length in state[2*layers:]: length.zero_()
+        compiled(dummy,zero,*state)
+    torch.cuda.synchronize()
+    prompt=torch.tensor([PROMPT],device='cuda')
+    positions=[torch.tensor([[128+i]],device='cuda') for i in range(max(args.lengths)-1)]
+    sg=json.loads(args.sglang_result.read_text())
+    if sg['model_files'] != fingerprint(args.model):raise RuntimeError('Checkpoint differs between engines')
+    expected=load_file(str(args.sglang_result.parent/'sglang-validation.safetensors'),device='cuda')
+    errors={}
+    def prepare():
+        result=model(prompt,use_cache=True,return_dict=True)
+        for i,cache in enumerate(result.past_key_values.layers):
+            state[i].zero_();state[layers+i].zero_()
+            state[i][:,:128].copy_(cache.keys.transpose(1,2))
+            state[layers+i][:,:128].copy_(cache.values.transpose(1,2))
+            state[2*layers+i].fill_(128)
+        return result.logits[:,-1,:].argmax(dim=-1),result.logits[:,-1,:]
+    def run(length,trial,verify=False):
+        torch.cuda.synchronize();start=time.perf_counter();current,logits=prepare();torch.cuda.synchronize()
+        prefill=time.perf_counter()-start
+        output=torch.empty(length,device='cuda',dtype=torch.int64);output[0].copy_(current[0])
+        checks={'0':logits.detach().clone()} if verify else {}
+        torch.cuda.synchronize();start=time.perf_counter()
+        for index in range(1,length):
+            logits=compiled(current.view(1,1),positions[index-1],*state)[:,-1,:]
+            current=logits.argmax(dim=-1)
+            output[index].copy_(current[0])
+            if verify and index in CHECKS:checks[str(index)]=logits.detach().clone()
+        torch.cuda.synchronize();elapsed=time.perf_counter()-start
+        if any(int(v.item())!=128+length-1 for v in state[2*layers:]):raise RuntimeError('KV lengths did not advance correctly')
+        return record(length,trial,elapsed,prefill,output.cpu().tolist()),checks
+    validation,checks=run(max(args.lengths),0,True)
+    if validation['output_token_ids'] != sg['validation']['output_token_ids']:
+        raise RuntimeError('Greedy token sequences differ between SGLang and MegaBake')
+    for index,logits in checks.items():
+        target=expected[index]
+        error=float((logits.float()-target.float()).norm()/target.float().norm().clamp_min(1e-12))
+        if not bool(torch.isfinite(logits).all()) or error>=.02:raise RuntimeError(f'Cross-engine logits L2 {error} at {index}')
+        errors[index]=error
+    # Workload trace excludes the separate greedy argmax and output-buffer copy.
+    current,_=prepare();torch.cuda.synchronize()
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,torch.profiler.ProfilerActivity.CUDA]) as profiler:
+        compiled(current.view(1,1),positions[0],*state);torch.cuda.synchronize()
+    kernels=[e for e in profiler.events() if e.device_type==torch.autograd.DeviceType.CUDA]
+    if len(kernels)!=1:raise RuntimeError(f'Workload kernels={len(kernels)}')
+    measurements=[]
+    for trial in range(1,args.rounds+1):
+        order=args.lengths if trial%2 else list(reversed(args.lengths))
+        for length in order:
+            row,_=run(length,trial)
+            if row['output_token_ids'] != validation['output_token_ids'][:length]:raise RuntimeError('MegaBake output not deterministic')
+            measurements.append(row)
+            print(f"MB output={length}, trial={trial}, decode={row['decode_total_ms']:.3f} ms",flush=True)
+    result=dict(state='complete',engine='megabake',prefill_tokens=128,batch_size=1,lengths=args.lengths,
+                rounds=args.rounds,model_files=fingerprint(args.model),measurements=measurements,validation=validation,
+                cross_engine_logits_relative_l2=errors,greedy_tokens_match=True,workload_kernel_count=1,
+                cache_capacity=capacity,compile_seconds=compile_s,torch=torch.__version__,
+                cute=importlib.metadata.version('nvidia-cutlass-dsl'),gpu=torch.cuda.get_device_name(),
+                execution_commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=Path(__file__).resolve().parents[2],text=True).strip())
+    args.output.write_text(json.dumps(result,indent=2)+'\n')
+
+
+if __name__=='__main__':main()
