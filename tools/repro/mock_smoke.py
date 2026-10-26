@@ -19,9 +19,10 @@ def main():
     parser.add_argument("--layers", type=int, default=2)
     parser.add_argument("--rows", type=int, default=4)
     parser.add_argument("--samples", type=int, default=20)
+    parser.add_argument("--rounds", type=int, default=1)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    if min(args.layers, args.rows, args.samples) < 1:
+    if min(args.layers, args.rows, args.samples, args.rounds) < 1:
         parser.error("layers, rows and samples must be positive")
 
     import torch
@@ -42,6 +43,7 @@ def main():
     else:
         from tests.fixtures import SmolLMArchitecture
         module = SmolLMArchitecture(layers=args.layers)
+        module.config.max_position_embeddings = max(4, args.rows)
         def model(ids, mask):
             return module(ids, attention_mask=mask).logits
         ids = torch.arange(1, args.rows + 1, device="cuda").view(1, -1)
@@ -91,19 +93,27 @@ def main():
 
     functions = {"eager": lambda: model(*inputs), "eager_cuda_graph": graph.replay,
                  "inductor": lambda: inductor(*inputs), "megabake": lambda: megabake(*inputs)}
-    measurements = {}
+    measurements = {name: {"samples_us": [], "round_medians_us": []} for name in functions}
     for name, function in functions.items():
         for _ in range(5):
             function()
         torch.cuda.synchronize()
-        samples = []
-        for _ in range(args.samples):
-            torch.cuda.synchronize()
-            started = time.perf_counter()
-            function()
-            torch.cuda.synchronize()
-            samples.append((time.perf_counter() - started) * 1e6)
-        measurements[name] = {"median_call_us": statistics.median(samples), "samples_us": samples}
+    # Rotate the variant order across rounds to reduce fixed order bias.
+    names = list(functions)
+    for trial in range(args.rounds):
+        order = names[trial % len(names):] + names[:trial % len(names)]
+        for name in order:
+            samples = []
+            for _ in range(args.samples):
+                torch.cuda.synchronize()
+                started = time.perf_counter()
+                functions[name]()
+                torch.cuda.synchronize()
+                samples.append((time.perf_counter() - started) * 1e6)
+            measurements[name]["samples_us"].extend(samples)
+            measurements[name]["round_medians_us"].append(statistics.median(samples))
+    for record in measurements.values():
+        record["median_call_us"] = statistics.median(record["samples_us"])
 
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
                                            torch.profiler.ProfilerActivity.CUDA]) as profiler:
@@ -116,7 +126,8 @@ def main():
               "execution_commit": subprocess.check_output(
                   ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[2], text=True).strip(),
               "workload": args.workload, "layers": args.layers if args.workload == "smollm" else None,
-              "rows": args.rows, "samples": args.samples, "dtype": "bfloat16",
+              "rows": args.rows, "samples": args.samples * args.rounds,
+              "rounds": args.rounds, "samples_per_round": args.samples, "dtype": "bfloat16",
               "profile": "experimental CUDA 12; not the upstream cu130 environment",
               "timing_scope": "synchronized model-forward calls; SmolLM uses a prebuilt causal mask; no SGLang engine comparison",
               "gpu": torch.cuda.get_device_name(), "torch": torch.__version__,

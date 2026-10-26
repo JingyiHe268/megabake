@@ -19,9 +19,13 @@ def main():
     parser.add_argument("--run-id", type=validate_id, required=True)
     parser.add_argument("--workload", choices=("mlp", "smollm"), required=True)
     parser.add_argument("--layers", type=int, default=2)
+    parser.add_argument("--tokens", type=int, nargs="+")
+    parser.add_argument("--rounds", type=int, default=1)
     args = parser.parse_args()
     config = json.loads(args.config.read_text())
-    if config.get("profile") != "cuda12-mock" or args.layers < 1:
+    lengths = args.tokens or [config["prompt_tokens"]]
+    if (config.get("profile") != "cuda12-mock" or args.layers < 1 or args.rounds < 1
+            or min(lengths) < 1 or len(set(lengths)) != len(lengths)):
         raise SystemExit("Use the explicit cuda12-mock profile and positive layer count")
     if os.environ.get("SLURM_JOB_ID") != str(config["job_id"]) or not os.environ.get("SLURM_STEP_ID"):
         raise SystemExit("Run inside the configured Slurm job step")
@@ -41,19 +45,34 @@ def main():
                CUDA_ROOT=config["cuda_home"], LD_LIBRARY_PATH=config["cuda_home"] + "/lib64",
                TRITON_PTXAS_PATH=config["cuda_home"] + "/bin/ptxas",
                HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", PYTHONUNBUFFERED="1")
-    command = [config["megabake_python"], "-u", str(ROOT / "tools/repro/mock_smoke.py"),
-               "--workload", args.workload, "--layers", str(args.layers),
-               "--rows", str(config["prompt_tokens"]), "--samples", str(config["samples"]),
-               "--output", str(folder / "mock-forward.json")]
-    stage = run_stage("mock-forward", command, folder, env, config["timeout_seconds"], ROOT)
-    if stage["state"] == "complete":
-        try:
-            data = json.loads((folder / "mock-forward.json").read_text())
-            if data["state"] != "complete" or data["execution_commit"] != commit:
-                raise ValueError("Result does not match the running source commit")
-        except (OSError, ValueError, KeyError) as error:
-            stage.update(state="failed", error=str(error))
-    status.update(state=stage["state"], stages=[stage], finished_at=now())
+    stages = []
+    sweep = len(lengths) > 1
+    if sweep:
+        write(folder / "sweep.json", {"tokens": lengths, "rounds": args.rounds, "execution_commit": commit})
+    for length in lengths:
+        point = folder / f"tokens-{length}" if sweep else folder
+        point.mkdir(exist_ok=True)
+        print(f"START tokens={length}, rounds={args.rounds}", flush=True)
+        command = [config["megabake_python"], "-u", str(ROOT / "tools/repro/mock_smoke.py"),
+                   "--workload", args.workload, "--layers", str(args.layers),
+                   "--rows", str(length), "--samples", str(config["samples"]),
+                   "--rounds", str(args.rounds), "--output", str(point / "mock-forward.json")]
+        stage = run_stage("mock-forward", command, point, env, config["timeout_seconds"], ROOT)
+        if stage["state"] == "complete":
+            try:
+                data = json.loads((point / "mock-forward.json").read_text())
+                if data["state"] != "complete" or data["execution_commit"] != commit or data["rows"] != length:
+                    raise ValueError("Result does not match the running source commit or token length")
+            except (OSError, ValueError, KeyError) as error:
+                stage.update(state="failed", error=str(error))
+        if sweep:
+            write(point / "status.json", {"state": stage["state"], "execution_commit": commit})
+        stages.append(dict(stage, tokens=length))
+        status.update(stages=stages)
+        write(folder / "status.json", status)
+        print(f"END tokens={length}, state={stage['state']}", flush=True)
+    state = "complete" if all(s["state"] == "complete" for s in stages) else "failed"
+    status.update(state=state, stages=stages, finished_at=now())
     write(folder / "status.json", status)
     print(json.dumps(status, indent=2), flush=True)
     return 0 if status["state"] == "complete" else 2

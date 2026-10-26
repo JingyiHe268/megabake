@@ -79,10 +79,12 @@ echo "DEPLOYED_COMMIT=$revision"
         {"commit": revision, "bundle_sha256": digest, "remote_repo": config["remote_repo"]}, indent=2) + "\n")
 
 
-def launch(config, config_path, run_id, baseline_only=False, mock=None, layers=2):
+def launch(config, config_path, run_id, baseline_only=False, mock=None, layers=2, tokens=None, rounds=1):
     run_id = validate_id(run_id)
     if mock and (baseline_only or config.get("profile") != "cuda12-mock" or layers < 1):
         raise SystemExit("Mock runs require cuda12-mock config, positive layers, and no --baseline-only")
+    if rounds < 1 or (tokens and (not mock or min(tokens) < 1 or len(set(tokens)) != len(tokens))):
+        raise SystemExit("Use unique positive --tokens with --mock and positive --rounds")
     try:
         relative_config = config_path.resolve().relative_to(ROOT)
     except ValueError:
@@ -100,7 +102,9 @@ def launch(config, config_path, run_id, baseline_only=False, mock=None, layers=2
     if baseline_only:
         argv.append("--baseline-only")
     if mock:
-        argv.extend(["--workload", mock, "--layers", str(layers)])
+        argv.extend(["--workload", mock, "--layers", str(layers), "--rounds", str(rounds)])
+        if tokens:
+            argv.extend(["--tokens", *map(str, tokens)])
     # Reserve the run directory atomically, detach on the login node; work executes under srun.
     script = f"""set -euo pipefail
 test "$(git -C {shlex.quote(repo)} rev-parse HEAD)" = {shlex.quote(expected)}
@@ -157,12 +161,14 @@ def main():
             p.add_argument("--baseline-only", action="store_true")
             p.add_argument("--mock", choices=("mlp", "smollm"))
             p.add_argument("--layers", type=int, default=2)
+            p.add_argument("--tokens", type=int, nargs="+")
+            p.add_argument("--rounds", type=int, default=1)
     args = parser.parse_args()
     config = json.loads(args.config.read_text())
     if args.command == "deploy":
         deploy(config)
     elif args.command == "launch":
-        launch(config, args.config, args.run_id, args.baseline_only, args.mock, args.layers)
+        launch(config, args.config, args.run_id, args.baseline_only, args.mock, args.layers, args.tokens, args.rounds)
     elif args.command == "collect":
         collect(config, args.run_id)
     elif args.command == "publish":

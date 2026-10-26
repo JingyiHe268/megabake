@@ -1,0 +1,17 @@
+{
+  "profile": "cuda12-mock",
+  "ssh_host": "ln301",
+  "job_id": "281111",
+  "remote_base": "/HOME/sysu_xwzhang/sysu_xwzhang_3/hejy",
+  "remote_repo": "/HOME/sysu_xwzhang/sysu_xwzhang_3/hejy/megabake",
+  "megabake_python": "/HOME/sysu_xwzhang/sysu_xwzhang_3/hejy/envs/megabake-cu126/bin/python",
+  "cuda_home": "/HOME/sysu_xwzhang/sysu_xwzhang_3/hejy/toolchains/cuda-12.9",
+  "repository": "https://github.com/JingyiHe268/megabake.git",
+  "branch": "reproduction/h100-sglang",
+  "source_revision": "f70b54cec53cc4e46136c7082e0c9e9f774f5ece",
+  "model_id": "MOCK/random-weights",
+  "model_revision": "seed-20261026",
+  "prompt_tokens": 4,
+  "samples": 50,
+  "timeout_seconds": 900
+}
