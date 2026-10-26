@@ -1,0 +1,14 @@
+# Experimental fixed-driver compatibility profile; original requirements.txt stays cu130.
+# Target: Linux x86_64, CPython 3.12. Do not resolve using macOS environment markers.
+torch==2.14.0+cu126
+nvidia-cutlass-dsl==4.8.0
+nvidia-cutlass==4.2.0.0
+cuda-python==12.9.10
+cuda-bindings==12.9.10
+safetensors==0.8.0
+huggingface-hub==1.33.0
+transformers==5.18.0
+numpy==2.5.3
+pytest==9.1.1
+setuptools>=77.0.3
+wheel
