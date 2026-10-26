@@ -141,3 +141,33 @@ Inductor 显式启用 `emulate_precision_casts=True`，保留 eager 的 BF16 中
 不把它与默认 Inductor 融合精度配置混为一谈。数值检查阈值保持 0.02。
 计时包含单 token 模型 forward、KV 写入、主机调用和结束同步，不包含采样/分词或 SGLang 调度。
 复用上述 collect / publish 命令；decode 表格使用 `cached_tokens`，图表横轴明确标为历史上下文长度。
+
+## 连续生成长度与 SGLang 对比
+
+这是用户指定的 decode length 扫描，与上面的固定 KV 上下文微基准不同。
+
+```bash
+python3 tools/repro/workflow.py --config tools/repro/ln301-generation.json deploy
+python3 tools/repro/workflow.py --config tools/repro/ln301-generation.json \
+  launch unique-generation-run --generation --tokens 128 256 512 1024 2048 4096 --rounds 3
+python3 tools/repro/workflow.py --config tools/repro/ln301-generation.json status unique-generation-run
+python3 tools/repro/workflow.py --config tools/repro/ln301-generation.json collect unique-generation-run
+MPLCONFIGDIR=.repro/matplotlib .repro/plot-env/bin/python tools/repro/workflow.py \
+  --config tools/repro/ln301-generation.json publish unique-generation-run
+```
+
+共同 checkpoint 位于 `~/hejy/models/mock-smollm135m-shared-v1`；只在不存在时生成，存在时核对 manifest 和文件 SHA256，不覆盖模型。
+它使用 SmolLM-135M 结构、共享 embedding、epsilon=1e-5、随机权重，并显式将最大位置扩到 8192 供合成性能测试。
+两个栈共享同一权重文件和同一组 128 个 prompt IDs；只调用 backend/model-runner，不测 HTTP 或 tokenizer。
+每组先执行真实 prefill，再自然推进 greedy decode；不使用随机 KV，不在每步 reset。
+
+输出 D 包含 prefill logits 采样出的第一个 token，定时 decode 步数=D-1。prefill 和编译不计入 decode。
+decode 计时包括模型/后端调用、KV 更新、greedy sampling 和 GPU 输出缓冲写入，只在整个循环起止同步。
+输出 CSV 分别记录 `output_tokens`、`decode_steps`、`decode_total_ms`、平均 TPOT、吞吐与单列 prefill 时间。
+主表为每组 3 次 run 的平均 TPOT 中位数，不是单 token 延迟的中位数。
+
+两栈都用自己的 greedy 输出继续生成；数值融合路径不同，随机模型可能发生 token 分叉。结果披露首个分叉位置，
+不声称输出逐位一致。MegaBake 在选定步骤以相同输入和 KV 状态对照原生 PyTorch，检查 logits、新 KV、旧 KV 和长度；
+该验证循环与性能计时循环分开。SGLang 的长序列 CUDA Graph 调用数也有实际检查。
+两栈软件版本不同且 SGLang 保留原有修改，结果是后端栈比较，不是孤立的编译器消融。
+发布仍仅允许通过检查的 CSV / Markdown 性能表格与数据绘制的 SVG 图；日志和诊断图不上传。

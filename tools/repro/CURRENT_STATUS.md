@@ -1,5 +1,40 @@
 # 当前复现进度（2026-10-26）
 
+## 当前主实验：固定 prefill=128，连续输出 128–4096，与 SGLang 比较
+
+**用户所指长度为输出/decode length，不是 KV cache 长度。** 前面的 KV 长度扫描属于另一种微基准，不作为本次需求的性能结论。
+[主结果表格与曲线](../../results/20261026-h100-generation-128-4096/published/performance.md)。
+
+共同 checkpoint 为 SmolLM-135M 结构的非零随机权重，固定 seed=20261026；共享 embedding、RMSNorm epsilon=1e-5，
+显式将合成测试的最大位置扩到 8192。两个栈加载相同 safetensors（SHA256 已校验），使用同一组 128 个 prompt token IDs。
+batch=1、BF16、TP=1；每组真实 prefill 后连续 greedy 生成，KV 自然增长，不在每步恢复状态。
+按 SGLang 输出长度定义，D 个输出的第一个来自 prefill logits，计时执行 D-1 次 decode；EOS 不提前终止。
+每组重复 3 次，取各次平均 TPOT 的中位数。
+
+| 输出 tokens D | 实际 decode 步数 | SGLang ms/token | MegaBake ms/token | SGLang / MegaBake |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 127 | 1.034033 | 1.729808 | 0.598× |
+| 256 | 255 | 1.060801 | 1.740546 | 0.609× |
+| 512 | 511 | 1.075818 | 1.747638 | 0.616× |
+| 1024 | 1023 | 1.086006 | 1.766213 | 0.615× |
+| 2048 | 2047 | 1.095911 | 1.841710 | 0.595× |
+| 4096 | 4095 | 1.105513 | 2.020126 | 0.547× |
+
+**当前连续生成口径下 SGLang 更快**：MegaBake 耗时为 SGLang 的约 1.62–1.83 倍。
+4096 输出对应 4095 次 timed decode，三轮总耗时中位数约 SGLang 4.527 s、MegaBake 8.272 s。
+计时包含后端调用、KV 更新、greedy sampling 与 GPU 输出缓冲写入，只在循环起止同步；
+加载、编译、warmup、prefill、HTTP 和分词均不计入。prefill 时间保存在逐轮表中，未加到 decode 指标。
+
+SGLang 已验证长序列的 4095 次 decode 经过 CUDA Graph；MegaBake 模型调用确认只执行 1 个工作内核，
+但 greedy sampling 和输出存储是额外操作。MegaBake 在 7 个选定步骤，用同输入、同 KV 状态对照原生 PyTorch，
+最大 logits 相对 L2=0.007577、最大新 KV 相对 L2=0.007893，均低于预设 0.02；旧 KV 与长度更新也检查通过。
+两栈的自然 greedy 序列在第 123 个输出处开始不同，不声称输出逐位等价。只在相同前缀下检查跨栈数值差异，
+不把分叉后的不同前缀 logits 用作正确性判断。
+
+SGLang 保持已有源码及工作区修改、torch 2.13.0+cu129；MegaBake 为 torch 2.14.0+cu126 / CuTe 4.8。
+因此是当前两个后端栈的性能比较，不能将差异只归因于 megakernel 编译器。
+执行源码提交 `11df6edcdad29c21ff3819e59c107484cf312935`，原 MegaBake 编译器源码不变。
+
 ## 结论与环境
 
 原版 CUDA 13 环境不能在固定 NVIDIA 550.54.15 驱动上直接运行：CUDA 13.0 runtime 实测返回驱动不足。
@@ -39,7 +74,7 @@ SmolLM 使用预构造因果 mask，已检查其与原始二维 mask 的 eager �
 MegaBake 相对 eager 的 L2 误差均为 0，三种工作负载均确认只执行 1 个工作内核。
 完整 30 层下，MegaBake 比 eager CUDA Graph 约快 1.54 倍，比 Inductor 约快 2.34 倍；
 MLP 和两层结果未显示相同优势。上述加速比只适用于这次随机权重、4 tokens 的同步 forward 测量。
-完整模型结构已验证可运行；原版 CUDA 13、预训练权重及共同模型 SGLang 对比仍未完成。mock decode 见下节。
+完整模型结构已验证可运行；原版 CUDA 13 与预训练权重仍未完成；共同随机模型的 SGLang 连续生成对比见本文顶部。
 
 ## 六组 prefill token 长度对比
 
@@ -67,7 +102,7 @@ Inductor / eager 为 0.013792–0.016289，均低于预设 0.02 阈值。
 当前 R550 低于 CuTe CUDA 12.9 的官方驱动要求。六组通过只证明这些路径实测可用；
 新驱动 API、新版 PTX JIT 或其他形状仍可能失败。详见 [实际影响](OFFLINE_MOCK.md#低于官方驱动要求的实际影响)。
 
-## Batch=1 decode：128–4096 已缓存 tokens
+## 历史固定 KV 单步扫描：不是用户指定的输出长度
 
 [完整表格、逐轮数据、3600 个采样及延迟/加速比曲线](../../results/20261026-h100-mock-decode-sweep-v3/published/performance.md)。
 30 层随机权重 SmolLM、BF16、seed=20261026、batch=1，每次输入 1 token 并更新 KV。

@@ -4,7 +4,7 @@ import io
 import json
 import math
 import statistics
-from generation_common import token_digest
+from generation_common import token_digest, CHECKS
 
 
 def validated(directory):
@@ -22,7 +22,8 @@ def validated(directory):
         raise ValueError('Token, megakernel or SGLang graph replay check missing')
     errors=mb.get('native_reference_logits_relative_l2',{})
     cache_errors=mb.get('native_reference_kv_relative_l2',{})
-    if (not errors or set(errors)!=set(cache_errors)
+    expected_checks={str(i) for i in CHECKS if 0<i<max(mb['lengths'])}
+    if (not errors or set(errors)!=expected_checks or set(errors)!=set(cache_errors)
             or not all(isinstance(v,(int,float)) and math.isfinite(v) and 0<=v<.02
                        for v in [*errors.values(),*cache_errors.values()])):
         raise ValueError('Native-reference logits or KV validation failed')
@@ -75,6 +76,8 @@ def export_generation(directory):
           'No per-step global synchronization. Excludes loading, compilation, warmup, prefill, HTTP and tokenization.\n\n'
           f'SGLang {sg["sglang"]}, torch {sg["torch"]}; MegaBake torch {mb["torch"]}, CuTe {mb["cute"]}. '
           'The stacks use different PyTorch/CUDA builds, so this is a backend-stack comparison, not an isolated compiler ablation.\n\n'
+          f'SGLang source `{sg.get("sglang_commit", "unavailable")}`; existing dirty worktree: {sg.get("sglang_dirty", "unavailable")}. '
+          'The existing SGLang environment and modifications were preserved.\n\n'
           f'MegaBake checked against native PyTorch using identical inputs and KV state at selected steps: '
           f'max logits L2 {max(mb["native_reference_logits_relative_l2"].values()):.6g}, '
           f'max new-KV L2 {max(mb["native_reference_kv_relative_l2"].values()):.6g}. '

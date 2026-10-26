@@ -2,6 +2,9 @@
 
 本次实际执行情况、测量与阻塞项见 [CURRENT_STATUS.md](CURRENT_STATUS.md)。
 
+当前主实验固定 prefill=128、batch=1，连续输出 128–4096 tokens，与现有 SGLang 比较；
+历史固定 KV 长度的单步结果不是这个输出长度扫描。操作见 [连续生成说明](OFFLINE_MOCK.md#连续生成长度与-sglang-对比)。
+
 本工作流固定 MegaBake 源码 `f70b54cec53cc4e46136c7082e0c9e9f774f5ece`，在其上增加实验工具。
 当前本地下载目录已与该提交逐文件核对。不要把 `origin/main` 的最新版本当作本次版本。
 
