@@ -127,6 +127,9 @@ def export_mock(directory):
 
 
 def export(directory):
+    if (directory / "sweep.json").exists():
+        from sweep_publication import export_sweep
+        return export_sweep(directory)
     if (directory / "mock-forward.json").exists():
         return export_mock(directory)
     rows = measurements(directory)

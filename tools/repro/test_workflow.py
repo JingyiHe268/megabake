@@ -158,5 +158,54 @@ class WorkflowTests(unittest.TestCase):
                 publication.export(folder)
 
 
+
+
+class SweepPublicationTests(unittest.TestCase):
+    def make_point(self, root, tokens, commit="abc"):
+        point = root / f"tokens-{tokens}"
+        point.mkdir()
+        data = dict(state="complete", mock_weights=True, workload="smollm", layers=30,
+                    rows=tokens, dtype="bfloat16", seed=1, torch="test", cute="test", gpu="test",
+                    profile="experimental", timing_scope="forward", execution_commit=commit,
+                    rounds=3, samples_per_round=2, samples=6, relative_l2=0.0,
+                    inductor_relative_l2=0.01, workload_kernel_count=1,
+                    measurements={name: dict(samples_us=[1., 3.] * 3, round_medians_us=[2.] * 3,
+                                             median_call_us=2.)
+                                  for name in ("eager", "eager_cuda_graph", "inductor", "megabake")})
+        (point / "mock-forward.json").write_text(json.dumps(data))
+        (point / "status.json").write_text('{"state":"complete"}')
+        return point
+
+    def test_sweep_excludes_failed_points_and_rejects_mixed_source(self):
+        from sweep_publication import load_points
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "sweep.json").write_text('{"tokens":[4,8,16],"rounds":3,"execution_commit":"abc"}')
+            self.make_point(root, 4)
+            self.make_point(root, 8)
+            point = self.make_point(root, 16)
+            (point / "status.json").write_text('{"state":"failed"}')
+            self.assertEqual([p["rows"] for p in load_points(root)], [4, 8])
+            (point / "status.json").write_text('{"state":"complete"}')
+            data = json.loads((point / "mock-forward.json").read_text())
+            data["execution_commit"] = "other"
+            (point / "mock-forward.json").write_text(json.dumps(data))
+            with self.assertRaises(ValueError):
+                load_points(root)
+
+    def test_sweep_rejects_summary_inconsistent_with_raw_samples(self):
+        from sweep_publication import load_points
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "sweep.json").write_text('{"tokens":[4,8],"rounds":3,"execution_commit":"abc"}')
+            self.make_point(root, 4)
+            point = self.make_point(root, 8)
+            data = json.loads((point / "mock-forward.json").read_text())
+            data["measurements"]["megabake"]["round_medians_us"] = [1., 1., 1.]
+            (point / "mock-forward.json").write_text(json.dumps(data))
+            with self.assertRaises(ValueError):
+                load_points(root)
+
+
 if __name__ == "__main__":
     unittest.main()

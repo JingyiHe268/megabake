@@ -86,3 +86,33 @@ python3 tools/repro/workflow.py --config tools/repro/ln301-mock-cu126.json publi
 `--mock mlp` 用于小型 MLP 检查，`--mock smollm --layers N` 用于 N 层模型结构测试。
 SmolLM 的四种实现均接收相同的预构造因果 mask；脚本先检查它与原始二维 padding mask 的 eager 输出一致。
 这样可排除 HF eager mask 构造期间的 CPU 标量复制，允许 CUDA Graph 捕获；计时不包含 mask 预处理。
+
+## 多长度与重复测量
+
+在本地提交并部署后，顺序测试多个长度，每个长度单独编译、检查，再采样。四种实现共用随机权重与输入。
+`--rounds` 是同一进程内重复计时，不表示独立重启进程；各轮轮换实现顺序。
+
+```bash
+python3 tools/repro/workflow.py --config tools/repro/ln301-mock-sweep.json \
+  launch unique-token-sweep --mock smollm --layers 30 --tokens 4 8 16 32 64 128 --rounds 3
+python3 tools/repro/workflow.py --config tools/repro/ln301-mock-sweep.json collect unique-token-sweep
+# 本地发布器的多长度绘图需要 matplotlib；服务器计算环境无需安装它。
+.repro/plot-env/bin/python tools/repro/workflow.py --config tools/repro/ln301-mock-sweep.json publish unique-token-sweep
+```
+
+多长度发布输出 `performance.csv`、`rounds.csv`、`samples.csv`、Markdown 汇总表和两张 SVG 折线图。
+只纳入状态完成、数值检查和单内核检查通过的长度。折线阴影为各轮中位数范围，不是置信区间。
+`--tokens` 改变 prefill 输入长度；不把它解释为 decode 的 KV 上下文长度。
+
+## 低于官方驱动要求的实际影响
+
+[CuTe 4.8 文档](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/quick_start.html)
+要求 CUDA 12.9 对应的驱动至少 575.51.03。
+[CUDA 次版本兼容说明](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html)
+允许部分 CUDA 12.x 应用在 R525 以上运行，但有功能限制，不能覆盖 CuTe 的更严格要求。
+
+- 依赖新驱动 API 的路径可能报 `cudaErrorCallRequiresNewerDriver`；CUDA 13 runtime 在本机已实测驱动不足。
+- 新版 PTX 交给旧驱动 JIT 时可能无法加载；为当前 H100 架构预编译的机器码与驱动 PTX JIT 是不同路径。
+- 已通过的工作负载不能证明未测试的算子、形状和编译选项兼容。发生失败时需查看实际错误，不能一律归因于驱动。
+- 低版本号本身不说明结果一定错误，也不说明性能固定降低。当前数值检查是特定测试的证据，不能外推到所有输入。
+- 同机、同环境内的性能比较可以记录，但不能把该实验配置的数据称为官方 CUDA 13 环境的复现。
