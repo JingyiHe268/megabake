@@ -15,6 +15,11 @@ CuTe 4.8 的默认包使用 CUDA 12 库，`[cu13]` extra 另装 CUDA 13 库。
 本方案选用 CUDA 12 包，CUDA Python 和 bindings 均固定 12.9.10。
 CuTe 的官方驱动要求高于本机驱动，因此只有实际 CuTe 编译和运行通过后才能判定试验可用。
 
+真实验证已完成：PyTorch BF16 GEMM、CuTe GPU 单测、mock MLP、两层及完整 30 层 SmolLM 均通过。
+完整模型的 MegaBake / eager 相对 L2 误差为 0，profiler 检查为一个工作内核。
+[性能表格](../../results/20261026-h100-mock-smollm30-cu126/published/performance.md)记录了四种实现的实测结果。
+这是 CUDA 12 实验配置的可运行证据，不代表 R550 的官方支持或预训练模型复现完成。
+
 ## 文件与目录
 
 - `requirements-cu126.in`：试验直接依赖。
