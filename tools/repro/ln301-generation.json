@@ -11,7 +11,7 @@
   "source_revision": "f70b54cec53cc4e46136c7082e0c9e9f774f5ece",
   "model_id": "MOCK/random-weights",
   "model_revision": "seed-20261026",
-  "prompt_tokens": 4,
+  "prompt_tokens": 128,
   "samples": 50,
   "timeout_seconds": 1800,
   "sglang_repo": "/HOME/sysu_xwzhang/sysu_xwzhang_3/hejy/sglang",

@@ -12,6 +12,7 @@ from generation_common import LENGTHS, PROMPT, CHECKS, fingerprint, record
 def main():
     p=argparse.ArgumentParser();p.add_argument('--model',required=True);p.add_argument('--output',type=Path,required=True)
     p.add_argument('--lengths',type=int,nargs='+',default=LENGTHS);p.add_argument('--rounds',type=int,default=3)
+    p.add_argument('--profile',action='store_true')
     args=p.parse_args()
     print('Importing SGLang benchmark and CUDA runtime',flush=True)
     import torch
@@ -66,9 +67,24 @@ def main():
                     raise RuntimeError('SGLang generation was not deterministic across trials')
                 measurements.append(row)
                 print(f"SG output={length}, trial={trial}, decode={row['decode_total_ms']:.3f} ms",flush=True)
+        profiles=[]
+        if args.profile:
+            from profile_common import LEADS,profile_window
+            for lead in LEADS:
+                runner.clear()
+                reqs=b.prepare_synthetic_inputs_for_latency_test(1,128,custom_inputs=[PROMPT])
+                current,_,batch=runner.extend(reqs)
+                output=torch.empty(4096,device='cuda',dtype=torch.int64)
+                def step(index):
+                    nonlocal current
+                    current,_=runner.decode(current,batch)
+                    output[index+1].copy_(current[0])
+                for index in range(lead):step(index)
+                profiles.append(profile_window(args.output.parent,'sglang',lead,step))
+                runner.cleanup(batch)
         cfg=b.resolving_view(server_args)
         result=dict(state='complete',engine='sglang',prefill_tokens=128,batch_size=1,lengths=args.lengths,
-                    rounds=args.rounds,model_files=fingerprint(args.model),measurements=measurements,
+                    rounds=args.rounds,model_files=fingerprint(args.model),measurements=measurements,profiles=profiles,
                     validation=validation,torch=torch.__version__,gpu=torch.cuda.get_device_name(),
                     sglang=importlib.metadata.version('sglang'),
                     cuda_graph_disabled=bool(getattr(cfg,'disable_cuda_graph',False)),

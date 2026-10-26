@@ -3,6 +3,7 @@
 import argparse
 import importlib.metadata
 import json
+import os
 from pathlib import Path
 import subprocess
 import time
@@ -12,7 +13,10 @@ from generation_common import LENGTHS,PROMPT,CHECKS,fingerprint,record
 def main():
     p=argparse.ArgumentParser();p.add_argument('--model',required=True);p.add_argument('--output',type=Path,required=True)
     p.add_argument('--sglang-result',type=Path,required=True);p.add_argument('--lengths',type=int,nargs='+',default=LENGTHS)
-    p.add_argument('--rounds',type=int,default=3);args=p.parse_args()
+    p.add_argument('--rounds',type=int,default=3)
+    p.add_argument('--profile',action='store_true');p.add_argument('--phase-profile',action='store_true')
+    args=p.parse_args()
+    if args.phase_profile:os.environ['MEGABAKE_PHASE_TIMER']='1'
     import torch
     from transformers import AutoModelForCausalLM
     from megabake import make_backend
@@ -36,7 +40,7 @@ def main():
         compiled(dummy,zero,*state)
     torch.cuda.synchronize()
     prompt=torch.tensor([PROMPT],device='cuda')
-    positions=[torch.tensor([[128+i]],device='cuda') for i in range(max(args.lengths)-1)]
+    positions=[torch.tensor([[128+i]],device='cuda') for i in range(max(args.lengths)+32)]
     sg=json.loads(args.sglang_result.read_text())
     if sg['model_files'] != fingerprint(args.model):raise RuntimeError('Checkpoint differs between engines')
     expected=load_file(str(args.sglang_result.parent/'sglang-validation.safetensors'),device='cuda')
@@ -103,7 +107,26 @@ def main():
             if row['output_token_ids'] != validation['output_token_ids'][:length]:raise RuntimeError('MegaBake output not deterministic')
             measurements.append(row)
             print(f"MB output={length}, trial={trial}, decode={row['decode_total_ms']:.3f} ms",flush=True)
+    profiles=[];phase_profiles=[]
+    if args.profile or args.phase_profile:
+        from profile_common import LEADS,profile_window
+        for lead in LEADS:
+            current,_=prepare();output=torch.empty(8192,device='cuda',dtype=torch.int64)
+            def step(index):
+                nonlocal current
+                logits=compiled(current.view(1,1),positions[index],*state)[:,-1,:]
+                current=logits.argmax(dim=-1);output[index+1].copy_(current[0])
+            for index in range(lead):step(index)
+            if args.profile:profiles.append(profile_window(args.output.parent,'megabake',lead,step))
+            if args.phase_profile:
+                from tools.phase_profile import profile
+                cursor=[lead]
+                def one():
+                    step(cursor[0]);cursor[0]+=1
+                phase_profiles.append(dict(lead_decode_steps=lead,first_cached_tokens=128+lead,
+                    **profile(backend.megabake_last_callable,backend.megabake_last_compiled,one,9)))
     result=dict(state='complete',engine='megabake',prefill_tokens=128,batch_size=1,lengths=args.lengths,
+                profiles=profiles,phase_profiles=phase_profiles,phase_instrumented=args.phase_profile,
                 rounds=args.rounds,model_files=fingerprint(args.model),measurements=measurements,validation=validation,
                 cross_engine_same_prefix_logits_relative_l2=errors,greedy_tokens_match=first_mismatch is None,
                 first_cross_engine_token_mismatch=first_mismatch,

@@ -33,11 +33,18 @@ def main():
     stages=[('prepare-checkpoint',[c['megabake_python'],str(ROOT/'tools/repro/prepare_shared_mock.py'),'--model',c['model_path']],mb_env),
             ('sglang-generation',[c['sglang_python'],str(ROOT/'tools/repro/sglang_generation.py'),*common,'--output',str(folder/'sglang-generation.json')],sg_env),
             ('megabake-generation',[c['megabake_python'],str(ROOT/'tools/repro/megabake_generation.py'),*common,'--sglang-result',str(folder/'sglang-generation.json'),'--output',str(folder/'megabake-generation.json')],mb_env)]
+    if c.get('profiling'):
+        stages[1][1].append('--profile');stages[2][1].append('--profile')
+        stages.append(('torch-comparison',[c['megabake_python'],str(ROOT/'tools/repro/torch_generation.py'),*common,
+                       '--output',str(folder/'torch-generation.json')],mb_env))
+        stages.append(('megabake-phases',[c['megabake_python'],str(ROOT/'tools/repro/megabake_generation.py'),
+                       '--model',c['model_path'],'--lengths','4096','--rounds','1','--phase-profile',
+                       '--sglang-result',str(folder/'sglang-generation.json'),'--output',str(folder/'megabake-phases.json')],mb_env))
     for name,command,env in stages:
         stage=run_stage(name,command,folder,env,c['timeout_seconds'],ROOT);status['stages'].append(stage)
         write(folder/'status.json',status)
         if stage['state']!='complete':break
-    status.update(state='complete' if len(status['stages'])==3 and all(s['state']=='complete' for s in status['stages']) else 'failed',finished_at=now())
+    status.update(state='complete' if len(status['stages'])==len(stages) and all(s['state']=='complete' for s in status['stages']) else 'failed',finished_at=now())
     write(folder/'status.json',status)
 
 
