@@ -85,7 +85,8 @@ def main():
     functions, states, errors, cache_errors, compile_seconds = {}, {}, {}, {}, {}
     builders = {'eager': lambda: reference,
                 'eager_cuda_graph': lambda: reference,
-                'inductor': lambda: torch.compile(reference, fullgraph=True, dynamic=False),
+                'inductor': lambda: torch.compile(reference, fullgraph=True, dynamic=False,
+                                                  options={'emulate_precision_casts': True}),
                 'megabake': lambda: torch.compile(declared, backend=backend, fullgraph=True, dynamic=False)}
     graph = None
     for name, build in builders.items():
@@ -164,6 +165,7 @@ def main():
                   rows=args.rows, context_length=args.rows, batch_size=1, output_tokens=1,
                   cache_capacity=capacity, cache_state_validation=True, cache_relative_l2=cache_errors,
                   baseline_reference='GPU-only tensor KV op; logits and full state checked against upstream eager',
+                  inductor_options={'emulate_precision_casts': True},
                   kv_contents='seeded nonzero random KV; not produced by prompt prefill',
                   layers=args.layers, dtype='bfloat16', rounds=args.rounds, samples_per_round=args.samples,
                   samples=args.samples*args.rounds, measurements=measurements,
